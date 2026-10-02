@@ -12,12 +12,18 @@ unsigned long g_mockMillis = 0;
 int g_mockAnalog[8] = { 512, 512, 512, 512, 512, 512, 512, 512 };
 int g_mockDigital[20] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH,
                           HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH };
+/* 记录 pinMode() 设过的模式，初值 INPUT，供探针断言"按键脚被设成 INPUT_PULLUP"。
+ * 真实硬件上 pinMode 是有效果的，这里只是把效果记下来，别的探针都不读它。 */
+int g_mockPinMode[20] = { INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT,
+                          INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT };
 
 unsigned long millis(void) { return g_mockMillis; }
 unsigned long micros(void) { return g_mockMillis * 1000UL; }
 void delay(unsigned long ms) { g_mockMillis += ms; }
 void delayMicroseconds(unsigned int us) { (void) us; }
-void pinMode(uint8_t, uint8_t) {}
+void pinMode(uint8_t pin, uint8_t mode) {
+  if (pin < 20) g_mockPinMode[pin] = (int) mode;
+}
 void digitalWrite(uint8_t, uint8_t) {}
 // 模拟真实按钮的电气行为：如果测试脚本把引脚电平设成 LOW，
 // 就让它保持 LOW 一段时间（由 g_mockButtonHoldMs 控制），

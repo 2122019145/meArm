@@ -26,7 +26,7 @@ $mock = Join-Path $sc 'mock'
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null }
 
-$fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp', 'pick_place.cpp') | ForEach-Object { Join-Path $root $_ }
+$fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp', 'pick_place.cpp', 'button_control.cpp') | ForEach-Object { Join-Path $root $_ }
 $inc = @("-I$root", "-I$mock")
 $fail = 0
 
@@ -51,7 +51,7 @@ Write-Host '================ 2) 自检程序（必须 ALL PASS）===============
 # 结果 $fw 里已经含 move.cpp、又在 extra 里再列一次，触发
 # "multiple definition of moveJointStep(int, double)" 链接错误。
 # 全部链接既简单又不会漏（未用到的目标文件由链接器按需取舍）。
-$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place')
+$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place', 'probe_button')
 foreach ($n in $probes) {
     $src  = Join-Path $sc ($n + '.cpp')
     $exe  = Join-Path $out ($n + '.exe')

@@ -47,6 +47,15 @@
 #define PROTO_CMD_PICK_B    'B'
 #define PROTO_CMD_PICK_C    'C'
 
+/* 四个物理按键的串口等价命令（效果与按下按键完全一样）。
+ * 用字母而不是 1/2/3/4：'1'/'2'/'3' 从 v0.2.0 起就是慢/中/快调速命令，
+ * 抢过来会让老的上位机脚本突然开始动机械臂。 */
+#define PROTO_CMD_BTN_CYCLE    'N'   /* 按键1 循环执行：下一次按顺序夹 A/B/C */
+#define PROTO_CMD_BTN_RECORD   'R'   /* 按键2 录制：第一次开始，第二次结束并保存 */
+#define PROTO_CMD_BTN_PLAY     'P'   /* 按键3 播放上一次录制的动作 */
+#define PROTO_CMD_BTN_HOME     'M'   /* 按键4 回中：回到开机初始位姿 */
+#define PROTO_CMD_BTN_HOME_ALT '0'   /* 回中的别名（'0' 没有被别的命令占用） */
+
 /* ---------- 2) x/y/z 三舵机同步角度指令 ---------- */
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */

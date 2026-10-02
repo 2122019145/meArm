@@ -198,6 +198,13 @@ bool recFromServo(REC *rec, const SER *ser);
  * 应在 setup() 里 writeServo() 之前调用，避免开机时舵机角度为 0 乱动。 */
 void posInit(void);
 
+/* 取"开机初始位姿"（POS_HOME）对应的关节角，写到 ser->angle1/2/3。
+ * 角度真值来自 POS_HOME 的反解，所以别处不需要写死 90/90/90 —— 以后改了
+ * POS_HOME 或关节限位，回中仍然会回到真正的初始位姿。
+ * ser->angle4 不会被改动：末端开合不是坐标反解的自由度，调用者传什么就保持什么。
+ * 返回 true 表示反解成功（此时 ser->angle1..3 已更新）。 */
+bool posGetHomeAngles(SER *ser);
+
 /* 设置末端舵机 angle4 (f) 的角度（度）。
  * 反解不会改动 angle4，它只能由这些接口或直接写 Pos.ser.angle4 改变，
  * 一个坐标点里 angle4 与 x/y/z 是彼此独立的自由度。

@@ -80,6 +80,9 @@ int  analogRead(uint8_t pin);
 extern unsigned long g_mockMillis;
 extern int g_mockAnalog[8];
 extern int g_mockDigital[20];
+/* pinMode() 的仿真记录（初值 INPUT）。串口/引脚在真实硬件上由 pinMode 生效，这里只是记下来，
+ * 方便探针断言"按键脚确实被设置成 INPUT_PULLUP"。 */
+extern int g_mockPinMode[20];
 
 /* 摇杆模块接入的引脚索引。
  * 注意: g_mockAnalog 用"A0 起算的下标"索引（0=A0, 1=A1, 2=A2, 3=A3），

@@ -2,6 +2,7 @@
 // serial_protocol.cpp
 // 串口命令协议实现：固定指令通信 + 多舵机协同（x/y/z 三舵机同步角度）
 // 另含 A/B/C 自动取放序列的启动入口（序列执行期间本层挡下其它动作指令）
+// 以及四个物理按键的串口等价命令 N/R/P/M（实现委托给 button_control.cpp）
 // 实现串口字符读取、行缓冲、命令解析和舵机控制
 */
 
@@ -10,6 +11,7 @@
 #include "pick_place.h"
 #include "protocol_constants.h"
 #include "serial_protocol.h"
+#include "button_control.h"
 #define WEARM_DEBUG_SERIAL 1
 
 /* ---------- 行缓冲与状态 ---------- */
@@ -153,17 +155,22 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
-  /* 取放序列执行期间的忙判定：取放序列独占 b/r/c 三个关节角，其它串口动作指令与摇杆都让位 */
-  if (pickPlaceIsBusy()) {
+  /* 忙判定：取放序列执行期间，或按键模块正在录制/播放/回中时，
+   * 其它串口动作指令与摇杆都让位。
+   *
+   * 两个例外必须放行（由被调用的模块自己再判一次，不合格就回 PROTO_RES_BUSY）：
+   *   1) 调速指令（H、L、1、2、3）—— 取放序列与录制的过程中都可能想调速度；
+   *   2) 按键命令（N、R、P、M）—— 录制中想发 R 结束录制，若在这里就被拦掉就永远结束不了。 */
+  if (pickPlaceIsBusy() || buttonControlBusy()) {
     char cmd = buf[0];
-    /* 只有调速指令集合（H、L、1、2、3）在取放序列执行期间仍然有效 */
-    if (cmd != PROTO_CMD_SPEED_UP && cmd != PROTO_CMD_SPEED_DOWN &&
-        cmd != PROTO_CMD_SPEED_SLOW && cmd != PROTO_CMD_SPEED_NORMAL &&
-        cmd != PROTO_CMD_SPEED_FAST) {
+    bool speedCmd = (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN ||
+                     cmd == PROTO_CMD_SPEED_SLOW || cmd == PROTO_CMD_SPEED_NORMAL ||
+                     cmd == PROTO_CMD_SPEED_FAST);
+    if (!speedCmd && !buttonIsCommandChar(cmd)) {
       /* 不打这句的话，上位机在序列执行的十几秒里发什么都不回话，
        * 操作者会以为板子死机了（实际是故意不执行）。 */
 #if WEARM_DEBUG_SERIAL
-      Serial.println(F("[proto] busy: pick/place running, command ignored"));
+      Serial.println(F("[proto] busy: pick/place or record/play running, command ignored"));
 #endif
       return PROTO_RES_BUSY;
     }
@@ -272,6 +279,17 @@ int protoHandleLine(const char *line)
 #endif
         return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
       }
+
+      /* N/R/P/M 与 '0'：四个物理按键的串口等价命令。
+       * 具体能不能执行（是否正在录制/播放/取放）由 button_control.cpp 自己判断，
+       * 不合格时它返回 PROTO_RES_BUSY —— 上面的忙守卫特意放行了这几个字符，
+       * 否则录制中发 R 想结束录制会被守卫拦掉。 */
+      case PROTO_CMD_BTN_CYCLE:
+      case PROTO_CMD_BTN_RECORD:
+      case PROTO_CMD_BTN_PLAY:
+      case PROTO_CMD_BTN_HOME:
+      case PROTO_CMD_BTN_HOME_ALT:
+        return buttonHandleCommand(cmd);
     }
     /* 单字符命令不识别，继续往下走角度解析 */
   }

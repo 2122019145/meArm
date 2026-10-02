@@ -749,8 +749,28 @@ void posInit(void) {
 #endif
 }
 
-/* ---------- 全局调速 ---------- */
+/* 取"开机初始位姿"对应的关节角，写给按键4 回中用。
+ * 角度真值由 POS_HOME 反解得到，不在别处写死 90/90/90 —— 以后改了 POS_HOME
+ * 或关节限位，回中仍然会回到真正的初始位姿。
+ * angle4（末端开合）不是坐标反解的自由度：传进来什么就保持什么，这里不动它。 */
+bool posGetHomeAngles(SER *ser) {
+  if (ser == NULL) return false;
 
+  pos p;
+  p.ser = *ser;                 /* 带上调用者的 angle4 */
+  p.rec.x = POS_HOME.x;
+  p.rec.y = POS_HOME.y;
+  p.rec.z = POS_HOME.z;
+  (void) clampToRange(&p);      /* 即使 POS_HOME 被改到界外也能拉回来 */
+  if (!getAngle(&p)) return false;
+
+  ser->angle1 = p.ser.angle1;
+  ser->angle2 = p.ser.angle2;
+  ser->angle3 = p.ser.angle3;
+  return true;
+}
+
+/* ---------- 全局调速 ---------- */
 /* 设置全局调速参数 (带合法性校验)
  * 校验规则: stepSize > 0；minDelayMs > 0；fullDelayMs >= minDelayMs。
  * 不合法的项保持原值，只有确实改动了参数才把档位标记为自定义。-1。 */

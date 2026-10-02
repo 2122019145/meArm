@@ -43,6 +43,14 @@
 #define PROTO_RES_PICK_STARTED 10 /* A/B/C 取放序列已启动 */
 #define PROTO_RES_BUSY         11 /* 动作指令被序列挡下：序列正在执行，或本次请求无法启动 */
 
+/* 按键命令的返回值（N/R/P/M，实现见 button_control.cpp） */
+#define PROTO_RES_REC_STARTED    12 /* R：开始录制 */
+#define PROTO_RES_REC_SAVED      13 /* R：结束录制且数据合格，已保存 */
+#define PROTO_RES_REC_REJECTED   14 /* R：结束录制但数据不合格（太短/没位移/缓冲满），已丢弃 */
+#define PROTO_RES_PLAY_STARTED   15 /* P：开始播放 */
+#define PROTO_RES_PLAY_NO_RECORD 16 /* P：还没有录制数据可播 */
+#define PROTO_RES_HOME_STARTED   17 /* M/0：开始回中 */
+
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */
 void serialProtocolBegin(void);

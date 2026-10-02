@@ -34,9 +34,9 @@ Windows 默认禁止直接运行 `.ps1`。）
 
 它做两件事，任一失败就 `exit 1`：
 
-1. **严格编译 6 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
+1. **严格编译 7 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
    **零警告**；
-2. **编译并运行 7 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
+2. **编译并运行 8 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
 
 每个探针的完整输出会存到 `.selfcheck\out\<探针>.log`。
 
@@ -50,6 +50,7 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] protocol_constants.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] serial_protocol.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] pick_place.cpp  EXIT=0  输出 0 行（零警告）
+  [ OK ] button_control.cpp  EXIT=0  输出 0 行（零警告）
 
 ================ 2) 自检程序（必须 ALL PASS）================
   [ OK ] probe_axes  零警告编译 + ALL PASS
@@ -59,8 +60,9 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] wearm_ino_test  零警告编译 + ALL PASS
   [ OK ] probe_protocol  零警告编译 + ALL PASS
   [ OK ] probe_pick_place  零警告编译 + ALL PASS
+  [ OK ] probe_button  零警告编译 + ALL PASS
 
->>> 全部通过（固件零警告 + 7 个自检 ALL PASS）
+>>> 全部通过（固件零警告 + 8 个自检 ALL PASS）
 ```
 
 ## 每个探针在测什么
@@ -74,6 +76,7 @@ Windows 默认禁止直接运行 `.ps1`。）
 | `wearm_ino_test` | **直接 `#include "../wearm.ino"`**（不手抄复刻）：4 个舵机 attach 引脚、上电姿态 = POS_HOME、上电不是 0（不会甩向原点）、静置 20 轮 loop 不动、推杆后 loop 真的把新角度写进舵机 |
 | `probe_protocol` | 串口协议完整测试：O/S/H/L 命令（爪子开/关/升档/降档）、角度指令格式（x10,y30,z20 及其变体）、行缓冲与超时处理（PROTO_LINE_BUF_SIZE=40, PROTO_LINE_TIMEOUT_MS=300）、速度档位边界（PROTO_SPEED_LEVEL_MIN/MAX/DEF）、MockSerial 64 字节缓冲边界测试、无换行超时场景、单字符打印 vs 码值打印 |
 | `probe_pick_place` | A/B/C 自动取放：位置表（Δx、Δy 各 ≥5，三初始点/三放置点两两相距 ≥5，放置点离"别人的初始点" ≥5，实测最紧 7.21）、6 个取放点与接近点都"在 limit 内 + 可达 + 反解未被吸附"、启动语义（0 / -2 忙 / -1 编号非法）、完整跑三轮（A 305 轮、B 334 轮、C 335 轮，逐轮零违规、末点 = 放置点 + 抬升 6.0、`angle4 == servoLimit.maxF`）、忙时让位（O/S/x45/k 全返 BUSY 且状态零改动，H/L 仍生效）、空闲时反复调用不动状态 |
+| `probe_button` | 四按键接口 9 段：`pinMode` 记录断言 D2~D5 都是 `INPUT_PULLUP`、初始无录制/不忙/不让位；按键1 物理连按四次 A→B→C→A 且序列执行中再按不推进序号；录制门槛（未录制时播放回 16、录制中 `busy=true` 但 `locked=false`、录制中 O 被挡回 11 而 H/L 仍回 3/4、只录 3 秒回 14、录 11.5 秒无位移回 14）；真实摇杆录制 11.6 秒 → 保存回 13、61 条、位移 24.95；播放回 15、只在"仍被独占"时推摇杆验证让位、回放末态与录制末态误差 0.00、耗时 12.52 s = 录制 11.6 s + 预摆 1.5 s；**播放中按按键4 / 发别名 `0` 都被拒（回 11）且播放不被劫持**；回中回 17 且 b/r/c 与 `posGetHomeAngles()` 位级一致、angle4 不动、别名 `0` 同样有效；串口路径 N/R/P/M 与忙守卫豁免（序列忙时 N 回 11、录制中 R 回 14）；空闲 100 次调用零改动；**[9] 最坏情况**：四路摇杆每 700 ms 翻向、连续推 11.2 秒 → 仍保存成功（444/512 条、位移 36.45；旧"每周期另写一条 WAIT"的格式要 ~560 条，必然溢出判废），回放后四轴末态差 0.00 度 |
 
 ### 当前实测包络（r、c 都放开到 0~180 之后）
 
@@ -133,6 +136,12 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 14. **探针不许引用只存在于某个 `.cpp` 里的私有宏**。`pick_place.cpp` 的 `PICK_GRASP_Z` / `PICK_APPROACH_DZ` 是文件内 `#define`，探针 include 了头文件也看不到它们（表现为 `'PICK_APPROACH_DZ' was not declared`）。修法不是把宏抄一遍（那会制造第二处真值），而是在头文件里加一个访问器：`double pickPlaceApproachDz(void);`。
 15. **`REC` / `SER` / `pos` 是 `typedef`，不能写 `struct REC r;`**（C 语言习惯，C++ 里报 `expected primary-expression`）。写 `REC r;` 即可。
 16. **子智能体说"编译通过/测试通过"一律要自己再验一遍**。本轮一个子智能体在**从未编译成功**的情况下写出"预期输出应该是所有测试通过"，还往 `.selfcheck\` 扔了 11 个一次性垃圾文件（`hello.c`、`probe_minimal.py`、`probe_report.txt` 之类）。验收口径：自己跑 `run_all.cmd`，看它在**你改完的磁盘文件**上是否真的全绿；子智能体贴的原始输出只当线索，不当证据。
+17. **测"某期间摇杆被让位"时，别把"期间结束的那一瞬间"算进去**。`probe_button` 的收尾循环写的是 `buttonLoop()` 之后紧接着 `joystickLoop()`：播放恰好在 `buttonLoop()` 里收尾，于是同轮的 `joystickLoop()` 立刻用还按着的摇杆走了 1.0°（`angle2 86.1124 -> 85.1124`），报成"让位失效"。固件是对的 —— 播放一结束摇杆就该立刻恢复。正确写法：循环条件用 `buttonControlLocked()`，并且**只在仍然锁着时才调 `joystickLoop()`**，然后单独收尾跑完剩余流程。
+18. **探针里对"循环序号"这类有状态的量，不要写死第几次的期望值**。`probe_button` 断言"mock 喂 `N\n` 应该夹 A"，但循环序号在前面用例里已经推进到 C，于是假失败。正确写法：调用**前**先取 `int nextBefore = buttonPickNext();`，再断言 `pickPlaceCurrentObject() == nextBefore`。
+19. **用 `edit` 工具改 `.ps1` 会丢 UTF-8 BOM**（第 274 行那条坑的另一面：`write`/`edit` 都按无 BOM 写）。改完必须补：读成字节、前置 `EF BB BF`、`[System.IO.File]::WriteAllBytes()` 写回，再确认 `CRLF` 数正常、`loneLF` 为 0。`run_all.ps1` 因为要被 `powershell -File` 解析，BOM 丢了会直接语法报错。
+20. **`run_all.ps1` 的汇总行用 `$probes.Count` 自动计数**，加探针不用手改文案；但 `README.md` 里的"6 个固件 TU / 7 个自检"是手写的，每加一个 TU 或探针都要同步改示例输出，否则文档与实测输出对不上。
+21. **"缓冲能撑多久"必须按最坏情况的每周期条目数推一遍**。`button_control.cpp` 头部原写"条目速率上限约 25 条/秒、512 条 ≈ 20 秒"，把采样周期误当成了条目速率；实际每个有动作的周期最多写 `1 + 动的关节数` 条 → 四关节同时动 = 125 条/秒，512 条只够 4.1 秒 → 必然写满、必然低于 10 秒门槛、录完就判废。修法是换格式：把"推进一个周期"塞进增量条目的 bit7（`BTN_TICK_FLAG`），每周期只花"动了几个关节"条，并把 tick 从 40 ms 放宽到 100 ms；容量结论按 `512 / (1 + 关节数) × tick` 重算后才写进注释。
+22. **"周期性采样 → 回放"必须显式处理首尾零头**。采样是离散的，`btnRecTick()` 只在周期边界结算增量，于是"最后一个整周期 → 松手"之间的动作永远进不了缓冲。四关节在快速档每周期能走 10 度，回放终点就整整差 10.00 度（不是量化误差，是丢了一段）。修法：`btnStopRecording()` 一开头调 `btnRecFlushTail(now)` 把这一小段补成条目，只有跨进新周期时才给第一条挂 `BTN_TICK_FLAG`。修完 `probe_button` 的末态差从 `10.00/10.00/10.00/9.50` 变成 `0.00/0.00/0.00/0.00`。
 
 ## 编译器的坑（本机实测）
 
@@ -256,12 +265,59 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 
 - **串口集成**：`serial_protocol.cpp` 在单字符命令 `switch` 里加了 `A/B/C` 三个分支，
   返回 `PROTO_RES_PICK_STARTED`（10）或 `PROTO_RES_BUSY`（11）；序列执行期间
-  `protoHandleLine()` 最前面有忙守卫，**只放行调速指令 `H/L/1/2/3`**，其余动作指令
-  一律返回 `PROTO_RES_BUSY` 且不改状态，并回一行 `[proto] busy: pick/place running,
-  command ignored`（在 `#if WEARM_DEBUG_SERIAL` 里，不影响返回值）。摇杆侧在
-  `joystick_control.cpp` 的轴步进循环开头 `if (pickPlaceIsBusy()) break;` ——
-  序列独占 b/r/c 与末端角。D13 指示灯把"序列在执行"也算作在动（`updateLed(moved ||
-  pickPlaceIsBusy())`），否则那十几秒灯是灭的，看着像死机。
+  `protoHandleLine()` 最前面有忙守卫（`pickPlaceIsBusy() || buttonControlBusy()`），
+  **只放行调速指令 `H/L/1/2/3` 与按键命令 `N/R/P/M`**，其余动作指令
+  一律返回 `PROTO_RES_BUSY` 且不改状态，并回一行
+  `[proto] busy: pick/place or record/play running, command ignored`（在
+  `#if WEARM_DEBUG_SERIAL` 里，不影响返回值）。摇杆侧在
+  `joystick_control.cpp` 的轴步进循环开头 `if (pickPlaceIsBusy() || buttonControlLocked()) break;` ——
+  序列执行与播放/回中期间独占 b/r/c 与末端角（录制期间**不**独占，见下一节）。
+  D13 指示灯把"序列在执行"也算作在动（`updateLed(moved || pickPlaceIsBusy() || buttonControlLocked())`），
+  否则那十几秒灯是灭的，看着像死机。
+
+## 新增四按键操作接口
+
+本轮新增 `button_control.h` / `button_control.cpp`：四个按键的全部调用接口都封装在
+**这一个 cpp** 里（这是需求原文的硬性要求），`weArm.ino` 只调 `buttonSetup()` /
+`buttonLoop()`。
+
+- **按键接线**：D2 = 按键1（循环执行取放）、D3 = 按键2（录制）、D4 = 按键3（播放）、
+  D5 = 按键4（回中）。四脚 `INPUT_PULLUP`，按下为**低电平**（另一端接 GND），
+  25 ms 时间消抖，只认按下沿。D6~D9 是舵机、D13 是灯、D0/D1 是串口、A0~A3 是摇杆，
+  D2~D5 是唯一空闲好接的四个脚。
+- **串口等价命令**（外部接口不只在按键上）：`N` = 按键1、`R` = 按键2、`P` = 按键3、
+  `M`（别名 `0`）= 按键4。**不用 1/2/3/4**，因为 `1/2/3` 已经是既有的调速命令。
+- **按键1 循环执行**：每按一次依次夹 A、B、C，第四次回到 A。忙时（序列执行中）
+  被拒绝且循环序号**不推进**。
+- **按键2 录制**：第一次按下开始录（状态「录制中」，串口回 `PROTO_RES_REC_STARTED`=12），
+  人工用摇杆操控；第二次按下结束并保存（13）。保存门槛：时长 **>10000 ms** 且
+  末端位移 **≥10.0**（`BTN_REC_MIN_MS` / `BTN_REC_MIN_TRAVEL`），不达标回
+  `PROTO_RES_REC_REJECTED`=14。**录制失败会连带废掉上一次的录制**（缓冲区已被本次
+  录制复用），代码注释与串口提示都写明了这一点。
+- **录制格式**：条目只有两种 —— "某关节角的增量（0.5 度量化，`BTN_ANGLE_UNIT`）"或
+  "等待若干个采样周期"。采样周期 `BTN_TICK_MS` = **100 ms**（**不是** 40 ms：四关节
+  同时动时 40 ms 只够录 4.1 秒，低于 10 秒门槛，见教训 21）。**"推进一个周期"不单独占
+  条目**，而是挂在本次动作第一条增量条目的最高位（`BTN_TICK_FLAG` = 0x80），所以
+  "每个周期都在动"时每周期只花"动了几个关节"条。缓冲 `BTN_REC_ENTRIES` = 512 条 =
+  1024 字节 SRAM，按最坏情况（每周期 1 条时间推进 + 每关节 1 条增量）的**连续动作
+  上限**：单关节 ≈51 s、两关节 ≈26 s、三关节 ≈17 s、四关节 ≈12.8 s；几乎不动时
+  每条 WAIT 可表 12.7 秒，理论上限约 43 分钟。写满会自动停止录制并明确提示。
+- **收尾增量**：结束录制时会把"最后一个整周期 → 按下结束键"之间那不到一个周期的
+  动作补成条目（`btnRecFlushTail()`）。不做这一步，回放终点会停在最后一个整周期上 ——
+  实测快速档四关节同时动时末态正好差一个周期的位移（10.00 度），见教训 22。
+- **按键3 播放**：先用 `BTN_RAMP_MS` = 1500 ms 在关节空间线性预摆到录制起点，
+  再按录制时的时间轴复现，结束回空闲。没有录制时回 `PROTO_RES_PLAY_NO_RECORD`=16。
+- **按键4 回中**：目标角由 `constant_and_positions.cpp` 新增的
+  `bool posGetHomeAngles(SER *ser)` 对 `POS_HOME`（20,0,20）反解得到（`b/r/c` = 90/90/90），
+  **angle4 保持当前值不动**；同样是 1500 ms 插值而不是瞬间跳变。探针直接拿这个函数
+  当期望值，避免在探针里抄死 90。
+- **忙与让位是两套语义**（这是本模块最容易写错的地方）：
+  - `buttonControlBusy()` = 录制/播放/回中任一 → 串口动作指令（除调速与 N/R/P/M）被挡。
+  - `buttonControlLocked()` = 播放/回中（**不含录制**） → 摇杆让位。
+  - 忙守卫必须**豁免 N/R/P/M 本身**，否则录制中发 `R` 想结束录制会被自己的忙守卫吞掉
+    （probe_button 专门有一条用例守着这个）。
+- **新增返回值**：12 录制开始、13 录制已保存、14 录制被拒、15 播放开始、
+  16 无可播放录制、17 回中开始（都定义在 `serial_protocol.h`）。
 
 ## PowerShell 的两个坑
 
@@ -300,3 +356,10 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
    观察夹爪是否真的夹到物体中段高度（`PICK_GRASP_Z` / `PICK_APPROACH_DZ`
    也在同一个文件顶部）。序列速度 = 当前档位（慢 25 / 中 50 / 快 90 度每秒），
    夹爪段固定 60 度每秒。
+
+7. **四个按键的接线与手感**：D2~D5 一端接按键、另一端接 GND，按下为低电平
+   （固件用 `INPUT_PULLUP`，接反或悬空会一直读到"按下"）。上机先逐个试：
+   按一下 D2 是否开始夹 A、再按是否换 B；按 D3 是否进入「录制中」、再按是否
+   报保存成功或"太短/没有位移"；D4 是否复现；D5 是否回到 `POS_HOME` 姿态。
+   注意**回放按录制时的时间轴走**，与当前调速档位无关，所以第一次录制建议
+   用慢速档录一小段、观察回放是否与手动操作一致。

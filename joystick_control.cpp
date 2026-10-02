@@ -28,6 +28,7 @@
 #include "move.h"
 #include "joystick_control.h"
 #include "pick_place.h"
+#include "button_control.h"
 
 /* ---------- 编译开关 ---------- */
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
@@ -296,8 +297,11 @@ void joystickLoop(void) {
   };
 
   for (int i = 0; i < JIDX_COUNT; i++) {
-    /* 取放序列执行期间让位：序列独占 b/r/c 三个关节角与末端角，摇杆一律不步进 */
-    if (pickPlaceIsBusy()) break;
+    /* 让位：取放序列执行期间、按键模块正在播放/回中期间，摇杆一律不步进
+     * （两者都独占 b/r/c 与末端角）。
+     * 注意 buttonControlLocked() 不包含"录制中"——录制就是要录你推摇杆的动作，
+     * 那时候摇杆必须照常可用。 */
+    if (pickPlaceIsBusy() || buttonControlLocked()) break;
 
     if (axes[i].amp <= 0) continue;
 
@@ -350,8 +354,8 @@ void joystickLoop(void) {
 #endif
 
   /* 3) 指示灯：本轮有任何关节在动 -> 快闪；否则灭。
-   *    取放序列期间摇杆被独占（moved 恒为 false），但 b/r/c 三个关节
-   *    确实一直在走，所以把"序列在执行"也算作在动，否则那十几秒灯是灭的，
-   *    看着像死机。 */
-  updateLed(moved || pickPlaceIsBusy());
+   *    取放序列执行期间、按键模块播放/回中期间摇杆被独占（moved 恒为 false），
+   *    但关节确实一直在走，所以把这些"别人在驱动机械臂"的状态也算作在动，
+   *    否则那十几秒灯是灭的，看着像死机。 */
+  updateLed(moved || pickPlaceIsBusy() || buttonControlLocked());
 }
