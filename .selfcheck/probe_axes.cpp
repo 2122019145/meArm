@@ -6,7 +6,7 @@
  * （固件是 (90-b)），整张可达表镜像，把"可达"读成"不可达"，浪费了好几轮。
  * 需要自己算的时候，必须用已知标定点手算核对一次。
  *
- * 关节限位直接取自固件全局 servoLimit（b[0,180] r[45,105] c[0,180] f[60,150]）。
+ * 关节限位直接取自固件全局 servoLimit（b[0,180] r[0,180] c[0,180] f[60,150]）。
  */
 #include <cmath>
 #include <cstdio>
@@ -78,7 +78,7 @@ int main(void) {
          limit.minX, limit.maxX, limit.minY, limit.maxY, limit.minZ, limit.maxZ);
   printf("  落在 limit 外的采样点: %d / %ld = %.1f%%\n",
          excluded, total, 100.0 * (double)excluded / (double)total);
-  /* limit 是按实测包络定出来的（外扩 0.5），因此"没有任何可达姿态落在 limit 外"
+  /* limit 是按实测包络定出来的（向外取整到 0.5；本次余量恰好为 0），因此"没有任何可达姿态落在 limit 外"
    * 是这套配置的核心不变量。若这里非 0，说明 limit 比真实包络小，
    * 角度模式下会表现为"某个关节走不到行程端点就被软护栏挡住"。
    * 外扩量也打出来，方便确认 limit 没有反过来放得太宽（软护栏失去意义）。 */

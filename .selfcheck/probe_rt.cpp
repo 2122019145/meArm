@@ -78,7 +78,7 @@ int main(void) {
   }
 
   printf("\n=== 2) 往返: 关节角 -> 正解 -> 反解 -> 关节角 ===\n");
-  int n = 0, bad = 0, clampedN = 0, otherBranch = 0;
+  int n = 0, bad = 0, clampedN = 0, otherBranch = 0, branchBad = 0;
   double worst = 0;
   for (int b = (int)servoLimit.minB; b <= (int)servoLimit.maxB; b += 15) {
     for (int r = (int)servoLimit.minR; r <= (int)servoLimit.maxR; r += 15) {
@@ -111,17 +111,32 @@ int main(void) {
         }
         double e = fabs(p.ser.angle1 - b);
         if (e > 180) e = 360 - e;
+        /* 回转角相差 180° 是"镜像分支"：同一个末端点可以有两组关节角到达 ——
+         * 基座转 180°、两节臂在相反的竖直平面里镜像，两组都合法，反解器只能
+         * 给出其中一个。r 放开到 0~180 之后镜像解也落进了行程，反解器可能先
+         * 选到它，这时只比 b 就会误报失败。
+         * 但也不能直接放过：必须用固件正解回代，确认反解出来的关节角真的能
+         * 复现同一个末端点（残差 < 0.05）。这比只比 b 是**更强**的判定。 */
+        if (e > 0.2) {
+          if (fabs(e - 180.0) < 1.0) {
+            double bx, by, bz;
+            fk(p.ser.angle1, p.ser.angle2, p.ser.angle3, &bx, &by, &bz);
+            double back = sqrt(pow(bx - x, 2) + pow(by - y, 2) + pow(bz - z, 2));
+            if (back < 0.05) { otherBranch++; continue; }   /* 合法镜像解 */
+          }
+          branchBad++;     /* 既不是同一分支、也没法用镜像解释 */
+        }
         if (e > worst) worst = e;
-        if (e > 0.2) otherBranch++;
       }
     }
   }
   {
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "共 %d 组, 反解 false %d 组, 被吸附 %d 组, 回转角最大误差 %.3f° (误差>0.2 的 %d 组)",
-             n, bad, clampedN, worst, otherBranch);
-    check("round-trip", bad == 0 && worst < 0.2, buf);
+             "共 %d 组, 反解 false %d 组, 被吸附 %d 组, 镜像分支 %d 组, "
+             "非镜像回转角最大误差 %.3f° (无法解释的 %d 组)",
+             n, bad, clampedN, otherBranch, worst, branchBad);
+    check("round-trip", bad == 0 && worst < 0.2 && branchBad == 0, buf);
   }
 
   printf("\n=== 3) 正解回代残差（能解时必须 <= 0.05）===\n");
