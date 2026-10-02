@@ -1,11 +1,13 @@
 /*
 // serial_protocol.cpp
 // 串口命令协议实现：固定指令通信 + 多舵机协同（x/y/z 三舵机同步角度）
+// 另含 A/B/C 自动取放序列的启动入口（序列执行期间本层挡下其它动作指令）
 // 实现串口字符读取、行缓冲、命令解析和舵机控制
 */
 
 #include "Arduino.h"
 #include "constant_and_positions.h"
+#include "pick_place.h"
 #include "protocol_constants.h"
 #include "serial_protocol.h"
 #define WEARM_DEBUG_SERIAL 1
@@ -75,7 +77,8 @@ void serialProtocolLoop(void)
           cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN ||
           cmd == PROTO_CMD_SPEED_SLOW || cmd == PROTO_CMD_SPEED_NORMAL ||
           cmd == PROTO_CMD_SPEED_FAST ||
-          cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP) {
+          cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP ||
+          cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B || cmd == PROTO_CMD_PICK_C) {
         protoFlushLine();  /* 立即派发单字符命令 */
       }
     }
@@ -150,6 +153,17 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
+  /* 取放序列执行期间的忙判定：取放序列独占 b/r/c 三个关节角，其它串口动作指令与摇杆都让位 */
+  if (pickPlaceIsBusy()) {
+    char cmd = buf[0];
+    /* 只有调速指令集合（H、L、1、2、3）在取放序列执行期间仍然有效 */
+    if (cmd != PROTO_CMD_SPEED_UP && cmd != PROTO_CMD_SPEED_DOWN &&
+        cmd != PROTO_CMD_SPEED_SLOW && cmd != PROTO_CMD_SPEED_NORMAL &&
+        cmd != PROTO_CMD_SPEED_FAST) {
+      return PROTO_RES_BUSY;
+    }
+  }
+
   /* 单字符命令处理 */
   if (j == 1) {
     char cmd = buf[0];
@@ -220,6 +234,38 @@ int protoHandleLine(const char *line)
         }
 #endif
         return PROTO_RES_TOOL_STEP;
+      }
+
+      case PROTO_CMD_PICK_A:
+      {
+        int rc = pickPlaceStart(PICK_OBJECT_A);
+#if WEARM_DEBUG_SERIAL
+        Serial.print(F("[pick] A start -> "));
+        Serial.println(rc == 0 ? "OK" : "REJECTED");
+#endif
+        /* 0 = 已启动；-2 = 正忙；-1/-3 = 本次没能启动（编号非法 / 路径校验失败），
+         * 都归到 BUSY，让上位机知道"指令认了但序列没跑"，具体原因看调试串口 */
+        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
+      }
+
+      case PROTO_CMD_PICK_B:
+      {
+        int rc = pickPlaceStart(PICK_OBJECT_B);
+#if WEARM_DEBUG_SERIAL
+        Serial.print(F("[pick] B start -> "));
+        Serial.println(rc == 0 ? "OK" : "REJECTED");
+#endif
+        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
+      }
+
+      case PROTO_CMD_PICK_C:
+      {
+        int rc = pickPlaceStart(PICK_OBJECT_C);
+#if WEARM_DEBUG_SERIAL
+        Serial.print(F("[pick] C start -> "));
+        Serial.println(rc == 0 ? "OK" : "REJECTED");
+#endif
+        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
       }
     }
     /* 单字符命令不识别，继续往下走角度解析 */
@@ -484,6 +530,7 @@ void serialProtocolBegin(void)
     Serial.println();
   }
   Serial.println(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
+  Serial.println(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
   Serial.println(F("[proto] ================================"));
 #endif
 }

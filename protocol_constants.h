@@ -42,6 +42,11 @@
 /* 'k' 与 'K' 每次步进的角度（度） */
 #define PROTO_TOOL_STEP_DEG      5.0
 
+/* A/B/C 自动取放指令：分别启动物体 A/B/C 的取放序列 */
+#define PROTO_CMD_PICK_A    'A'
+#define PROTO_CMD_PICK_B    'B'
+#define PROTO_CMD_PICK_C    'C'
+
 /* ---------- 2) x/y/z 三舵机同步角度指令 ---------- */
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */

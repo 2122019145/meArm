@@ -27,6 +27,7 @@
 #include "constant_and_positions.h"
 #include "move.h"
 #include "joystick_control.h"
+#include "pick_place.h"
 
 /* ---------- 编译开关 ---------- */
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
@@ -295,6 +296,9 @@ void joystickLoop(void) {
   };
 
   for (int i = 0; i < JIDX_COUNT; i++) {
+    /* 取放序列执行期间让位：序列独占 b/r/c 三个关节角与末端角，摇杆一律不步进 */
+    if (pickPlaceIsBusy()) break;
+
     if (axes[i].amp <= 0) continue;
 
     int interval = speedIntervalMs(axes[i].amp);

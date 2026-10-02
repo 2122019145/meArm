@@ -6,9 +6,10 @@
 //   setup() —— 复位到安全初始角度、初始化串口协议与手柄引脚、挂载 4 个舵机
 //   loop()  —— 每轮:
 //     1. serialProtocolLoop() 处理串口指令（唯一读者，放在最前面保证及时响应）
-//     2. joystickLoop()   读手柄（MeArm 套件手柄：两根双轴摇杆，共占 A0~A3），
+//     2. pickPlaceLoop()   推进取放序列（非阻塞状态机，独占 b/r/c 三个关节角）
+//     3. joystickLoop()   读手柄（MeArm 套件手柄：两根双轴摇杆，共占 A0~A3），
 //                         按全局速度参数直接改变 4 个舵机的目标角度
-//     3. writeServo()     把当前角度写入 4 个 Servo
+//     4. writeServo()     把当前角度写入 4 个 Servo
 //
 // 【控制方式：直接控制关节角】
 //   摇杆推动 = 对应舵机角度增大/减小，不再通过末端坐标反解。
@@ -73,6 +74,7 @@
 #include "move.h"
 #include "joystick_control.h"
 #include "serial_protocol.h"
+#include "pick_place.h"
 
 /* 4 个舵机: index 1~4 对应各关节。
  * 字母记号（与 constant_and_positions.h 的 servoLimit 一致）:
@@ -118,6 +120,9 @@ void loop() {
   /* 先处理串口指令（唯一读者），再处理手柄；
    * 串口放在最前面保证及时响应。 */
   serialProtocolLoop();
+
+  /* 推进取放序列（A/B/C 触发的非阻塞状态机，每轮走一步） */
+  pickPlaceLoop();
 
   /* 读手柄，按全局调速参数直接改变 4 个关节角度 */
   joystickLoop();

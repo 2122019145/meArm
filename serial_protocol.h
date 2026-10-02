@@ -10,6 +10,7 @@
 //                                 可只写其中一部分（如 y45），未出现的轴不动
 //   1 / 2 / 3                     兼容旧命令：直接切到 慢/中/快 档
 //   k / K                         兼容旧命令：爪子步进张开/收回
+//   A / B / C                     启动物体 A/B/C 的自动取放序列，序列执行期间只有调速指令仍然有效、其它动作指令返回 BUSY
 //
 // 舵机对应关系（可改 protocol_constants.cpp 里的 protoAxisServoIndex）:
 //   x -> angle1 = b 基座回转
@@ -39,6 +40,8 @@
 #define PROTO_RES_ANGLES_SET    7  /* x/y/z 角度指令已同步写入 */
 #define PROTO_RES_UNKNOWN       8  /* 无法识别的命令（未改动任何状态） */
 #define PROTO_RES_BAD_SYNTAX    9  /* 像角度指令但语法错（未改动任何状态） */
+#define PROTO_RES_PICK_STARTED 10 /* A/B/C 取放序列已启动 */
+#define PROTO_RES_BUSY         11 /* 动作指令被序列挡下：序列正在执行，或本次请求无法启动 */
 
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */

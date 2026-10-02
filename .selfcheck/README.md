@@ -34,9 +34,9 @@ Windows 默认禁止直接运行 `.ps1`。）
 
 它做两件事，任一失败就 `exit 1`：
 
-1. **严格编译 5 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
+1. **严格编译 6 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
    **零警告**；
-2. **编译并运行 6 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
+2. **编译并运行 7 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
 
 每个探针的完整输出会存到 `.selfcheck\out\<探针>.log`。
 
@@ -49,6 +49,7 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] joystick_control.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] protocol_constants.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] serial_protocol.cpp  EXIT=0  输出 0 行（零警告）
+  [ OK ] pick_place.cpp  EXIT=0  输出 0 行（零警告）
 
 ================ 2) 自检程序（必须 ALL PASS）================
   [ OK ] probe_axes  零警告编译 + ALL PASS
@@ -57,8 +58,9 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] probe_joystick  零警告编译 + ALL PASS
   [ OK ] wearm_ino_test  零警告编译 + ALL PASS
   [ OK ] probe_protocol  零警告编译 + ALL PASS
+  [ OK ] probe_pick_place  零警告编译 + ALL PASS
 
->>> 全部通过（固件零警告 + 6 个自检 ALL PASS）
+>>> 全部通过（固件零警告 + 7 个自检 ALL PASS）
 ```
 
 ## 每个探针在测什么
@@ -71,6 +73,7 @@ Windows 默认禁止直接运行 `.ps1`。）
 | `probe_axes` | 5929741 个关节角组合扫出真实可达包络、验证 `limit` 完全覆盖包络且余量非负、单轴满行程自查（每个关节都能走到行程两端）、5 个标定点核对 |
 | `wearm_ino_test` | **直接 `#include "../wearm.ino"`**（不手抄复刻）：4 个舵机 attach 引脚、上电姿态 = POS_HOME、上电不是 0（不会甩向原点）、静置 20 轮 loop 不动、推杆后 loop 真的把新角度写进舵机 |
 | `probe_protocol` | 串口协议完整测试：O/S/H/L 命令（爪子开/关/升档/降档）、角度指令格式（x10,y30,z20 及其变体）、行缓冲与超时处理（PROTO_LINE_BUF_SIZE=40, PROTO_LINE_TIMEOUT_MS=300）、速度档位边界（PROTO_SPEED_LEVEL_MIN/MAX/DEF）、MockSerial 64 字节缓冲边界测试、无换行超时场景、单字符打印 vs 码值打印 |
+| `probe_pick_place` | A/B/C 自动取放：位置表（Δx、Δy 各 ≥5，三初始点/三放置点两两相距 ≥5）、6 个取放点与接近点都"在 limit 内 + 可达 + 反解未被吸附"、启动语义（0 / -2 忙 / -1 编号非法）、完整跑三轮（A 305 轮、B 343 轮、C 333 轮，逐轮零违规、末点 = 放置点 + 抬升 6.0、`angle4 == servoLimit.maxF`）、忙时让位（O/S/x45/k 全返 BUSY 且状态零改动，H/L 仍生效）、空闲时反复调用不动状态 |
 
 ### 当前实测包络（r、c 都放开到 0~180 之后）
 
@@ -127,6 +130,14 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 11. **探针直接赋值 `Pos.ser` 会造出固件永远不会产生的脏状态**：探针的 `resetInputs()` 直接写 `Pos.ser.angle1` 到 `angle4`，不走固件写入路径，因此 `Pos.rec` 不刷新；而固件唯一写角度的地方 `protoApplyAngles()` 在 `written` 大于 0 时会调一次 `recFromServo(&Pos.rec, &Pos.ser)`，即固件任何一次成功写入都保证 `Pos.rec` 自洽。曾因此在压力测试里出现 violations 等于 4 的假警报（全是"Pos.rec 必须等于 recFromServo(Pos.ser)"这一条不变量）。正确做法：压力测试开始前自己补一句 `(void) recFromServo(&Pos.rec, &Pos.ser);`。
 12. **PowerShell 的逗号优先级高于加号**：把两个 `-I` 参数用 `@("-I" + $root, "-I" + $mock)` 这样写会拼成**一个**字符串，表现为编译报 `fatal error: Arduino.h: No such file or directory`。必须给每个拼接加括号。
 13. **给子智能体的长文本（例如 workflow 脚本里的 prompt）不能出现反引号**：脚本里用模板字符串包住 prompt 时，正文里的 markdown 反引号会直接终结模板字符串，报 `workflow script does not parse` 与 `SyntaxError: Unexpected identifier`。
+14. **探针不许引用只存在于某个 `.cpp` 里的私有宏**。`pick_place.cpp` 的 `PICK_GRASP_Z` / `PICK_APPROACH_DZ` 是文件内 `#define`，探针 include 了头文件也看不到它们（表现为 `'PICK_APPROACH_DZ' was not declared`）。修法不是把宏抄一遍（那会制造第二处真值），而是在头文件里加一个访问器：`double pickPlaceApproachDz(void);`。
+15. **`REC` / `SER` / `pos` 是 `typedef`，不能写 `struct REC r;`**（C 语言习惯，C++ 里报 `expected primary-expression`）。写 `REC r;` 即可。
+16. **子智能体说"编译通过/测试通过"一律要自己再验一遍**。本轮一个子智能体在**从未编译成功**的情况下写出"预期输出应该是所有测试通过"，还往 `.selfcheck\` 扔了 11 个一次性垃圾文件（`hello.c`、`probe_minimal.py`、`probe_report.txt` 之类）。验收口径：自己跑 `run_all.cmd`，看它在**你改完的磁盘文件**上是否真的全绿；子智能体贴的原始输出只当线索，不当证据。
+
+## 编译器的坑（本机实测）
+
+1. **`C:\msys64\ucrt64\bin\g++.exe` 在本沙箱下静默失败**：退出码 1、stderr 一个字都没有、连 `-v` 都不打印，`.exe`/`.o` 永不产出（看起来像"什么都没发生"）。**一切编译/链接都用 `C:\ProgramData\mingw64\mingw64\bin\g++.exe`** —— 它也是 `run_all.ps1` 里 `$gpp` 用的那一个。
+2. **`cmd /c "... & echo ERRORLEVEL=%errorlevel%"` 的 `%errorlevel%` 是解析期展开的**，打印出来是命令**执行前**的值，会给出"编译成功"的错觉。PowerShell 里一律用 `$LASTEXITCODE`。
 
 ## 固件里的坑（自检抓到过的真 bug）
 
@@ -205,6 +216,48 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
   - `probe_joystick` 中的旧串口用例已删除，移至 `probe_protocol` 专门测试
   - 新增 `probe_protocol` 探针（约 582 行，12 段）专门测试串口协议功能
 
+## 新增 A/B/C 自动取放模块
+
+本轮新增 `pick_place.h` / `pick_place.cpp`：上位机发送单个字母 `A` 或 `B` 或 `C`，
+机械臂自动把对应物体夹起来搬到另一个位置。
+
+- **对外接口**（`pick_place.h`）：
+  - `int pickPlaceStart(int object)`：启动某个物体的取放序列。返回 `0` 已启动、
+    `-1` 编号非法、`-2` 已有序列在执行、`-3` 路径校验失败（**失败时不改任何全局状态**）。
+  - `void pickPlaceLoop(void)`：非阻塞推进，每轮 `loop()` 调一次，不调用 `delay()`，
+    不做等待式循环。
+  - `bool pickPlaceIsBusy(void)` / `int pickPlaceCurrentObject(void)` / `const char *pickPlaceStageName(void)`
+  - `bool pickPlaceGetSource(int, double*, double*, double*)` / `...GetTarget(...)`：
+    读出物体初始位置与放置位置。
+  - `double pickPlaceApproachDz(void)`：接近点相对物体的抬升高度（探针用它，避免抄死 6.0）。
+  - 物体编号：`PICK_OBJECT_A/B/C` = 0/1/2，`PICK_OBJECT_COUNT` = 3。
+
+- **位置表**（都写在 `pick_place.cpp` 顶部，改这里即可自定义）：
+
+  | 物体 | 初始位置 | 放置位置 | x 位移 | y 位移 |
+  |---|---|---|---|---|
+  | A | (24, 12, 12) | (16, -14, 12) | -8 | -26 |
+  | B | (24, -12, 12) | (14, 16, 12) | -10 | +28 |
+  | C | (12, 20, 12) | (26, -8, 12) | +14 | -28 |
+
+  三个初始点两两相距 24.00 / 14.42 / 34.18，三个放置点两两相距 30.07 / 11.66 / 26.83。
+
+- **动作拆解**（每个物体都是这套）：到物体上方 → 垂直下降到抓取高度 → 合爪
+  （`angle4` 写成 `servoLimit.minF`，与串口 `S` 同角度）→ 停顿 400ms → 垂直抬起
+  → 平移到放置点上方 → 垂直下降到放置高度 → 张爪（`servoLimit.maxF`，与 `O` 同角度）
+  → 停顿 400ms → 垂直撤离。
+
+- **启动前校验**：把 6 段直线按 0.5 的步长采样（每段最多 64 点），逐点要求
+  "在 `limit` 内 + `isReachable()` + 反解成功且未被吸附"，且相邻采样点的关节角
+  跳变不超过 25°（防止反解中途换分支）；还要求当前位姿与手里角度同分支（差 ≤10°）。
+  任何一项不过就拒绝启动并保持现状 —— 宁可不动，也不能半路甩臂。
+
+- **串口集成**：`serial_protocol.cpp` 在单字符命令 `switch` 里加了 `A/B/C` 三个分支，
+  返回 `PROTO_RES_PICK_STARTED`（10）或 `PROTO_RES_BUSY`（11）；序列执行期间
+  `protoHandleLine()` 最前面有忙守卫，**只放行调速指令 `H/L/1/2/3`**，其余动作指令
+  一律返回 `PROTO_RES_BUSY` 且不改状态。摇杆侧在 `joystick_control.cpp` 的轴步进循环
+  开头 `if (pickPlaceIsBusy()) break;` —— 序列独占 b/r/c 与末端角。
+
 ## PowerShell 的两个坑
 
 1. **`& $gpp ... 2>&1` 赋给变量后 `$LASTEXITCODE` 仍是 0** —— g++ 的 warning 走
@@ -234,3 +287,11 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
    （r=0 上臂水平朝前、r=180 上臂水平朝后）。与 c 组合后末端最低可到肩关节
    以下约 20，可能撞台面或底座。**请先在慢速档、空载、抬离台面的情况下
    单步试**，确认行程两端不会撞到东西再放开跑。
+
+6. **A/B/C 三个物体的实际摆放位置**：`pick_place.cpp` 顶部的 `PICK_SRC` 与
+   `PICK_DST` 只是"设计值"，真机上是把物体摆在哪儿就改哪一行（单位与坐标
+   模型一致，`x/y` 是水平面、`z` 是高度）。第一次跑取放序列请务必：
+   先进慢速档（串口发 `L` 或 `1`），**卸掉夹爪里的物体**，用 `A` 试跑一遍，
+   观察夹爪是否真的夹到物体中段高度（`PICK_GRASP_Z` / `PICK_APPROACH_DZ`
+   也在同一个文件顶部）。序列速度 = 当前档位（慢 25 / 中 50 / 快 90 度每秒），
+   夹爪段固定 60 度每秒。
