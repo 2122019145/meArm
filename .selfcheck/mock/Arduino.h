@@ -51,6 +51,9 @@ struct MockSerial {
   void println(long v)                     { if (mockSerialOn()) printf("%ld\n", v); }
   void println(unsigned long v)            { if (mockSerialOn()) printf("%lu\n", v); }
   void println(double v)                   { if (mockSerialOn()) printf("%f\n", v); }
+  /* 真 Arduino 的 Stream 同时有 print(double,int) 与 println(double,int)，
+   * 这里补齐后者（draw_control.cpp 用它打印带小数位的坐标）。 */
+  void println(double v, int digits)       { if (mockSerialOn()) printf("%.*f\n", digits, v); }
 };
 extern MockSerial Serial;
 

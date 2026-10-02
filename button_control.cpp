@@ -47,6 +47,7 @@
 #include "pick_place.h"
 #include "protocol_constants.h"
 #include "button_control.h"
+#include "draw_control.h"
 
 /* 与 constant_and_positions.cpp / serial_protocol.cpp 保持一致：1 = 打调试日志 */
 #define WEARM_DEBUG_SERIAL 1
@@ -588,6 +589,13 @@ static int btnActionHome(void) {
 }
 
 static int btnAction(int key) {
+  /* 绘图任务在跑（或正在示教）时，四个按键交给 draw_control.cpp 解释：
+   * 示教中 1=记录 2=撤销 3=取消 4=开始；绘制中 1=暂停 2=继续 3=取消 4=无动作。
+   * 空闲时 drawAcceptButton() 返回 false，按键仍然是原来的循环取放/录制/播放/回中。 */
+  if (drawAcceptButton(key)) {
+    return drawHandleButton(key);
+  }
+
   switch (key) {
     case BTN_KEY_CYCLE:  return btnActionCycle();
     case BTN_KEY_RECORD: return btnActionRecord();

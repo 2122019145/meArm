@@ -3,6 +3,7 @@
 // 串口命令协议实现：固定指令通信 + 多舵机协同（x/y/z 三舵机同步角度）
 // 另含 A/B/C 自动取放序列的启动入口（序列执行期间本层挡下其它动作指令）
 // 以及四个物理按键的串口等价命令 N/R/P/M（实现委托给 button_control.cpp）
+// 以及绘图命令 F/D/G/E/Q/U/W 与纸面标定命令 p/n/o（实现委托给 draw_control.cpp）
 // 实现串口字符读取、行缓冲、命令解析和舵机控制
 */
 
@@ -12,6 +13,7 @@
 #include "protocol_constants.h"
 #include "serial_protocol.h"
 #include "button_control.h"
+#include "draw_control.h"
 #define WEARM_DEBUG_SERIAL 1
 
 /* ---------- 行缓冲与状态 ---------- */
@@ -27,6 +29,7 @@ static bool protoParseAxisLine(const char *s, double angles[3], bool seen[3]);
 static bool protoParseNumber(const char **pp, double *out);
 static int protoApplyAngles(const double angles[3], const bool seen[3]);
 static int protoSpeedStep(int delta);
+static int protoHandleDrawCalib(const char *line, char cmd);
 
 /* ========== 主循环接口 ========== */
 /* 每轮 loop() 调用一次：把串口收到的字符攒成一行并执行 */
@@ -155,22 +158,24 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
-  /* 忙判定：取放序列执行期间，或按键模块正在录制/播放/回中时，
+  /* 忙判定：取放序列执行期间，或按键模块正在录制/播放/回中，或绘图任务正在跑时，
    * 其它串口动作指令与摇杆都让位。
    *
    * 两个例外必须放行（由被调用的模块自己再判一次，不合格就回 PROTO_RES_BUSY）：
    *   1) 调速指令（H、L、1、2、3）—— 取放序列与录制的过程中都可能想调速度；
-   *   2) 按键命令（N、R、P、M）—— 录制中想发 R 结束录制，若在这里就被拦掉就永远结束不了。 */
-  if (pickPlaceIsBusy() || buttonControlBusy()) {
+   *   2) 按键命令（N、R、P、M）—— 录制中想发 R 结束录制，若在这里就被拦掉就永远结束不了。
+   *   3) 绘图命令（F、D、G、E、Q、U、W 与 p、n、o）—— 暂停/继续/取消/记录/标定
+   *      正是"绘图进行中"才需要发的命令，拦掉就等于三项控制功能全废。 */
+  if (pickPlaceIsBusy() || buttonControlBusy() || drawControlBusy()) {
     char cmd = buf[0];
     bool speedCmd = (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN ||
                      cmd == PROTO_CMD_SPEED_SLOW || cmd == PROTO_CMD_SPEED_NORMAL ||
                      cmd == PROTO_CMD_SPEED_FAST);
-    if (!speedCmd && !buttonIsCommandChar(cmd)) {
+    if (!speedCmd && !buttonIsCommandChar(cmd) && !drawIsCommandChar(cmd)) {
       /* 不打这句的话，上位机在序列执行的十几秒里发什么都不回话，
        * 操作者会以为板子死机了（实际是故意不执行）。 */
 #if WEARM_DEBUG_SERIAL
-      Serial.println(F("[proto] busy: pick/place or record/play running, command ignored"));
+      Serial.println(F("[proto] busy: pick/place, button or draw running, command ignored"));
 #endif
       return PROTO_RES_BUSY;
     }
@@ -290,8 +295,29 @@ int protoHandleLine(const char *line)
       case PROTO_CMD_BTN_HOME:
       case PROTO_CMD_BTN_HOME_ALT:
         return buttonHandleCommand(cmd);
+
+      /* F/D/G/E/Q/U/W：绘图命令（切换任务 / 开始 / 记录示教点 / 撤销 / 暂停 / 继续 / 取消）。
+       * 具体能不能执行（是否正在绘制、示教点够不够、轨迹校验过不过）由
+       * draw_control.cpp 自己判断，不合格时它返回 PROTO_RES_BUSY 或 PROTO_RES_DRAW_REJECTED
+       * —— 上面的忙守卫特意放行了这几个字符，否则"绘图进行中"想暂停/取消会被拦掉。 */
+      case PROTO_CMD_DRAW_TASK:
+      case PROTO_CMD_DRAW_START:
+      case PROTO_CMD_DRAW_RECORD:
+      case PROTO_CMD_DRAW_UNDO:
+      case PROTO_CMD_DRAW_PAUSE:
+      case PROTO_CMD_DRAW_RESUME:
+      case PROTO_CMD_DRAW_CANCEL:
+        return drawHandleCommand(cmd);
     }
     /* 单字符命令不识别，继续往下走角度解析 */
+  }
+
+  /* 纸面标定命令 p/n/o：多字符（p12.5 / n6 / o20,0），落在角度解析之前处理，
+   * 因为 'o' 那行含逗号，不先截下来会被当成"像角度指令却写错了"。 */
+  if (buf[0] == PROTO_CMD_DRAW_PAPER_Z ||
+      buf[0] == PROTO_CMD_DRAW_HALF ||
+      buf[0] == PROTO_CMD_DRAW_CENTER) {
+    return protoHandleDrawCalib(buf, buf[0]);
   }
 
   /* 角度指令解析 */
@@ -429,6 +455,54 @@ static bool protoParseNumber(const char **pp, double *out)
   *out = result;
   *pp = p;
   return true;
+}
+
+/* ========== 绘图参数标定 ========== */
+/* p<纸面高度> / n<半宽> / o<中心x>,<中心y>
+ * 语法错或取值超出允许范围都返回 PROTO_RES_DRAW_REJECTED，且不改动任何参数。 */
+static int protoHandleDrawCalib(const char *line, char cmd)
+{
+  const char *p = line + 1;   /* 跳过命令字母 */
+  double v1 = 0.0;
+  double v2 = 0.0;
+
+  while (*p == ' ' || *p == '\t') p++;
+  if (!protoParseNumber(&p, &v1)) return PROTO_RES_DRAW_REJECTED;
+  while (*p == ' ' || *p == '\t') p++;
+
+  bool ok = false;
+  if (cmd == PROTO_CMD_DRAW_PAPER_Z) {
+    if (*p == '\0') ok = drawSetPaperZ(v1);
+  } else if (cmd == PROTO_CMD_DRAW_HALF) {
+    if (*p == '\0') ok = drawSetHalfSize(v1);
+  } else {
+    if (*p == ',') {
+      p++;
+      while (*p == ' ' || *p == '\t') p++;
+      if (protoParseNumber(&p, &v2)) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') ok = drawSetCenter(v1, v2);
+      }
+    }
+  }
+
+#if WEARM_DEBUG_SERIAL
+  if (ok) {
+    Serial.print(F("[draw] 标定 -> 纸面 z="));
+    Serial.print(drawGetPaperZ(), 2);
+    Serial.print(F(" 半宽="));
+    Serial.print(drawGetHalfSize(), 2);
+    Serial.print(F(" 中心=("));
+    Serial.print(drawGetCenterX(), 2);
+    Serial.print(F(","));
+    Serial.print(drawGetCenterY(), 2);
+    Serial.println(F(")"));
+  } else {
+    Serial.println(F("[draw] 标定命令语法错或取值非法，参数未改动"));
+  }
+#endif
+
+  return ok ? PROTO_RES_DRAW_CALIBRATED : PROTO_RES_DRAW_REJECTED;
 }
 
 /* ========== 落地写入 ========== */

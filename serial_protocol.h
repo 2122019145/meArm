@@ -51,6 +51,17 @@
 #define PROTO_RES_PLAY_NO_RECORD 16 /* P：还没有录制数据可播 */
 #define PROTO_RES_HOME_STARTED   17 /* M/0：开始回中 */
 
+/* 绘图命令的返回值（F/D/G/E/Q/U/W 与 p/n/o，实现见 draw_control.cpp） */
+#define PROTO_RES_DRAW_TASK_SELECTED 18 /* F：切换绘制任务（直线/N/三角形/Z/V/五点折线/五点曲线） */
+#define PROTO_RES_DRAW_STARTED       19 /* D：绘图任务已启动（内置图形，或进入五点示教） */
+#define PROTO_RES_DRAW_PAUSED        20 /* Q：绘制已暂停（停在原地，任务状态保留） */
+#define PROTO_RES_DRAW_RESUMED       21 /* U：从暂停处继续绘制 */
+#define PROTO_RES_DRAW_CANCELED      22 /* W：取消本次绘图，抬笔后回待机 */
+#define PROTO_RES_DRAW_TEACH_POINT   23 /* G：记录一个示教点 */
+#define PROTO_RES_DRAW_TEACH_UNDO    24 /* E：撤销一个示教点 */
+#define PROTO_RES_DRAW_REJECTED      25 /* 绘图请求被拒：轨迹校验不过 / 示教点不够 / 标定值非法 */
+#define PROTO_RES_DRAW_CALIBRATED    26 /* p/n/o：纸面高度、图形半宽、图形中心已更新 */
+
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */
 void serialProtocolBegin(void);
