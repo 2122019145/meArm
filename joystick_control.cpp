@@ -349,6 +349,9 @@ void joystickLoop(void) {
   }
 #endif
 
-  /* 3) 指示灯：本轮有任何关节在动 -> 快闪；否则灭 */
-  updateLed(moved);
+  /* 3) 指示灯：本轮有任何关节在动 -> 快闪；否则灭。
+   *    取放序列期间摇杆被独占（moved 恒为 false），但 b/r/c 三个关节
+   *    确实一直在走，所以把"序列在执行"也算作在动，否则那十几秒灯是灭的，
+   *    看着像死机。 */
+  updateLed(moved || pickPlaceIsBusy());
 }

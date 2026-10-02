@@ -58,13 +58,19 @@ static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] = {
 
 /* 放置位置。逐条的位移（探针要求 x、y 都有明显位移，门限 5.0）：
  *   A: Δx = 16.0 - 24.0 =  -8.0    Δy = -14.0 -  12.0 = -26.0
- *   B: Δx = 14.0 - 24.0 = -10.0    Δy =  16.0 - (-12.0) = +28.0
- *   C: Δx = 26.0 - 12.0 = +14.0    Δy =  -8.0 -  20.0 = -28.0
- * 三个放置点两两之间的距离：A-B 30.1、A-C 11.7、B-C 26.8，都算"明显不同的位置"。 */
+ *   B: Δx = 18.0 - 24.0 =  -6.0    Δy =  16.0 - (-12.0) = +28.0
+ *   C: Δx = 28.0 - 12.0 = +16.0    Δy =  -6.0 -  20.0 = -26.0
+ * 三个放置点两两之间的距离：A-B 30.1、A-C 14.4、B-C 24.2，都算"明显不同的位置"。
+ * 还有一条约束（探针 [1] 会断言）：放置点离**别人**的初始位置不能太近，否则
+ * 给某个物体放件时会蹭到还在地上的另一个物体。实测最近的距离是 7.21（√52），
+ * 而且是三对并列：B 放 (18,16) 对 A 初始 (24,12)、B 放 (18,16) 对 C 初始 (12,20)、
+ * C 放 (28,-6) 对 B 初始 (24,-12)，三对都是 7.2111，比夹爪宽度宽。
+ * 最初选的 B 放 (14,16) 与 C 初始点只差 4.47、C 放 (26,-8) 与
+ * B 初始点只差 4.47，都改掉了。 */
 static const struct pickPoint PICK_DST[PICK_OBJECT_COUNT] = {
   { 16.0, -14.0, PICK_GRASP_Z },   /* A 放这里 */
-  { 14.0,  16.0, PICK_GRASP_Z },   /* B 放这里 */
-  { 26.0,  -8.0, PICK_GRASP_Z }    /* C 放这里 */
+  { 18.0,  16.0, PICK_GRASP_Z },   /* B 放这里 */
+  { 28.0,  -6.0, PICK_GRASP_Z }    /* C 放这里 */
 };
 
 static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
@@ -111,14 +117,13 @@ enum {
   PICK_ST_DESCEND_DST,
   PICK_ST_OPEN_TOOL,
   PICK_ST_DWELL_OPEN,
-  PICK_ST_RETREAT,
-  PICK_ST_DONE
+  PICK_ST_RETREAT
 };
 
 static const char *const PICK_STAGE_NAME[] = {
   "idle", "to-src-approach", "descend-src", "close-tool", "dwell-close",
   "lift", "traverse", "descend-dst", "open-tool", "dwell-open",
-  "retreat", "done"
+  "retreat"
 };
 
 /* 阶段类型：直线插值移动 / 夹爪角度渐变 / 原地停顿 */

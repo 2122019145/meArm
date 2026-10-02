@@ -123,6 +123,19 @@ int main(void) {
     }
   }
 
+  /* 放件时另一个物体可能还停在它的初始位置上：放置点离"别人的初始点"太近，
+   * 夹爪垂直下降就会蹭到它。这个门限和上面一样取 5.0。 */
+  double worstClear = 1e9;
+  for (int i = 0; i < PICK_OBJECT_COUNT; i++) {
+    for (int k = 0; k < PICK_OBJECT_COUNT; k++) {
+      if (i == k) continue;
+      double dc = distXY(&dst[i], &src[k]);
+      if (dc < worstClear) worstClear = dc;
+    }
+  }
+  snprintf(d, sizeof(d), "最紧的一对是 %.2f（要求 >=5）", worstClear);
+  check("放置点不会蹭到别的物体（离别人的初始点 >=5）", worstClear >= 5.0, d);
+
   /* ---------------- 2) 取放点与接近点 ---------------- */
   printf("\n[2] 取放点与接近点可达性\n");
   for (int i = 0; i < PICK_OBJECT_COUNT; i++) {

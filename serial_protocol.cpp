@@ -160,6 +160,11 @@ int protoHandleLine(const char *line)
     if (cmd != PROTO_CMD_SPEED_UP && cmd != PROTO_CMD_SPEED_DOWN &&
         cmd != PROTO_CMD_SPEED_SLOW && cmd != PROTO_CMD_SPEED_NORMAL &&
         cmd != PROTO_CMD_SPEED_FAST) {
+      /* 不打这句的话，上位机在序列执行的十几秒里发什么都不回话，
+       * 操作者会以为板子死机了（实际是故意不执行）。 */
+#if WEARM_DEBUG_SERIAL
+      Serial.println(F("[proto] busy: pick/place running, command ignored"));
+#endif
       return PROTO_RES_BUSY;
     }
   }
