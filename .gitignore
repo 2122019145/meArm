@@ -1,0 +1,40 @@
+# ---- 编辑器 / IDE ----
+# JetBrains（Arduino IDE 2 / CLion 系）的本地状态：workspace.xml 里有本机路径、
+# 打开过的文件、运行配置，属于"每个人都不一样"的东西，不该进仓库。
+.idea/
+*.iml
+
+# VS Code：c_cpp_properties.json 里的 includePath/编译器路径是本机绝对路径，
+# 换台机器就失效；settings.json 若将来加入本地配置也一并忽略。
+.vscode/
+!.vscode/extensions.json
+
+# ---- 编译产物 ----
+# .selfcheck 是 PC 端的自检/回归目录，源码要进仓库（它是工程的一部分），
+# 但生成的 exe/obj/日志不进。注意：目录一旦被忽略，里面的文件就无法用
+# "!" 再捞回来，所以这里只忽略 out/ 子目录本身。
+.selfcheck/out/
+*.o
+*.obj
+*.exe
+*.elf
+*.hex
+*.bin
+*.map
+*.i
+
+# Arduino 构建目录与编辑器临时目录（本工程里出现过 *.tmpdir 残留）
+build/
+*.tmpdir/
+
+# 编辑器/系统的临时文件
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+.DS_Store
+Thumbs.db
+
+# 日志（探针日志在 .selfcheck/out/ 下，已被上面排除）
+*.log
