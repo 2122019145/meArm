@@ -29,7 +29,7 @@
 #include "joystick_control.h"
 
 /* ---------- 编译开关 ---------- */
-/* 置 1: 打开串口(115200)用于调试与速度/末端命令。
+/* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 需与 constant_and_positions.cpp 中的同名开关保持一致。 */
 #define WEARM_DEBUG_SERIAL 1
 #define WEARM_JOY_DEBUG    0   /* 置 1 时每次移动都打印各轴与角度，调试用 */
@@ -250,11 +250,9 @@ void joystickSetup(void) {
   digitalWrite(PIN_LED_MODE, LOW);
 
 #if WEARM_DEBUG_SERIAL
-  Serial.begin(115200);
   JLOG("[joy] MeArm dual-stick JOINT control ready (A0-A3)");
   JLOG("[joy] A0 -> b angle1 base   A1 -> r angle2 shoulder");
   JLOG("[joy] A3 -> c angle3 elbow  A2 -> f angle4 tool");
-  JLOG("[joy] serial: 1/2/3 = SLOW/NORMAL/FAST, k/K = tool open/close");
 #endif
 
   for (int i = 0; i < JIDX_COUNT; i++) lastStepTime[i] = millis();
@@ -267,17 +265,14 @@ void joystickSetup(void) {
 }
 
 void joystickLoop(void) {
-  /* 1) 串口命令（调速 '1'/'2'/'3'、末端 'k'/'K'），放在最前面保证及时响应 */
-  handleSerialSpeedCmd();
-
-  /* 2) 摇杆采样（4 路轴一次读完，同时给出方向、幅度与活跃位图） */
+  /* 1) 摇杆采样（4 路轴一次读完，同时给出方向、幅度与活跃位图） */
   struct joyState st;
   joystickReadState(&st);
 
   unsigned long now = millis();
   bool moved = false;
 
-  /* 3) 按"关节 | 偏转量 | 原始轴值 | 该关节的计时槽"逐轴步进。
+  /* 2) 按"关节 | 偏转量 | 原始轴值 | 该关节的计时槽"逐轴步进。
    *    每个关节自己一套时间门控：一个关节推到头或在慢速档，
    *    不会把另一个关节也拖慢。偏转越大步越慢（安全）。 */
   /* 【方向约定】上臂 r 与下臂 c 这两路推杆方向是上机实测后调转过的：
@@ -350,6 +345,6 @@ void joystickLoop(void) {
   }
 #endif
 
-  /* 4) 指示灯：本轮有任何关节在动 -> 快闪；否则灭 */
+  /* 3) 指示灯：本轮有任何关节在动 -> 快闪；否则灭 */
   updateLed(moved);
 }

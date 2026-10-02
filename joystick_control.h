@@ -30,8 +30,12 @@
 //     右手柄 前后推 (A3)      c = angle3 下臂俯仰       前推 = 角度减小 / 后拉 = 角度增大
 //     右手柄 左右推 (A2)      f = angle4 末端夹具       角度增大（张开）
 //     上臂与下臂这两路的方向是上机实测后调转过的，基座与末端未改。
-//     串口发送 '1'/'2'/'3'     切速度档: 慢速 / 中速 / 快速  (波特率 115200)
-//     串口发送 'k'/'K'          末端张开 / 收回 (与右手柄左右推等效)
+//     串口发送 O              爪子张开（angle4 走到 f 行程上限）
+//     串口发送 S              爪子关闭（angle4 走到 f 行程下限）
+//     串口发送 H / L          整体运行速度 提升 / 降低 一档  (波特率 115200)
+//     串口发送 x角度,y角度,z角度  同步设置三个舵机，例: x10,y30,z20
+//                             x -> angle1 基座、y -> angle2 上臂、z -> angle3 下臂
+//                             （旧的 '1'/'2'/'3' 调速与 k/K 末端开合仍兼容）
 //
 //   每个关节的行程由全局 servoLimit 限制（b 0~180 / r 0~180 / c 0~180 / f 60~150），
 //   推到行程尽头就停住（moveJointStep 返回 MOVE_AT_LIMIT），不会顶死舵机。
@@ -109,8 +113,8 @@ struct joyState {
 #define JOY_ACT_ELBOW    0x04   /* 下臂 c */
 #define JOY_ACT_TOOL     0x08   /* 末端 f */
 
-/* 初始化摇杆引脚、LED 与串口（在 setup() 中调用）。
- * 注意：内部会 Serial.begin(115200)，不要重复初始化。 */
+/* 初始化摇杆引脚与 LED（在 setup() 中调用）。
+ * 注意：串口由 serial_protocol 模块的 serialProtocolBegin() 初始化，这里不再初始化。 */
 void joystickSetup(void);
 
 /* 读取当前手柄状态（4 个自由度的偏转量 + 原始值 + 选中的移动方向） */
@@ -123,7 +127,7 @@ int joystickRead(void);
 int joystickGetMode(void);
 
 /* 每轮 loop 调一次，非阻塞（内部不使用 delay）。
- * 内部依次处理：串口命令 -> 摇杆采样 -> 按全局调速参数步进 -> LED 指示。 */
+ * 内部依次处理：摇杆采样 -> 按全局调速参数步进 -> LED 指示。 */
 void joystickLoop(void);
 
 #endif /* WEARM_JOYSTICK_CONTROL_H */

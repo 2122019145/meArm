@@ -6,8 +6,8 @@
 # 或  powershell -NoProfile -ExecutionPolicy Bypass -File D:\dsh1\wearm\.selfcheck\run_all.ps1
 #
 # 做三件事：
-#   1. 严格编译 3 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）
-#   2. 严格编译并运行 5 个自检程序，逐个要求 "ALL PASS" 且退出码 0
+#   1. 严格编译 5 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）
+#   2. 严格编译并运行 6 个自检程序，逐个要求 "ALL PASS" 且退出码 0
 #   3. 汇总退出码（任一失败则 exit 1）
 #
 # 【注意 PowerShell / g++ 的坑】
@@ -26,7 +26,7 @@ $mock = Join-Path $sc 'mock'
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null }
 
-$fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp') | ForEach-Object { Join-Path $root $_ }
+$fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp') | ForEach-Object { Join-Path $root $_ }
 $inc = @("-I$root", "-I$mock")
 $fail = 0
 
@@ -51,7 +51,7 @@ Write-Host '================ 2) 自检程序（必须 ALL PASS）===============
 # 结果 $fw 里已经含 move.cpp、又在 extra 里再列一次，触发
 # "multiple definition of moveJointStep(int, double)" 链接错误。
 # 全部链接既简单又不会漏（未用到的目标文件由链接器按需取舍）。
-$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test')
+$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol')
 foreach ($n in $probes) {
     $src  = Join-Path $sc ($n + '.cpp')
     $exe  = Join-Path $out ($n + '.exe')
@@ -80,7 +80,7 @@ foreach ($n in $probes) {
 
 Write-Host ''
 if ($fail -eq 0) {
-    Write-Host '>>> 全部通过（固件零警告 + 5 个自检 ALL PASS）' -ForegroundColor Green
+    Write-Host ('>>> 全部通过（固件零警告 + {0} 个自检 ALL PASS）' -f $probes.Count) -ForegroundColor Green
     exit 0
 } else {
     Write-Host (">>> 有 {0} 项失败" -f $fail) -ForegroundColor Red

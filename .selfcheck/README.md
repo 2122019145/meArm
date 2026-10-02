@@ -34,9 +34,9 @@ Windows 默认禁止直接运行 `.ps1`。）
 
 它做两件事，任一失败就 `exit 1`：
 
-1. **严格编译 3 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
+1. **严格编译 5 个固件 TU**（`-Wall -Wextra -Wshadow -Wconversion`），要求
    **零警告**；
-2. **编译并运行 5 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
+2. **编译并运行 6 个自检程序**，逐个要求输出里有 `ALL PASS` 且退出码 0。
 
 每个探针的完整输出会存到 `.selfcheck\out\<探针>.log`。
 
@@ -47,6 +47,8 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] constant_and_positions.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] move.cpp  EXIT=0  输出 0 行（零警告）
   [ OK ] joystick_control.cpp  EXIT=0  输出 0 行（零警告）
+  [ OK ] protocol_constants.cpp  EXIT=0  输出 0 行（零警告）
+  [ OK ] serial_protocol.cpp  EXIT=0  输出 0 行（零警告）
 
 ================ 2) 自检程序（必须 ALL PASS）================
   [ OK ] probe_axes  零警告编译 + ALL PASS
@@ -54,8 +56,9 @@ Windows 默认禁止直接运行 `.ps1`。）
   [ OK ] probe_move  零警告编译 + ALL PASS
   [ OK ] probe_joystick  零警告编译 + ALL PASS
   [ OK ] wearm_ino_test  零警告编译 + ALL PASS
+  [ OK ] probe_protocol  零警告编译 + ALL PASS
 
->>> 全部通过（固件零警告 + 5 个自检 ALL PASS）
+>>> 全部通过（固件零警告 + 6 个自检 ALL PASS）
 ```
 
 ## 每个探针在测什么
@@ -67,6 +70,7 @@ Windows 默认禁止直接运行 `.ps1`。）
 | `probe_joystick` | 四路轴各控一个关节角且互不干扰、坐标 = `recFromServo(Pos.ser)`、末端 A2 方向与限位、斜推可同时动多个关节、死区不动作、串口 `1/2/3` 调速、串口 `k/K` 开合、快速转角 > 慢速、四路推到头都停在 `servoLimit` 内、4000 轮随机推杆 |
 | `probe_axes` | 5929741 个关节角组合扫出真实可达包络、验证 `limit` 完全覆盖包络且余量非负、单轴满行程自查（每个关节都能走到行程两端）、5 个标定点核对 |
 | `wearm_ino_test` | **直接 `#include "../wearm.ino"`**（不手抄复刻）：4 个舵机 attach 引脚、上电姿态 = POS_HOME、上电不是 0（不会甩向原点）、静置 20 轮 loop 不动、推杆后 loop 真的把新角度写进舵机 |
+| `probe_protocol` | 串口协议完整测试：O/S/H/L 命令（爪子开/关/升档/降档）、角度指令格式（x10,y30,z20 及其变体）、行缓冲与超时处理（PROTO_LINE_BUF_SIZE=40, PROTO_LINE_TIMEOUT_MS=300）、速度档位边界（PROTO_SPEED_LEVEL_MIN/MAX/DEF）、MockSerial 64 字节缓冲边界测试、无换行超时场景、单字符打印 vs 码值打印 |
 
 ### 当前实测包络（r、c 都放开到 0~180 之后）
 
@@ -114,6 +118,15 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
    - 用 `==` 比较浮点角度：`posInit()` 走"设坐标→反解→落角度"往返，
      角度带 ~1e-13 舍入误差，`89.99999999999999 != 90.0` 会报假失败
      （而 `%.1f` 打印出来完全正常）→ 用容差比较。
+
+6. **串口必须单一读者**。旧函数 `handleSerialSpeedCmd()` 自己调用 `Serial.read()`，新的行缓冲也要读同一串数据，两个读者会把字节各吃一半、行永远拼不完整。因此旧函数已**整体删除**（连同 `constant_and_positions.h` 里的声明），串口字节只由 `serialProtocolLoop()` 读，调用点只在 `weArm.ino` 的 `loop()` 里（放在 `joystickLoop()` 之前）。`joystickSetup()` 也不再调用 `Serial.begin()`。
+7. **mock 的串口输入缓冲只有 64 字节且只追加不压缩**：`.selfcheck\mock\Arduino.cpp` 里是 `static char inBuf[64]`，`mockSerialFeed()` 只 append，读空后 `inPos` 等于 `inLen` 但 `inLen` 不回退。所以连续喂超过 64 字节的测试，后面的字符根本进不去 —— 测的是 mock 缓冲被塞满，而不是固件行为。正确做法是穿插 `mockSerialClear()`（或分段重建缓冲）。反例：`probe_protocol` 原超长行用例注释写"60 个 A"，字面量实际是 70 个，行尾换行符根本没能进缓冲。
+8. **无换行超时用例必须调用两次 `serialProtocolLoop()`**：固件在读到字符时把 `s_lastCharMs` 记成 `millis()`，若先喂数据、再一次性推进 400 毫秒、再调 loop，则超时判断里的时间差恒为 0。正确写法是先 `mockSerialFeed` 再调一次 loop，再 `g_mockMillis` 加 400，再调第二次 loop。
+9. **mock 的 `MockSerial` 没有 `print` 的单字符重载**：写 `Serial.print(某个 char 变量)` 会被隐式提升到打印 int，串口里打出的是码值（例如字母 x 打成 120）。要打印单个字符必须用长度 2 的 C 串（`char ch[2] = { c, 0 }; Serial.print(ch);`），真机与 mock 都能出字母。
+10. **`PROTO_ANGLE_MIN` 与 `PROTO_ANGLE_MAX` 已被删除**：本工程不为解析阶段定义名义角度区间。解析时不该因为角度超出某个区间就拒绝指令（那样 x200 就变成废指令），而是落地前按该关节真实的 `servoLimit` 夹取（x200 最终写 180）。探针要造随机角度请用自己的局部常量。
+11. **探针直接赋值 `Pos.ser` 会造出固件永远不会产生的脏状态**：探针的 `resetInputs()` 直接写 `Pos.ser.angle1` 到 `angle4`，不走固件写入路径，因此 `Pos.rec` 不刷新；而固件唯一写角度的地方 `protoApplyAngles()` 在 `written` 大于 0 时会调一次 `recFromServo(&Pos.rec, &Pos.ser)`，即固件任何一次成功写入都保证 `Pos.rec` 自洽。曾因此在压力测试里出现 violations 等于 4 的假警报（全是"Pos.rec 必须等于 recFromServo(Pos.ser)"这一条不变量）。正确做法：压力测试开始前自己补一句 `(void) recFromServo(&Pos.rec, &Pos.ser);`。
+12. **PowerShell 的逗号优先级高于加号**：把两个 `-I` 参数用 `@("-I" + $root, "-I" + $mock)` 这样写会拼成**一个**字符串，表现为编译报 `fatal error: Arduino.h: No such file or directory`。必须给每个拼接加括号。
+13. **给子智能体的长文本（例如 workflow 脚本里的 prompt）不能出现反引号**：脚本里用模板字符串包住 prompt 时，正文里的 markdown 反引号会直接终结模板字符串，报 `workflow script does not parse` 与 `SyntaxError: Unexpected identifier`。
 
 ## 固件里的坑（自检抓到过的真 bug）
 
@@ -170,6 +183,27 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 - 推进时间：直接改 `g_mockMillis += ms;`（固件里没有 `delay`，全靠时间门控）。
 - `mockServoPin(i)` / `mockServoAngle(i)` / `mockServoWriteCount()` 记录每个
   `Servo` 实例最后一次 attach 的引脚与写入的角度（`wearm_ino_test` 靠它核对接线）。
+
+## 新增串口协议模块
+
+本轮新增了完整的串口协议处理模块，包含：
+
+- **协议常量**（`protocol_constants.h` 与 `.cpp`）：
+  - 命令字符：`O`（爪子张开）、`S`（爪子关闭）、`H`/`L`（速度档升/降）、`x/y/z`（轴指令）
+  - 兼容保留字符：`1/2/3`、`k/K`
+  - 轴到舵机映射：`protoAxisServoIndex = {1,2,3}`（x→基座、y→上臂、z→下臂）
+  - 关节字母表：`protoAxisJoint = {b,r,c}`
+  - 协议参数：`PROTO_LINE_BUF_SIZE=40`、`PROTO_BAUD=115200`、`PROTO_LINE_TIMEOUT_MS=300`、`PROTO_TOOL_STEP_DEG=5.0`
+  - 速度档位：`PROTO_SPEED_LEVEL_MIN`/`MAX`/`DEF`
+
+- **串口协议处理**（`serial_protocol.h` 与 `.cpp`）：
+  - 字符读取、行缓冲、命令解析与落地写入
+  - 对外接口：`serialProtocolBegin()`、`serialProtocolLoop()`、`protoHandleLine(const char*)`
+  - 命令语义：`O`=爪子开、`S`=爪子关、`H/L`=速度档升降、`x角度,y角度,z角度`格式指令
+
+- **探针更新**：
+  - `probe_joystick` 中的旧串口用例已删除，移至 `probe_protocol` 专门测试
+  - 新增 `probe_protocol` 探针（约 582 行，12 段）专门测试串口协议功能
 
 ## PowerShell 的两个坑
 

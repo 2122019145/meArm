@@ -234,10 +234,4 @@ const char *speedLevelName(int level);
 /* 在 慢→中→快→慢 之间循环降一档，返回生效的档位。 */
 int  speedStepDown(void);
 
-/* 串口命令处理：
- *   '1'/'2'/'3' —— 切到 慢速/中速/快速 档
- *   'k'/'K'     —— 末端张开 / 收回一步
- * 需在 loop() 中调用（joystickLoop() 内部已调用，二者不要重复）。 */
-void handleSerialSpeedCmd(void);
-
 #endif /* WEARM_CONSTANT_AND_POSITIONS_H */

@@ -1,8 +1,8 @@
 /* probe_joystick.cpp —— 双摇杆手柄层端到端回归（【角度模式】：摇杆直接控关节角）
  * 直接链接固件：joystick_control.cpp + constant_and_positions.cpp + move.cpp
  *
- * 仿真方式：改写 g_mockAnalog（A0 起算下标）模拟推杆，推进 g_mockMillis 走时间门控，
- *           用 mockSerialFeed() 喂串口命令。
+ * 仿真方式：改写 g_mockAnalog（A0 起算下标）模拟推杆，推进 g_mockMillis 走时间门控。
+ *           （串口命令已搬到 serial_protocol 模块，由 probe_protocol.cpp 负责测试。）
  *
  * 角度模式与旧的坐标模式的区别：
  *   被控量是 Pos.ser.angle1..angle4，Pos.rec.x/y/z 是正运动学算出的派生量。
@@ -200,47 +200,7 @@ int main(void) {
           fabs(j1.c - j0.c) < 1e-9 && fabs(j1.f - j0.f) < 1e-9, buf);
   }
 
-  printf("=== 6) 串口命令 '1'/'2'/'3' 调速 ===\n");
-  {
-    mockSerialFeed("1");
-    runLoop(1, 5);
-    snprintf(buf, sizeof(buf), "step=%.1f deg", speed.stepSize);
-    check("串口 '1' -> 慢速 0.5 度/步", fabs(speed.stepSize - 0.5) < 1e-9, buf);
-
-    mockSerialFeed("2");
-    runLoop(1, 5);
-    snprintf(buf, sizeof(buf), "step=%.1f deg", speed.stepSize);
-    check("串口 '2' -> 中速 1.0 度/步", fabs(speed.stepSize - 1.0) < 1e-9, buf);
-
-    mockSerialFeed("3");
-    runLoop(1, 5);
-    snprintf(buf, sizeof(buf), "step=%.1f deg", speed.stepSize);
-    check("串口 '3' -> 快速 2.0 度/步", fabs(speed.stepSize - 2.0) < 1e-9, buf);
-  }
-
-  printf("=== 7) 串口 'k'/'K' 控末端开合 ===\n");
-  {
-    resetInputs(); posInit();
-    double f0 = Pos.ser.angle4;
-    mockSerialFeed("k");
-    runLoop(1, 5);
-    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f", f0, Pos.ser.angle4);
-    check("串口 'k' -> 末端张开 (f 增大)", Pos.ser.angle4 > f0, buf);
-
-    f0 = Pos.ser.angle4;
-    mockSerialFeed("K");
-    runLoop(1, 5);
-    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f", f0, Pos.ser.angle4);
-    check("串口 'K' -> 末端收回 (f 减小)", Pos.ser.angle4 < f0, buf);
-
-    /* 连续 'k' 到顶必须停在 maxF */
-    resetInputs(); posInit();
-    for (int i = 0; i < 60; i++) { mockSerialFeed("k"); runLoop(1, 5); }
-    snprintf(buf, sizeof(buf), "f=%.1f 上限=%.0f", Pos.ser.angle4, servoLimit.maxF);
-    check("连续 'k' 停在 servoLimit.maxF", Pos.ser.angle4 <= servoLimit.maxF + 1e-9, buf);
-  }
-
-  printf("=== 8) 调速档位影响转角速度（同起点比较）===\n");
+  printf("=== 6) 调速档位影响转角速度（同起点比较）===\n");
   {
     /* 慢速 */
     adjustSpeed(SPEED_SLOW);
@@ -262,7 +222,7 @@ int main(void) {
     check("同起点同轮数下 快速转角 > 慢速转角", fastDb > slowDb, buf);
   }
 
-  printf("=== 9) 持续推杆：每个关节最终都停在 servoLimit 内 ===\n");
+  printf("=== 7) 持续推杆：每个关节最终都停在 servoLimit 内 ===\n");
   {
     adjustSpeed(SPEED_NORMAL);
     resetInputs(); posInit();
@@ -280,7 +240,7 @@ int main(void) {
     check("四路都推到头：角度全部落在 servoLimit 内且非 NaN", inRange && valid, buf);
   }
 
-  printf("=== 10) 4000 轮随机推杆压力测试 ===\n");
+  printf("=== 8) 4000 轮随机推杆压力测试 ===\n");
   {
     resetInputs(); posInit();
     adjustSpeed(SPEED_FAST);
@@ -292,7 +252,6 @@ int main(void) {
       int v = (int)((seed >> 8) % 1024UL);      /* 0..1023 */
       resetInputs();
       g_mockAnalog[which] = v;                  /* 轮流扰动四路轴 */
-      if (i % 37 == 0) mockSerialFeed((i % 74 == 0) ? "1" : "k");
       runLoop(1, 25);
 
       /* 角度必须全部在 servoLimit 内 */

@@ -6,7 +6,7 @@
 #include "constant_and_positions.h"
 
 /* ---------- 编译开关 ---------- */
-/* 置 1: 打开串口(115200)并接受 '1'/'2'/'3' 调速命令。
+/* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 本开关需与 joystick_control.cpp 中的同名开关保持一致，否则串口输出会缺失。 */
 #define WEARM_DEBUG_SERIAL 1
 
@@ -836,39 +836,4 @@ bool posToolOpen(double stepDeg) {
 bool posToolClose(double stepDeg) {
   if (stepDeg <= 0) stepDeg = 5.0;
   return posSetAngle4(Pos.ser.angle4 - stepDeg);
-}
-
-/* ---------- 串口命令 ---------- */
-
-/* 串口命令处理。需在 loop() 中调用（joystickLoop() 内部已调用，不要重复）。 */
-void handleSerialSpeedCmd(void) {
-#if WEARM_DEBUG_SERIAL
-  if (Serial.available() <= 0) return;
-  int c = Serial.read();
-
-  /* 1) 调速命令：'1'/'2'/'3' 对应 慢/中/快 */
-  int level = -1;
-  switch (c) {
-    case '1': level = SPEED_SLOW;   break;
-    case '2': level = SPEED_NORMAL; break;
-    case '3': level = SPEED_FAST;   break;
-    default:  level = -1;           break;
-  }
-  if (level >= 0) {
-    level = adjustSpeed(level);
-    Serial.print(F("[speed] serial cmd -> "));
-    Serial.println(speedLevelName(level));
-    return;
-  }
-
-  /* 2) 末端命令：'k' 张开 / 'K' 收回（与右手柄左右推等效） */
-  if (c == 'k' || c == 'K') {
-    bool ok = (c == 'k') ? posToolOpen(5.0) : posToolClose(5.0);
-    Serial.print(F("[tool] "));
-    Serial.print(ok ? F("angle4 -> ") : F("at limit, angle4 = "));
-    Serial.println(Pos.ser.angle4);
-    return;
-  }
-  /* 其它字符忽略 */
-#endif
 }
