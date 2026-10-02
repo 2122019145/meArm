@@ -161,14 +161,14 @@ void joystickReadState(struct joyState *st) {
     mask |= JOY_ACT_SHOULDER;
     if (st->shoulder > mag) {
       mag = st->shoulder;
-      best = (st->sy > JOY_CENTER) ? JOY_DIR_FWD : JOY_DIR_BWD;
+      best = (st->sy > JOY_CENTER) ? JOY_DIR_BWD : JOY_DIR_FWD;
     }
   }
   if (st->elbow > 0) {
     mask |= JOY_ACT_ELBOW;
     if (st->elbow > mag) {
       mag = st->elbow;
-      best = (st->ty > JOY_CENTER) ? JOY_DIR_UP : JOY_DIR_DOWN;
+      best = (st->ty > JOY_CENTER) ? JOY_DIR_DOWN : JOY_DIR_UP;
     }
   }
   if (st->tool > 0) {
@@ -280,6 +280,12 @@ void joystickLoop(void) {
   /* 3) 按"关节 | 偏转量 | 原始轴值 | 该关节的计时槽"逐轴步进。
    *    每个关节自己一套时间门控：一个关节推到头或在慢速档，
    *    不会把另一个关节也拖慢。偏转越大步越慢（安全）。 */
+  /* 【方向约定】上臂 r 与下臂 c 这两路推杆方向是上机实测后调转过的：
+   *   上臂 A1 前推 = r 减小、后拉 = r 增大；
+   *   下臂 A3 前推 = c 减小、后拉 = c 增大。
+   *   改动方式是把这两路的 dirPos/dirNeg 对调；JOY_DIR_FWD/UP 等方向码
+   *   本身的含义（"该关节角度增大"）没变，只是哪一侧推杆对应哪个码换了。
+   *   基座 A0 与末端 A2 两路的方向没有改动。 */
   const struct {
     int amp;        /* 该轴扣死区后的偏转量，0 = 没推 */
     int raw;        /* 该轴原始 ADC 值，用来判方向 */
@@ -288,8 +294,8 @@ void joystickLoop(void) {
     int idx;        /* lastStepTime 下标 */
   } axes[JIDX_COUNT] = {
     { st.base,     st.sx, JOINT_B_RIGHT, JOINT_B_LEFT,  JIDX_BASE     },
-    { st.shoulder, st.sy, JOINT_R_FWD,   JOINT_R_BWD,   JIDX_SHOULDER },
-    { st.elbow,    st.ty, JOINT_C_UP,    JOINT_C_DOWN,  JIDX_ELBOW    },
+    { st.shoulder, st.sy, JOINT_R_BWD,   JOINT_R_FWD,   JIDX_SHOULDER },
+    { st.elbow,    st.ty, JOINT_C_DOWN,  JOINT_C_UP,    JIDX_ELBOW    },
     { st.tool,     st.tx, 0,             0,             JIDX_TOOL     }
   };
 

@@ -89,54 +89,55 @@ int main(void) {
     check("A0 左推 -> 只有 b(angle1) 减小",
           Pos.ser.angle1 < j0.b && onlyChanged(j0, snap(), 0), buf);
 
-    /* A1 前推 -> 上臂 r 增大 */
+    /* A1 前推 -> 上臂 r 减小 */
     resetInputs(); posInit();
     j0 = snap();
     g_mockAnalog[MOCK_AY] = 900;
     runLoop(6, 20);
     snprintf(buf, sizeof(buf), "r: %.1f -> %.1f  (b=%.1f c=%.1f f=%.1f)", j0.r, Pos.ser.angle2,
              Pos.ser.angle1, Pos.ser.angle3, Pos.ser.angle4);
-    check("A1 前推 -> 只有 r(angle2) 增大",
-          Pos.ser.angle2 > j0.r && onlyChanged(j0, snap(), 1), buf);
+    check("A1 前推 -> 只有 r(angle2) 减小",
+          Pos.ser.angle2 < j0.r && onlyChanged(j0, snap(), 1), buf);
 
-    /* A1 后拉 -> 上臂 r 减小 */
+    /* A1 后拉 -> 上臂 r 增大 */
     resetInputs(); posInit();
     j0 = snap();
     g_mockAnalog[MOCK_AY] = 200;
     runLoop(6, 20);
     snprintf(buf, sizeof(buf), "r: %.1f -> %.1f", j0.r, Pos.ser.angle2);
-    check("A1 后拉 -> 只有 r(angle2) 减小",
-          Pos.ser.angle2 < j0.r && onlyChanged(j0, snap(), 1), buf);
+    check("A1 后拉 -> 只有 r(angle2) 增大",
+          Pos.ser.angle2 > j0.r && onlyChanged(j0, snap(), 1), buf);
 
-    /* A3 前推 -> 下臂 c 增大 */
+    /* A3 前推 -> 下臂 c 减小 */
     resetInputs(); posInit();
     j0 = snap();
     g_mockAnalog[MOCK_TY] = 900;
     runLoop(6, 20);
     snprintf(buf, sizeof(buf), "c: %.1f -> %.1f  (b=%.1f r=%.1f f=%.1f)", j0.c, Pos.ser.angle3,
              Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle4);
-    check("A3 前推 -> 只有 c(angle3) 增大",
-          Pos.ser.angle3 > j0.c && onlyChanged(j0, snap(), 2), buf);
+    check("A3 前推 -> 只有 c(angle3) 减小",
+          Pos.ser.angle3 < j0.c && onlyChanged(j0, snap(), 2), buf);
 
-    /* A3 后拉 -> 下臂 c 减小 */
+    /* A3 后拉 -> 下臂 c 增大 */
     resetInputs(); posInit();
     j0 = snap();
     g_mockAnalog[MOCK_TY] = 200;
     runLoop(6, 20);
     snprintf(buf, sizeof(buf), "c: %.1f -> %.1f", j0.c, Pos.ser.angle3);
-    check("A3 后拉 -> 只有 c(angle3) 减小",
-          Pos.ser.angle3 < j0.c && onlyChanged(j0, snap(), 2), buf);
+    check("A3 后拉 -> 只有 c(angle3) 增大",
+          Pos.ser.angle3 > j0.c && onlyChanged(j0, snap(), 2), buf);
   }
 
   printf("=== 2) 坐标是角度的派生量：角度变了坐标必须跟着变且自洽 ===\n");
   {
     resetInputs(); posInit();
     double x0 = Pos.rec.x, z0 = Pos.rec.z;
-    g_mockAnalog[MOCK_AY] = 900;            /* 抬上臂 */
+    g_mockAnalog[MOCK_AY] = 900;            /* 前推 -> 上臂 r 减小（放下） */
     runLoop(8, 20);
     snprintf(buf, sizeof(buf), "末端 (%.1f,%.1f,%.1f)，起 x=%.1f z=%.1f",
              Pos.rec.x, Pos.rec.y, Pos.rec.z, x0, z0);
-    check("上臂抬起后末端坐标随之改变", fabs(Pos.rec.z - z0) > 1e-9, buf);
+    /* 这里只要求坐标跟着角度变，不判增/减方向（方向由第 1 段专测） */
+    check("上臂角度变化后末端坐标随之改变", fabs(Pos.rec.z - z0) > 1e-9, buf);
 
     /* 用固件自己的正运动学独立复算一遍，验证 Pos.rec 确实与 Pos.ser 严格对应 */
     REC chk;
@@ -266,16 +267,16 @@ int main(void) {
     adjustSpeed(SPEED_NORMAL);
     resetInputs(); posInit();
     g_mockAnalog[MOCK_AX] = 900;   /* b 一直加 */
-    g_mockAnalog[MOCK_AY] = 900;   /* r 一直加 */
-    g_mockAnalog[MOCK_TY] = 900;   /* c 一直加 */
+    g_mockAnalog[MOCK_AY] = 900;   /* r 一直减 */
+    g_mockAnalog[MOCK_TY] = 900;   /* c 一直减 */
     g_mockAnalog[MOCK_TX] = 900;   /* f 一直减 */
     runLoop(600, 30);
     struct Joints j1 = snap();
-    bool inRange = j1.b <= servoLimit.maxB + 1e-6 && j1.r <= servoLimit.maxR + 1e-6 &&
-                   j1.c <= servoLimit.maxC + 1e-6 && j1.f >= servoLimit.minF - 1e-6;
+    bool inRange = j1.b <= servoLimit.maxB + 1e-6 && j1.r >= servoLimit.minR - 1e-6 &&
+                   j1.c >= servoLimit.minC - 1e-6 && j1.f >= servoLimit.minF - 1e-6;
     bool valid = (j1.b == j1.b) && (j1.r == j1.r) && (j1.c == j1.c) && (j1.f == j1.f);
-    snprintf(buf, sizeof(buf), "b=%.1f(max %.0f) r=%.1f(max %.0f) c=%.1f(max %.0f) f=%.1f",
-             j1.b, servoLimit.maxB, j1.r, servoLimit.maxR, j1.c, servoLimit.maxC, j1.f);
+    snprintf(buf, sizeof(buf), "b=%.1f(max %.0f) r=%.1f(min %.0f) c=%.1f(min %.0f) f=%.1f",
+             j1.b, servoLimit.maxB, j1.r, servoLimit.minR, j1.c, servoLimit.minC, j1.f);
     check("四路都推到头：角度全部落在 servoLimit 内且非 NaN", inRange && valid, buf);
   }
 
