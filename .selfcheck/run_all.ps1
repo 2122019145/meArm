@@ -1,9 +1,9 @@
 ﻿#
-# run_all.ps1 -- wearm 工程 PC 端全量自检
+# run_all.ps1 -- meArm 工程 PC 端全量自检
 #
 # 用法（任意目录）：
-#     D:\dsh1\wearm\.selfcheck\run_all.cmd
-# 或  powershell -NoProfile -ExecutionPolicy Bypass -File D:\dsh1\wearm\.selfcheck\run_all.ps1
+#     D:\dsh1\meArm\.selfcheck\run_all.cmd
+# 或  powershell -NoProfile -ExecutionPolicy Bypass -File D:\dsh1\meArm\.selfcheck\run_all.ps1
 #
 # 做三件事：
 #   1. 严格编译 9 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）

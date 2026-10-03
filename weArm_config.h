@@ -28,7 +28,7 @@
  *                            既不占 flash 也不占 SRAM）
  *
  * 关闭某个功能时，该模块的头文件会退化成一组空实现的 inline 桩函数，
- * 因此**调用方（weArm.ino / serial_protocol.cpp / joystick_control.cpp /
+ * 因此**调用方（meArm.ino / serial_protocol.cpp / joystick_control.cpp /
  * button_control.cpp）一行都不用改**，编译器会把空调用直接优化掉。
  *
  * ============================== 怎么用 =====================================

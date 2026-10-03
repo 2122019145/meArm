@@ -1,5 +1,5 @@
 //
-// wearm.ino
+// meArm.ino
 // 机械臂主程序 (Arduino)
 //
 // 结构:

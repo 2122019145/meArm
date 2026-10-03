@@ -15,7 +15,7 @@
  *   本文件用同一套 Timer1 机制重写等价功能，约 300 B，净省约 650 B。
  *
  * 【脉宽映射与 Servo 库逐位一致（这是不改变机械行为的硬要求）】
- *   wearm.ino 原来是 servos[i].write((int)angle)，走 Servo::write(int)：
+ *   meArm.ino（当时还叫 wearm.ino）原来是 servos[i].write((int)angle)，走 Servo::write(int)：
  *     1) angle < 544 视为角度 -> 夹到 0~180 -> map(angle, 0, 180, 544, 2400)
  *                              = angle * 1856 / 180 + 544  （32 位长整型运算）
  *     2) writeMicroseconds(): 夹到 [544, 2400] -> 减去 TRIM_DURATION(2us)

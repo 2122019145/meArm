@@ -1,5 +1,5 @@
 ﻿#
-# avr_build.ps1 -- build the weArm sketch exactly the way the Arduino IDE does,
+# avr_build.ps1 -- build the meArm sketch exactly the way the Arduino IDE does,
 # with the locally installed AVR toolchain, and report flash/SRAM usage.
 #
 # Toolchain (found on this machine):
@@ -14,8 +14,8 @@
 #
 [CmdletBinding()]
 param(
-  [string]$SketchDir  = 'D:\dsh1\wearm',
-  [string]$BuildRoot  = 'D:\dsh1\wearm\.selfcheck\avrbuild',
+  [string]$SketchDir  = 'D:\dsh1\meArm',
+  [string]$BuildRoot  = 'D:\dsh1\meArm\.selfcheck\avrbuild',
   [switch]$Full,       # also rebuild the core archive
   [switch]$Symbols,    # print the biggest symbols after linking
   [switch]$NoLto,      # disable LTO (per-object sizes become meaningful)

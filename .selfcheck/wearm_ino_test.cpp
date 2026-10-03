@@ -1,8 +1,11 @@
 //
 // wearm_ino_test.cpp
-// 直接编译 wearm.ino 本体（不手抄复刻），核对 sketch 的接线与上电行为。
+// 直接编译 meArm.ino 本体（不手抄复刻），核对 sketch 的接线与上电行为。
 //
-// 【为什么直接 #include "../wearm.ino"】
+// （文件名保留 wearm_ino_test：它测的是"主 sketch 本体"，
+//   而主 sketch 已随工作区一起改名为 meArm.ino。）
+//
+// 【为什么直接 #include "../meArm.ino"】
 // 早期版本是把 setup()/loop() 手工抄一份到本文件里编译，只能证明"抄件能编译"。
 // 抄件已经漂移过一次：抄件写 servos[2].attach(10)、servos[3].attach(11)，
 // 而真 sketch 是 attach(7)/attach(8)，抄件照样编译通过、零警告，
@@ -20,7 +23,7 @@
 #include "Arduino.h"
 #include "../weArm_config.h"
 #include "servo_drive.h"
-#include "../wearm.ino"
+#include "../meArm.ino"
 
 #include <stdio.h>
 #include <math.h>
@@ -77,7 +80,7 @@ static void captureFrame(int pins[4], unsigned width[4], uint16_t *frameTicks) {
 }
 
 int main(void) {
-  printf("=== wearm.ino 真实 sketch 自检（直接 include 真文件）===\n");
+  printf("=== meArm.ino 真实 sketch 自检（直接 include 真文件）===\n");
 
   char buf[160];
 

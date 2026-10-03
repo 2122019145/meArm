@@ -26,7 +26,7 @@
 ## 一键跑全部
 
 ```powershell
-D:\dsh1\wearm\.selfcheck\run_all.cmd
+D:\dsh1\meArm\.selfcheck\run_all.cmd
 ```
 
 （`.cmd` 只是个壳，用 `-ExecutionPolicy Bypass` 调 `run_all.ps1`——
@@ -78,7 +78,7 @@ Windows 默认禁止直接运行 `.ps1`。）
 | `probe_move` | 六向定长步进（`moveup` = 下臂 c +1°、`moveright` = 基座 b +1°、`moveforward` = 上臂 r +1°，其余关节一字节不动）、推到头返回 `MOVE_AT_LIMIT` 且零位移、非法方向 `MOVE_NONE`、`stepSize=0` 跟随全局调速、坐标与角度严格自洽且不出 `limit`、超臂展 `isReachable()==false`、三档调速参数、4000 步随机压力（零越界/零 NaN/零关节越限）；**[7] `moveToPoint()`（绘图与串口共用的"移动到指定 x,y,z"）**：不可达点整条拒绝且 `Pos` `memcmp` 逐字节不变、`TRACK` 超速整点拒绝/限内接受且写进去的角度与独立反解结果**逐位相同**、`JOG` 每步不超过 `maxDps×dtSec` 并反复调用收敛到反解结果、`NOW` 不限速一次到位（实测一次跳变 4.57°）且坐标自洽、部分 `seen` 只动被提及的轴、`NULL`/未知模式都返回 `REJECTED` 且不动 |
 | `probe_joystick` | 四路轴各控一个关节角且互不干扰、坐标 = `recFromServo(Pos.ser)`、末端 A2 方向与限位、斜推可同时动多个关节、死区不动作、串口 `1/2/3` 调速、串口 `k/K` 开合、快速转角 > 慢速、四路推到头都停在 `servoLimit` 内、4000 轮随机推杆 |
 | `probe_axes` | 5929741 个关节角组合扫出真实可达包络、验证 `limit` 完全覆盖包络且余量非负、单轴满行程自查（每个关节都能走到行程两端）、5 个标定点核对 |
-| `wearm_ino_test` | **直接 `#include "../wearm.ino"`**（不手抄复刻）：4 个舵机 attach 引脚、上电姿态 = POS_HOME、上电不是 0（不会甩向原点）、静置 20 轮 loop 不动、推杆后 loop 真的把新角度写进舵机 |
+| `wearm_ino_test` | **直接 `#include "../meArm.ino"`**（不手抄复刻；探针文件名保持不变，被 include 的主 sketch 已随工作区改名为 `meArm.ino`）：4 个舵机 attach 引脚、上电姿态 = POS_HOME、上电不是 0（不会甩向原点）、静置 20 轮 loop 不动、推杆后 loop 真的把新角度写进舵机 |
 | `probe_protocol` | 串口协议完整测试：O/S/H/L 命令（爪子开/关/升档/降档）、角度指令格式（x10,y30,z20 及其变体）、行缓冲与超时处理（PROTO_LINE_BUF_SIZE=40, PROTO_LINE_TIMEOUT_MS=300）、速度档位边界（PROTO_SPEED_LEVEL_MIN/MAX/DEF）、MockSerial 64 字节缓冲边界测试、无换行超时场景、单字符打印 vs 码值打印 |
 | `probe_pick_place` | A/B/C 自动取放：位置表（Δx、Δy 各 ≥5，三初始点/三放置点两两相距 ≥5，放置点离"别人的初始点" ≥5，实测最紧 7.21）、6 个取放点与接近点都"在 limit 内 + 可达 + 反解未被吸附"、启动语义（0 / -2 忙 / -1 编号非法）、完整跑三轮（A 305 轮、B 334 轮、C 335 轮，逐轮零违规、末点 = 放置点 + 抬升 6.0、`angle4 == servoLimit.maxF`）、忙时让位（O/S/x45/k 全返 BUSY 且状态零改动，H/L 仍生效）、空闲时反复调用不动状态 |
 | `probe_button` | 四按键接口 11 段（编号跳过 [10]）：`pinMode` 记录断言 D2~D5 都是 `INPUT_PULLUP`、初始无录制/不忙/不让位；按键1 物理连按四次 A→B→C→A 且序列执行中再按不推进序号；录制门槛（未录制时播放回 16、录制中 `busy=true` 但 `locked=false`、录制中 O 被挡回 11 而 H/L 仍回 3/4、只录 3 秒但**没动**回 14、**8.2 秒短录像有位移 → 回 13、40 条、位移 20.54（时长门槛已删除的回归）**、录 11.5 秒无位移回 14）；真实摇杆录制 11.6 秒 → 保存回 13、57 条、位移 24.95；播放回 15、只在"仍被独占"时推摇杆验证让位、回放末态与录制末态误差 0.00、耗时 13.02 s = 录制 11.6 s + 预摆 1.5 s；**播放中按按键4 / 发别名 `0` 都被拒（回 11）且播放不被劫持**；回中回 17 且 b/r/c 与 `posGetHomeAngles()` 位级一致、angle4 不动、别名 `0` 同样有效；串口路径 N/R/P/M 与忙守卫豁免（序列忙时 N 回 11、录制中 R 回 14）；空闲 100 次调用零改动；**[9] 最坏情况**：四路摇杆每 700 ms 翻向、连续推 11.2 秒 → 仍保存成功（55/192 条、位移 32.32；旧"每周期另写 WAIT/增量"的格式要 ~560 条，必然溢出判废），回放后四轴末态差 0.00 度；**[11] 录制中直接按 P**：只录 2 秒没位移 → 回 14 且不播放；合格录制（11.5 s）按 P → 回 15、先收尾保存再立刻播放、回放末态 == 按 P 那一刻的位姿（四轴差 0.00）；**[12] 缓冲写满**：连续推杆录到 38.2 s 仍在录制且条目 190/192（stride 200 ms、uint16 计数不回绕），38.8 s 写满自动收尾并**判废不留半段数据**，事后按 P 回 16 |
@@ -133,7 +133,7 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
      角度带 ~1e-13 舍入误差，`89.99999999999999 != 90.0` 会报假失败
      （而 `%.1f` 打印出来完全正常）→ 用容差比较。
 
-6. **串口必须单一读者**。旧函数 `handleSerialSpeedCmd()` 自己调用 `Serial.read()`，新的行缓冲也要读同一串数据，两个读者会把字节各吃一半、行永远拼不完整。因此旧函数已**整体删除**（连同 `constant_and_positions.h` 里的声明），串口字节只由 `serialProtocolLoop()` 读，调用点只在 `weArm.ino` 的 `loop()` 里（放在 `joystickLoop()` 之前）。`joystickSetup()` 也不再调用 `Serial.begin()`。
+6. **串口必须单一读者**。旧函数 `handleSerialSpeedCmd()` 自己调用 `Serial.read()`，新的行缓冲也要读同一串数据，两个读者会把字节各吃一半、行永远拼不完整。因此旧函数已**整体删除**（连同 `constant_and_positions.h` 里的声明），串口字节只由 `serialProtocolLoop()` 读，调用点只在 `meArm.ino` 的 `loop()` 里（放在 `joystickLoop()` 之前）。`joystickSetup()` 也不再调用 `Serial.begin()`。
 7. **mock 的串口输入缓冲只有 64 字节且只追加不压缩**：`.selfcheck\mock\Arduino.cpp` 里是 `static char inBuf[64]`，`mockSerialFeed()` 只 append，读空后 `inPos` 等于 `inLen` 但 `inLen` 不回退。所以连续喂超过 64 字节的测试，后面的字符根本进不去 —— 测的是 mock 缓冲被塞满，而不是固件行为。正确做法是穿插 `mockSerialClear()`（或分段重建缓冲）。反例：`probe_protocol` 原超长行用例注释写"60 个 A"，字面量实际是 70 个，行尾换行符根本没能进缓冲。
 8. **无换行超时用例必须调用两次 `serialProtocolLoop()`**：固件在读到字符时把 `s_lastCharMs` 记成 `millis()`，若先喂数据、再一次性推进 400 毫秒、再调 loop，则超时判断里的时间差恒为 0。正确写法是先 `mockSerialFeed` 再调一次 loop，再 `g_mockMillis` 加 400，再调第二次 loop。
 9. **mock 的 `MockSerial` 没有 `print` 的单字符重载**：写 `Serial.print(某个 char 变量)` 会被隐式提升到打印 int，串口里打出的是码值（例如字母 x 打成 120）。要打印单个字符必须用长度 2 的 C 串（`char ch[2] = { c, 0 }; Serial.print(ch);`），真机与 mock 都能出字母。
@@ -296,7 +296,7 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 ## 新增四按键操作接口
 
 本轮新增 `button_control.h` / `button_control.cpp`：四个按键的全部调用接口都封装在
-**这一个 cpp** 里（这是需求原文的硬性要求），`weArm.ino` 只调 `buttonSetup()` /
+**这一个 cpp** 里（这是需求原文的硬性要求），`meArm.ino` 只调 `buttonSetup()` /
 `buttonLoop()`。
 
 - **按键接线**：D2 = 按键1（循环执行取放）、D3 = 按键2（录制）、D4 = 按键3（播放）、
@@ -661,7 +661,7 @@ mock 侧的 `mock/Servo.cpp`、`mock/Servo.h` 也已删除。
 反向装上的，逻辑角增大时它们物理上朝反方向走。`O` 走 `maxF` 本该张开、实际夹紧，
 就是同一个原因（不是 `O`/`S` 写反了）。
 
-修法**不动 0~180 映射、也不动任何逻辑角**，只在唯一写出口 `wearm.ino` 的
+修法**不动 0~180 映射、也不动任何逻辑角**，只在唯一写出口 `meArm.ino` 的
 `writeServo()` 里对这两个通道做一次"在自身行程窗口内镜像"：
 
     physical = (min + max) - logical      /* ch0 用 [minB,maxB]=[0,180]
@@ -723,7 +723,7 @@ v1.3.0 的实现本来就是对的**：帧尾比较值是在"4 路都发完"那�
 
 ### 5) 注释修正（问题 ④）
 
-- `wearm.ino` 头注释：`x/y/z` 明确写成**末端空间直角坐标**（旧的"三个关节角"
+- `meArm.ino` 头注释（当时还叫 `wearm.ino`）：`x/y/z` 明确写成**末端空间直角坐标**（旧的"三个关节角"
   说法是 v1.0.0 的语义，已标注【破坏性变更】）；补 `!` / `!P` / `!B` / `!D`、
   补"命令都有短回复"、补摇杆中位自标定与方向镜像两段；按键3/`P` 的
   "先收尾再播放"也写进命令表。
@@ -912,7 +912,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 没编译进去，没有重复代码可省，而 `moveToPoint()` 无论如何都要编译一份。默认配置相
 对 32256 B 可用 flash 的余量从 318 B 变成 **486 B**。
 
-### 顺带修订 `wearm.ino` 的头部注释
+### 顺带修订 `meArm.ino`（改名前的 `wearm.ino`）的头部注释
 
 重构后 .ino 顶上那段大注释有几处已经说反了，一并改掉：`setup()`/`loop()` 的结构清单
 补上绘图模块与 `moveToPoint()`；"【控制方式：直接控制关节角】……不再通过末端坐标反解"
@@ -923,6 +923,37 @@ x/y/z 指令那几条改成"反解出 b/r/c 三个关节角、夹爪 f 不变、
 把那个用不到的 `#include "move.h"` 换成显式的 `#include "constant_and_positions.h"`
 （`Pos` / `servoLimit` 本来就是他间接带进来的，现在写明）。改完 AVR 实编仍是
 **31770 B / 1414 B**，11 个探针依旧 ALL PASS。
+
+## 工作区改名为 meArm（主 sketch 跟着改名 wearm.ino → meArm.ino）
+
+工作区目录 `D:\dsh1\wearm` 改成了 **`D:\dsh1\meArm`**。Arduino IDE 与 `arduino-cli`
+都要求**主 `.ino` 的文件名与所在目录同名**，否则那个目录不再被当成一个 sketch，
+所以主程序文件同步改名：
+
+| 项目 | 之前 | 现在 |
+|---|---|---|
+| 工作区目录 | `D:\dsh1\wearm` | `D:\dsh1\meArm` |
+| 主 sketch | `wearm.ino` | `meArm.ino` |
+| 自检探针文件名 | `wearm_ino_test.cpp` | **不变**（它测的是"主 sketch 本体"，名字里的 wearm 是历史） |
+
+- **内容零改动**：改名前后的 `.ino` 逐字节相同（`git rev-parse HEAD:wearm.ino`
+  与 `git hash-object meArm.ino` 都是 `1608d1ff1c3c22b6e69821c686c3c5c1d1bb8d06`，
+  16732 字节）。只改了文件里的第 2 行注释 `// wearm.ino` → `// meArm.ino`。
+- **改名踩到的锁**：`Move-Item` 先报"另一个进程正在使用此文件"，子目录能改、根目录不能
+  → 锁在根目录，持有者是开着的 **Arduino IDE**（`Get-CimInstance Win32_Process` 能看到
+  命令行里就是那个 `.ino`）。关掉 IDE 后立刻改名成功。
+- **跟着改的引用**（不改就会指向不存在的路径）：`.selfcheck\avr_build.ps1` 的默认
+  `$SketchDir` / `$BuildRoot`（脚本本身按 `*.ino` 通配找文件，与文件名无关，只是默认路径
+  写死了旧目录）、`.selfcheck\run_all.ps1` 头部用法注释、`.selfcheck\wearm_ino_test.cpp`
+  的 `#include "../meArm.ino"` 与横幅文字、`weArm_config.h` 顶部调用方清单、
+  `servo_drive.h` 的脉宽映射说明、本文件里的路径与文件名。
+- **验证**：`.selfcheck\run_all.cmd` → 9 个固件 TU 零警告 + **11 个探针 ALL PASS**；
+  `.selfcheck\avr_build.ps1` 默认配置实编 **31770 B / 1414 B**（与改名前一模一样 ——
+  改的都是注释与路径，没有一行逻辑）。
+- **顺带踩中的老坑**：用编辑工具改 `.selfcheck\run_all.ps1` / `avr_build.ps1` 会把
+  **UTF-8 BOM 丢掉**（见下面第 2 条），PowerShell 5.1 立刻按 ANSI 解码中文注释并整篇
+  语法报错。改完跑一次 `& .\.selfcheck\ensure_bom.ps1`（`-Check` 只检查）确认三个
+  `.ps1` 都有 BOM。
 
 ## PowerShell / 脚本的几个坑
 
