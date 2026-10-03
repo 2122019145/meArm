@@ -11,8 +11,10 @@
  *
  * 【轨迹是怎么走的】
  *   轨迹在笛卡尔空间定义（折线 = 顶点连线，曲线 = 向心 Catmull-Rom 样条）。
- *   每个采样点用 getAngleEx() 反解成 b/r/c，写进 Pos.ser，再做一次正解刷新 Pos.rec
- *   （与串口角度指令、pick_place 完全同一约定：坐标永远等于角度的真实结果）。
+ *   每个采样点交给 move.h 的 moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，
+ *   串口的 x/y/z 指令用的是同一个函数）：反解、速率限制、写入 Pos 与正解刷新
+ *   都在那里，本文件只决定"下一步走到哪个坐标"。
+ *   （与串口角度指令、pick_place 同一约定：坐标永远等于角度的真实结果。）
  *
  *   速度规划用"按剩余距离刹车"的经典做法，不需要预先算速度表：
  *       v 允许的最大值 = min( DRAW_V_MAX, sqrt(2a·已走距离), 当前速度 + a·dt )
@@ -38,6 +40,7 @@
 #include <math.h>
 #include <Arduino.h>
 #include "constant_and_positions.h"
+#include "move.h"           /* moveToPoint(): "移动到指定 x,y,z" 的唯一实现 */
 #include "path_core.h"
 #include "joystick_control.h"
 #include "pick_place.h"
@@ -199,10 +202,9 @@ static unsigned long s_jogLastMs[4] = { 0UL, 0UL, 0UL, 0UL };  /* x/y/z/f 各自
  * 这里保留同名同签名的转发函数，本文件所有调用点一行都不用改；采样步长与分支
  * 跳变门限仍用本文件的 DRAW_* 常量。转发函数是 static inline，会被就地展开，
  * 不会另外留下一份代码。 */
-static inline bool solveJoint(double x, double y, double z,
-                              double *b, double *r, double *c) {
-  return pathCoreSolveJoint(x, y, z, b, r, c);
-}
+/* 注：原来这里还有一个 solveJoint() 转发，只被下面的点位写入用过；点位写入改成
+ * 调 move.h 的 moveToPoint() 之后它没有调用方了，已删除（path_core.h 里的实现
+ * 仍由 pointOk 与 pick_place.cpp 使用）。 */
 
 /* 这个工作区点能不能用：在 limit 内 + isReachable() + 反解成功且没被吸附。 */
 static inline bool pointOk(double x, double y, double z,
@@ -499,58 +501,20 @@ static double applyDtSec(void)
   return dt;
 }
 
-/* 反解 (x,y,z) 并同时给出关节角 abc[3] 与本步允许的最大变化 maxStep。
- * tryApplyPoint / applyPointClamped 共用这段前缀，避免各展开一份。 */
-static bool solveStep(double x, double y, double z, double maxDps, double dtSec,
-                      double *abc, double *maxStep)
+/* 反解 (x,y,z) 并按策略写进 Pos —— 本文件所有"点位移"都走这里，实现则是 move.h 的
+ * moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，串口 x/y/z 指令用同一个函数）。
+ *
+ * 原来本文件自己展开过两份（严格版 tryApplyPoint / 夹取版 applyPointClamped），
+ * 每份都要重算 maxDps×dtSec、逐轴比较或夹取；现在这些算式只存在于 moveToPoint()
+ * 里，两边不可能再走偏。参数与判据一个字没改，所以三个调用点仍然逐位等价：
+ *   MOVE_XYZ_TRACK —— 任一关节本步要动超过 maxDps×dtSec 就整点拒绝（轨迹跟随）；
+ *   MOVE_XYZ_JOG   —— 超出的部分夹到上限，尽量走一点（示教点动，绝不原地卡住）。
+ *
+ * 成功后才前移速率基准时刻 s_applyMs —— 与原先在 setJoints() 之后写它的次序一致。 */
+static bool applyPointStep(double x, double y, double z, double maxDps, double dtSec, int mode)
 {
-  if (!solveJoint(x, y, z, &abc[0], &abc[1], &abc[2])) return false;
-  double ms = maxDps * dtSec;
-  if (ms < 0.2) ms = 0.2;          /* 极短的一轮也给个最小步长 */
-  *maxStep = ms;
-  return true;
-}
-
-/* 反解 (x,y,z) 并检查每个关节相对当前角度的变化不超过 maxDps×dtSec。
- * 通过则写入 Pos 并返回 true；不通过则什么都不改、返回 false（调用方可缩小步长重试）。 */
-static bool tryApplyPoint(double x, double y, double z, double maxDps, double dtSec)
-{
-  double abc[3] = { 0.0, 0.0, 0.0 };
-  double maxStep = 0.0;
-  if (!solveStep(x, y, z, maxDps, dtSec, abc, &maxStep)) return false;
-
-  if (fabs(abc[0] - Pos.ser.angle1) > maxStep) return false;
-  if (fabs(abc[1] - Pos.ser.angle2) > maxStep) return false;
-  if (fabs(abc[2] - Pos.ser.angle3) > maxStep) return false;
-
-  setJoints(abc[0], abc[1], abc[2]);
-  s_applyMs = millis();
-  return true;
-}
-
-/* 反解 (x,y,z) 后把每个关节的变化量"夹取"到 maxDps×dtSec 之内再写入，总是成功（可达时）。
- * 供示教点动用：手动点动宁可按不到请求的那点，也绝不能原地卡住。 */
-static bool applyPointClamped(double x, double y, double z, double maxDps, double dtSec)
-{
-  double abc[3] = { 0.0, 0.0, 0.0 };
-  double maxStep = 0.0;
-  if (!solveStep(x, y, z, maxDps, dtSec, abc, &maxStep)) return false;
-
-  /* setJoints 之前先把当前角度读出来（与原版三个实参都在调用前求值一致） */
-  double cur[3];
-  cur[0] = Pos.ser.angle1; cur[1] = Pos.ser.angle2; cur[2] = Pos.ser.angle3;
-
-  double db = abc[0] - cur[0];
-  double dr = abc[1] - cur[1];
-  double dc = abc[2] - cur[2];
-  if (db >  maxStep) db =  maxStep;
-  if (db < -maxStep) db = -maxStep;
-  if (dr >  maxStep) dr =  maxStep;
-  if (dr < -maxStep) dr = -maxStep;
-  if (dc >  maxStep) dc =  maxStep;
-  if (dc < -maxStep) dc = -maxStep;
-
-  setJoints(cur[0] + db, cur[1] + dr, cur[2] + dc);
+  const double goal[3] = { x, y, z };
+  if (moveToPoint(goal, 0x07u, maxDps, dtSec, mode) != MOVE_XYZ_OK) return false;
   s_applyMs = millis();
   return true;
 }
@@ -697,7 +661,7 @@ static bool moveTick(void)
   double y = s_mFrom[1] + (s_mTo[1] - s_mFrom[1]) * t;
   double z = s_mFrom[2] + (s_mTo[2] - s_mFrom[2]) * t;
 
-  if (!tryApplyPoint(x, y, z, DRAW_MAX_DPS, applyDtSec())) {
+  if (!applyPointStep(x, y, z, DRAW_MAX_DPS, applyDtSec(), MOVE_XYZ_TRACK)) {
     /* 关节速率不够（理论上只在异常时才发生）：本轮不动，下轮再试 */
     return false;
   }
@@ -754,7 +718,7 @@ static bool pathAdvance(double step)
       polyPointAt(s_done + tryStep, &p[0], &p[1], &p[2]);
     }
 
-    if (tryApplyPoint(p[0], p[1], p[2], DRAW_MAX_DPS, applyDtSec())) {
+    if (applyPointStep(p[0], p[1], p[2], DRAW_MAX_DPS, applyDtSec(), MOVE_XYZ_TRACK)) {
       s_done += tryStep;
       s_span  = (int8_t)nspan;
       s_u     = nu;
@@ -870,7 +834,7 @@ static void teachJogTick(void)
 
     /* 示教点动用"夹取"版：一次点动最多走 DRAW_JOG_MAX_DPS × 本次步进间隔，
      * 超出部分就少走一点（手动操作允许笔尖略偏离请求点），绝不原地卡住。 */
-    if (!applyPointClamped(nx, ny, nz, DRAW_JOG_MAX_DPS, (double)interval / 1000.0)) {
+    if (!applyPointStep(nx, ny, nz, DRAW_JOG_MAX_DPS, (double)interval / 1000.0, MOVE_XYZ_JOG)) {
 #if DRAW_DEBUG_SERIAL
       Serial.println(F("[draw] 点动被挡：该方向不可达或超出工作空间"));
 #endif

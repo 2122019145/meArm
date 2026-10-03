@@ -3,23 +3,33 @@
 // 机械臂主程序 (Arduino)
 //
 // 结构:
-//   setup() —— 复位到安全初始角度、初始化串口协议、自标定摇杆中位、初始化手柄与
-//              按键、挂载 4 个舵机
+//   setup() —— 复位到安全初始角度、初始化串口协议、自标定摇杆中位与状态灯、
+//              初始化按键/绘图模块、启动 Timer1 舵机驱动并把 4 路 attach 到引脚
+//              （顺序有讲究，见 setup() 里的编号注释）
 //   loop()  —— 每轮:
 //     1. serialProtocolLoop() 处理串口指令（唯一读者，放在最前面保证及时响应）
 //     2. pickPlaceLoop()   推进取放序列（非阻塞状态机，独占 b/r/c 三个关节角）
 //     3. buttonLoop()      扫描四个按键 + 推进录制/播放/回中的插值（非阻塞）
-//     4. drawLoop()        推进绘图任务（回待机/走位/落笔/绘制/抬笔；示教时读摇杆点动）
+//     4. drawLoop()        推进绘图任务（回待机/走位/落笔/绘制/抬笔；示教时读摇杆点动。
+//                          每个采样点最终都交给 move.h 的 moveToPoint() 落地）
 //     5. joystickLoop()    读手柄（MeArm 套件手柄：两根双轴摇杆，共占 A0~A3），
 //                          按全局速度参数直接改变 4 个关节角
 //     6. writeServo()      把当前 4 个关节角写入物理舵机（servo_drive，Timer1 硬件 PWM）
 //   （取放/按键/绘图三者互斥：各自的 IsBusy()/Locked() 会让另外两个与摇杆整段让位）
 //
-// 【控制方式：直接控制关节角】
-//   摇杆推动 = 对应舵机角度增大/减小，不再通过末端坐标反解。
-//   被控量: Pos.ser.angle1..angle4（b / r / c / f 四个关节角）
-//   派生量: Pos.rec.x/y/z —— 由正运动学 recFromServo() 实时算出，只用于显示，
-//           不再是"用户设定的目标"（原坐标控制方式的代码已备份到工作区外）。
+// 【控制方式：关节角是唯一被控量】
+//   被控量: Pos.ser.angle1..angle4（b / r / c / f 四个关节角）—— 摇杆直接加减它们。
+//   派生量: Pos.rec.x/y/z —— 由正运动学 recFromServo() 实时算出，用于显示与工作空间
+//           校验，不是"用户设定的目标"。
+//   坐标输入只有两个入口，最终都落到上面这组关节角上:
+//     1) 串口 x/y/z 指令（见下，一次到位）；
+//     2) 绘图轨迹的每个采样点（draw_control.cpp）。
+//   两者调用的是**同一个函数** move.cpp 的 moveToPoint()——"移动到指定 x,y,z 坐标"
+//   在全工程只有这一份实现（内部 getAngleEx() 反解 → 写 Pos.ser → recFromServo()
+//   刷新 Pos.rec），所以"坐标 == 角度的真实结果"这条不变量在每个入口上都成立。
+//   （v1.0.0 那种"把坐标当目标直接控制"的方式已废弃；坐标入口一律是**严格移动**：
+//     解不出来或超出关节速率上限的点整条拒绝、一个字节都不写，绝不会半路停在
+//     没人要的姿态上。旧坐标控制的代码已备份到工作区外。）
 //
 // 手柄操作（详见 joystick_control.h）:
 //   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 +y 侧转
@@ -36,9 +46,12 @@
 //     发 H             整体运行速度提升一档
 //     发 L             整体运行速度降低一档
 //     发 x坐标,y坐标,z坐标   末端**空间直角坐标**（例: x20,y0,z40），不是关节角度：
-//                      固件会反解出四个关节角并移过去，可只写其中一部分
-//                      （如 y10）。原点 = 过肩关节的地面垂足，x+ 面朝方向、
-//                      z+ 向上；z 是离地高度，负值直接 REJECTED。
+//                      固件把这行交给 move.h 的 moveToPoint()（与绘图轨迹用的是同一个
+//                      核心）反解出 b/r/c 三个关节角并一次到位，夹爪角 f 保持不变；
+//                      可只写其中一部分（如 y10），没写到的轴沿用当前坐标。
+//                      原点 = 过肩关节的地面垂足，x+ 面朝方向、z+ 向上；
+//                      z 是离地高度，负值直接 REJECTED。
+//                      解不出来或超出关节行程的点整条拒绝（REJECTED），一个字节都不写。
 //                      【破坏性变更】v1.0.0 的 x/y/z 是"三个关节角度"，
 //                      同样一条 x10,y30,z20 现在表示一个坐标点。
 //     发 A / B / C     自动取放：夹起物体 A/B/C 放到各自的放置点（详见 pick_place.h）
@@ -64,7 +77,9 @@
 //     因为串口 N/R/P/M 走的就是它；录制期间摇杆照常可用，播放/回中期间摇杆让位，
 //     忙让位规则详见 button_control.h。
 //
-//   绘图（铅笔固定在末端夹具上，详见 draw_control.h；实现只有 draw_control.cpp 一个文件）:
+//   绘图（铅笔固定在末端夹具上，详见 draw_control.h；实现只有 draw_control.cpp 一个文件。
+//   每个采样点都交给 move.h 的 moveToPoint()：反解、关节速率限制、写 Pos 与正解刷新都在
+//   那里，与上面 x/y/z 指令共用同一份实现，draw_control.cpp 只决定"下一步走到哪个坐标"）:
 //     发 F             切换绘制任务：直线 -> 字母N -> 三角形 -> 字母Z -> 字母V -> 五点折线 -> 五点曲线
 //     发 D             开始绘制（内置图形直接画；五点折线/五点曲线先进入五点示教）
 //     发 G / E         示教中记录 / 撤销一个示教点（等价于示教时按按键1 / 按键2）
@@ -97,13 +112,16 @@
 //   换一套装配就把 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL 改成 0。
 //
 // 安全边界:
-//   1. servoLimit 关节硬限位 —— b[0,180] r[0,180] c[0,180] f[60,150]，
-//                              角度模式下的唯一软件边界；转到行程尽头就停住，
-//                              不会顶死舵机（详见 moveJointStep）。
+//   1. servoLimit 关节硬限位 —— b[0,180] r[0,180] c[0,180] f[60,150]，唯一的软件边界。
+//                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
+//                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
+//                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
+//                              点，绘图/示教一律拒绝，串口 x/y/z（NOW 策略）允许吸附后到位。
 //   2. rangeLimit 位置边界   —— 由新角度正解出的末端坐标若跑出 limit 区间，
 //                              这一步整步回退，避免臂跑到没标定的区域。
 //   3. 正运动学自洽          —— 每步都用 recFromServo() 重算坐标，
-//                              Pos.ser 与 Pos.rec 永远严格对应。
+//                              Pos.ser 与 Pos.rec 永远严格对应（坐标入口也一样，
+//                              见 move.cpp 的 moveToPoint()）。
 //
 // 坐标模型（用于显示与工作空间校验，与 constant_and_positions.cpp 一致）:
 //   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
@@ -130,13 +148,13 @@
 //   或 setSpeed(stepSize, minDelayMs, fullDelayMs) 自定义（stepSize 单位现在是"度"）。
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
-#include "servo_drive.h"
-#include "move.h"
-#include "joystick_control.h"
-#include "serial_protocol.h"
-#include "pick_place.h"
-#include "button_control.h"
-#include "draw_control.h"
+#include "servo_drive.h"             /* 4 路舵机（Timer1 硬件 PWM，取代 Servo 库） */
+#include "constant_and_positions.h"  /* Pos（唯一被控量）与 servoLimit / rangeLimit */
+#include "joystick_control.h"        /* 摇杆读取、板载 LED、全局调速 */
+#include "serial_protocol.h"         /* 串口命令解析（x/y/z 指令在这里换算坐标系） */
+#include "pick_place.h"              /* 取放序列 A/B/C */
+#include "button_control.h"          /* 按键 / 录制 / 播放 / 回中 */
+#include "draw_control.h"            /* 绘图任务（采样点交给 move.h 的 moveToPoint()） */
 
 /* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
  * 字母记号（与 constant_and_positions.h 的 servoLimit 一致）:

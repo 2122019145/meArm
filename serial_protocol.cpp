@@ -13,6 +13,7 @@
 
 #include "Arduino.h"
 #include "constant_and_positions.h"
+#include "move.h"           /* moveToPoint(): x/y/z 指令落点用的公共核心 */
 #include "pick_place.h"
 #include "protocol_constants.h"
 #include "serial_protocol.h"
@@ -51,7 +52,6 @@ static unsigned long s_lastCharMs = 0;
 static void protoFlushLine(void);
 static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
-static bool protoMoveToCoords(const double coords[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
 #define PROTO_FEATURE_PICK   0x01u
@@ -679,8 +679,32 @@ int protoHandleLine(const char *line)
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    if (!protoMoveToCoords(coords, seen)) {
-      /* unreachable, or below the ground plane: nothing was changed at all */
+    /* Landing the parsed point is delegated to move.h's moveToPoint() — the very
+     * same "move to a given x,y,z" core the drawing module calls.
+     *
+     * Frame (serial_protocol.h): origin O = the foot of the perpendicular dropped
+     * from the shoulder joint to the ground, x+ = the direction the arm faces in
+     * its initial pose, z+ = straight up, right handed. The firmware's internal
+     * frame has the same axes and only differs by where z counts from: its origin
+     * sits on the shoulder joint, so z_internal = z_coordinate - WEARM_SHOULDER_HEIGHT.
+     * Below the ground plane does not exist: the whole line is rejected.
+     *
+     * MOVE_XYZ_NOW is the instant, unlimited strategy, which is what this command
+     * always was: a strict move — a target the arm cannot stand at is rejected with
+     * nothing written at all, so a rejected command never leaves the arm half way
+     * to a pose nobody asked for. An axis the line did not mention keeps the value
+     * it already had (moveToPoint() handles that from the seen mask). */
+    if ((seen & (uint8_t)(1u << 2)) != 0u) {
+      if (coords[2] < 0.0) {
+        R_REJ();
+        DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
+        return PROTO_RES_COORDS_REJECTED;
+      }
+      coords[2] -= WEARM_SHOULDER_HEIGHT;
+    }
+
+    if (moveToPoint(coords, seen, 0.0, 0.0, MOVE_XYZ_NOW) != MOVE_XYZ_OK) {
+      /* unreachable, or out of joint travel: nothing was changed at all */
       R_REJ();
       DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
       return PROTO_RES_COORDS_REJECTED;
@@ -862,61 +886,6 @@ static int protoHandleDrawCalib(const char *line, char cmd)
   R_ERR();
   DEBUG_PRINTLN(F("[draw] calib syntax error or bad value, parameters unchanged"));
   return PROTO_RES_DRAW_REJECTED;
-}
-
-/* ========== landing the parsed coordinates ========== */
-/* Move the end effector to a point given in the ground frame.
- *
- * Frame (serial_protocol.h): origin O = the foot of the perpendicular dropped
- * from the shoulder joint to the ground, x+ = the direction the arm faces in its
- * initial pose, z+ = straight up, right handed. The firmware's internal frame
- * has the same axes and only differs by where z counts from: its origin sits on
- * the shoulder joint, so z_internal = z_coordinate - WEARM_SHOULDER_HEIGHT.
- *
- * Unlike the old module (which wrote joint angles straight into the servos and
- * clamped whatever the host asked for), this is a strict move: the point is
- * solved with the inverse kinematics and a target the arm cannot stand at is
- * rejected with nothing written at all, so a rejected command never leaves the
- * arm half way to a pose nobody asked for. An axis the line did not mention
- * keeps the value it already had.
- *
- * Returns true when the arm was moved. */
-static bool protoMoveToCoords(const double coords[3], uint8_t seen)
-{
-  pos target = Pos;
-
-  if (seen & (uint8_t)(1u << 0)) {
-    target.rec.x = coords[0];
-  }
-  if (seen & (uint8_t)(1u << 1)) {
-    target.rec.y = coords[1];
-  }
-  if (seen & (uint8_t)(1u << 2)) {
-    /* z is the height above the ground: below the ground plane does not exist */
-    if (coords[2] < 0.0) {
-      return false;
-    }
-    target.rec.z = coords[2] - WEARM_SHOULDER_HEIGHT;
-  }
-
-  /* getAngleEx() writes target.ser only when it returns true: out of reach (or
-   * out of joint travel) leaves the struct untouched. Its clamped flag speaks
-   * about the tool servo (angle4) alone, which this command never sets, so a
-   * successful solve of the requested point is all we ask for. The tool angle
-   * therefore stays exactly where it was, and is never clamped into range here. */
-  if (!getAngleEx(&target, NULL)) {
-    return false;
-  }
-
-  Pos = target;
-
-  /* Keep the derived coordinates coming from the forward kinematics, exactly the
-   * way the rest of the firmware maintains them, so Pos.rec and Pos.ser can
-   * never disagree about where the arm is. */
-  if (!recFromServo(&Pos.rec, &Pos.ser)) {
-    DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
-  }
-  return true;
 }
 
 /* ========== speed control ========== */

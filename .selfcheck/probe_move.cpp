@@ -4,6 +4,7 @@
  */
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include "constant_and_positions.h"
 #include "move.h"
 
@@ -46,6 +47,18 @@ static bool inLimit(void) {
   return Pos.rec.x >= limit.minX - 1e-9 && Pos.rec.x <= limit.maxX + 1e-9 &&
          Pos.rec.y >= limit.minY - 1e-9 && Pos.rec.y <= limit.maxY + 1e-9 &&
          Pos.rec.z >= limit.minZ - 1e-9 && Pos.rec.z <= limit.maxZ + 1e-9;
+}
+
+/* 独立参照：照"预期实现"直接反解一次（不经过 moveToPoint），
+ * 用来确认 moveToPoint() 写进去的就是这一步反解出来的角度。 */
+static bool solveRef(double x, double y, double z, double *b, double *r, double *c) {
+  pos p = Pos;
+  p.rec.x = x; p.rec.y = y; p.rec.z = z;
+  bool clamped = false;
+  if (!getAngleEx(&p, &clamped)) return false;
+  if (clamped) return false;
+  *b = p.ser.angle1; *r = p.ser.angle2; *c = p.ser.angle3;
+  return true;
 }
 
 int main(void) {
@@ -200,6 +213,126 @@ int main(void) {
     snprintf(buf, sizeof(buf), "violations=%d 末态=(%.1f,%.1f,%.1f) b=%.1f r=%.1f c=%.1f",
              bad, Pos.rec.x, Pos.rec.y, Pos.rec.z, Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
     check("4000 步随机压力：零越界/零 NaN/零关节越限/坐标始终自洽", bad == 0, buf);
+  }
+
+  printf("=== 7) moveToPoint(): 绘图 / 串口共用的「移动到指定 x,y,z」 ===\n");
+  {
+    unsigned char before[sizeof(pos)];
+
+    /* 7a 不可达点：整条拒绝，Pos 一个字节都不许动 */
+    posInit();
+    memcpy(before, &Pos, sizeof(pos));
+    {
+      double g[3] = { 0.0, 0.0, 100.0 };            /* 内部坐标 z 远超 L1+L2=40 */
+      int res = moveToPoint(g, 0x07u, 110.0, 0.05, MOVE_XYZ_TRACK);
+      snprintf(buf, sizeof(buf), "res=%d（期望 %d） 逐字节不变=%d",
+               res, MOVE_XYZ_REJECTED, memcmp(before, &Pos, sizeof(pos)) == 0 ? 1 : 0);
+      check("7a 不可达点 -> REJECTED 且 Pos 逐字节不变",
+            res == MOVE_XYZ_REJECTED && memcmp(before, &Pos, sizeof(pos)) == 0, buf);
+    }
+
+    /* 7b TRACK 超出本步速率上限：整点拒绝（调用方再折半重试） */
+    posInit();
+    memcpy(before, &Pos, sizeof(pos));
+    {
+      double g[3] = { Pos.rec.x + 5.0, Pos.rec.y, Pos.rec.z };
+      int res = moveToPoint(g, 0x07u, 1.0, 0.005, MOVE_XYZ_TRACK);   /* 上限 0.2 度 */
+      snprintf(buf, sizeof(buf), "res=%d（期望 %d） 逐字节不变=%d",
+               res, MOVE_XYZ_REJECTED, memcmp(before, &Pos, sizeof(pos)) == 0 ? 1 : 0);
+      check("7b TRACK 超速 -> REJECTED 且不动",
+            res == MOVE_XYZ_REJECTED && memcmp(before, &Pos, sizeof(pos)) == 0, buf);
+    }
+
+    /* 7c TRACK 在限内：写进去的必须就是这一步反解出来的角度（逐位）。
+     * 上限按"这一步实际需要的变化"给（×2），保证测的是"限内接受"这一支。 */
+    {
+      double g[3] = { Pos.rec.x + 5.0, Pos.rec.y, Pos.rec.z };
+      double eb = 0.0, er = 0.0, ec = 0.0;
+      bool ref = solveRef(g[0], g[1], g[2], &eb, &er, &ec);
+      double need = fabs(eb - Pos.ser.angle1);
+      if (fabs(er - Pos.ser.angle2) > need) need = fabs(er - Pos.ser.angle2);
+      if (fabs(ec - Pos.ser.angle3) > need) need = fabs(ec - Pos.ser.angle3);
+      int res = moveToPoint(g, 0x07u, need * 2.0 / 0.1, 0.1, MOVE_XYZ_TRACK);
+      snprintf(buf, sizeof(buf), "res=%d 参照解=%d 需动=%.3f 上限=%.3f b=%.3f/%.3f r=%.3f/%.3f c=%.3f/%.3f 自洽=%d",
+               res, ref ? 1 : 0, need, need * 2.0, Pos.ser.angle1, eb, Pos.ser.angle2, er,
+               Pos.ser.angle3, ec, selfConsistent() ? 1 : 0);
+      check("7c TRACK 限内 -> OK 且角度 == 反解结果（逐位）",
+            ref && res == MOVE_XYZ_OK && Pos.ser.angle1 == eb && Pos.ser.angle2 == er &&
+            Pos.ser.angle3 == ec && selfConsistent(), buf);
+    }
+
+    /* 7d JOG 夹取：每次最多走 maxStep，反复调用逐点逼近直到落到位 */
+    posInit();
+    {
+      double g[3] = { Pos.rec.x + 3.0, Pos.rec.y, Pos.rec.z };
+      double eb = 0.0, er = 0.0, ec = 0.0;
+      bool ref = solveRef(g[0], g[1], g[2], &eb, &er, &ec);
+      double maxStep = 10.0 * 0.02;                   /* 0.2 度 */
+      int steps = 0;
+      double worst = 0.0;
+      for (int i = 0; i < 200; i++) {
+        struct Joints a = snap();
+        int res = moveToPoint(g, 0x07u, 10.0, 0.02, MOVE_XYZ_JOG);
+        struct Joints b = snap();
+        if (res != MOVE_XYZ_OK) { steps = -1; break; }
+        double d = fabs(b.b - a.b);
+        if (fabs(b.r - a.r) > d) d = fabs(b.r - a.r);
+        if (fabs(b.c - a.c) > d) d = fabs(b.c - a.c);
+        if (d > worst) worst = d;
+        steps++;
+        if (b.b == a.b && b.r == a.r && b.c == a.c) break;   /* 已经到位 */
+      }
+      snprintf(buf, sizeof(buf), "参照解=%d 步数=%d 每步最大变化=%.6f（上限 %.2f） 末态=%.4f/%.4f/%.4f",
+               ref ? 1 : 0, steps, worst, maxStep, Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
+      check("7d JOG 每步不超上限、反复调用收敛到反解结果",
+            ref && steps > 0 && worst <= maxStep + 1e-12 &&
+            fabs(Pos.ser.angle1 - eb) < 1e-9 && fabs(Pos.ser.angle2 - er) < 1e-9 &&
+            fabs(Pos.ser.angle3 - ec) < 1e-9, buf);
+    }
+
+    /* 7e NOW：不限速一次到位（串口 x/y/z 的语义），大跳变也一步落上 */
+    posInit();
+    {
+      double g[3] = { Pos.rec.x + 5.0, Pos.rec.y + 2.0, Pos.rec.z - 1.0 };
+      double eb = 0.0, er = 0.0, ec = 0.0;
+      bool ref = solveRef(g[0], g[1], g[2], &eb, &er, &ec);
+      double b0 = Pos.ser.angle1;
+      int res = moveToPoint(g, 0x07u, 0.0, 0.0, MOVE_XYZ_NOW);
+      double jump = fabs(Pos.ser.angle1 - b0);
+      snprintf(buf, sizeof(buf), "参照解=%d res=%d 一次跳变=%.2f 度 自洽=%d 在界内=%d",
+               ref ? 1 : 0, res, jump, selfConsistent() ? 1 : 0, inLimit() ? 1 : 0);
+      check("7e NOW 一次到位且坐标自洽",
+            ref && res == MOVE_XYZ_OK && Pos.ser.angle1 == eb && Pos.ser.angle2 == er &&
+            Pos.ser.angle3 == ec && jump > 1.0 && selfConsistent() && inLimit(), buf);
+    }
+
+    /* 7f 部分 seen：只提及 x 时，y/z 必须沿用当前坐标 */
+    posInit();
+    {
+      double y0 = Pos.rec.y, z0 = Pos.rec.z;
+      double g[3] = { Pos.rec.x + 1.0, -99.0, -99.0 };      /* y/z 故意给垃圾值 */
+      int res = moveToPoint(g, (uint8_t)(1u << 0), 0.0, 0.0, MOVE_XYZ_NOW);
+      snprintf(buf, sizeof(buf), "res=%d x=%.4f（请求 %.4f） Δy=%.2e Δz=%.2e 自洽=%d",
+               res, Pos.rec.x, g[0], fabs(Pos.rec.y - y0), fabs(Pos.rec.z - z0),
+               selfConsistent() ? 1 : 0);
+      check("7f 只提及 x -> 只有 x 变、y/z 沿用当前值",
+            res == MOVE_XYZ_OK && fabs(Pos.rec.x - g[0]) < 1e-9 &&
+            fabs(Pos.rec.y - y0) < 1e-9 && fabs(Pos.rec.z - z0) < 1e-9 && selfConsistent(), buf);
+    }
+
+    /* 7g 参数与模式：空指针、未知模式都必须拒绝且不动 */
+    posInit();
+    memcpy(before, &Pos, sizeof(pos));
+    {
+      double g[3] = { Pos.rec.x, Pos.rec.y, Pos.rec.z };
+      int r1 = moveToPoint(NULL, 0x07u, 110.0, 0.05, MOVE_XYZ_TRACK);
+      int r2 = moveToPoint(g, 0x07u, 110.0, 0.05, 99);       /* 未知策略码 */
+      snprintf(buf, sizeof(buf), "NULL=%d 未知模式=%d 逐字节不变=%d",
+               r1, r2, memcmp(before, &Pos, sizeof(pos)) == 0 ? 1 : 0);
+      check("7g NULL / 未知模式 -> REJECTED 且不动",
+            r1 == MOVE_XYZ_REJECTED && r2 == MOVE_XYZ_REJECTED &&
+            memcmp(before, &Pos, sizeof(pos)) == 0, buf);
+    }
   }
 
   printf("\n>>> %s (失败 %d 项)\n", failures == 0 ? "ALL PASS" : "HAS FAILURES", failures);

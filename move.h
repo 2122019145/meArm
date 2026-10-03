@@ -94,4 +94,52 @@ int moveJointStep(int dir, double stepSize);
  * 新代码请直接用 moveJointStep + JOINT_*，语义更清楚。 */
 int moveAxisStep(int dir, double stepSize);
 
+/* ==================== 移动到指定 x,y,z（绘图 / 串口共用） ====================
+ *
+ * 「移动到指定坐标」在本工程只有这一份实现：反解目标点 -> 按关节速率上限把
+ * b/r/c 朝解算结果推进一格。绘图的三处点位写入（直线平移 moveTick、轨迹跟随
+ * pathAdvance、示教点动 teachJogTick）与串口的 x/y/z 指令全部调用这里，
+ * 不再各自展开一份"反解 + 限速 + 写角度"的代码。
+ *
+ * 参数:
+ *   goal[3]  目标点，与 Pos.rec 同一坐标系（肩关节为原点的内部坐标，
+ *            z 从肩算起；串口的"地面坐标系"由串口层自己换算后再传进来）。
+ *   seen     位掩码：位 0/1/2 分别表示 x/y/z 被本次请求提及。**没被提及的轴
+ *            沿用 Pos.rec 的当前值**（串口 "x10" 这类单轴命令就是这么处理的），
+ *            传 0x07 表示三个轴都要走到 goal。
+ *   maxDps   关节角速度上限（度/秒）。**只在 TRACK / JOG 下有意义**：
+ *            <= 0（或 dtSec <= 0）时本步上限退化到下限 0.2 度 —— 也就是最严格的
+ *            限速，超出的点照样被拒绝 / 夹取。只有 MOVE_XYZ_NOW 是真正不限速、
+ *            一次调用直接到位，它根本不读这两个参数。
+ *   dtSec    本轮时长（秒）；与 maxDps 相乘就是本步允许的最大关节变化
+ *            （下限 0.2 度，极短的一轮也给一点步长）。
+ *   mode     逼近策略，见下面三个 MOVE_XYZ_*。
+ *
+ * 返回 enum MoveXyzResult。**只有 MOVE_XYZ_OK 会写 Pos**，其余情况 Pos.ser 与
+ * Pos.rec 一个字节都不改，调用方可以直接把失败当成"这一轮什么也没发生"。
+ *
+ * 【与角度模式的关系】本函数是"坐标模式"的入口：写进去的仍然是关节角，
+ * 写完立刻用正运动学刷新 Pos.rec，所以不变量（坐标 == 角度的真实结果）不变。 */
+enum MoveXyzResult {
+  MOVE_XYZ_REJECTED = 0,   /* 解不出来 / 被硬限位吸附 / 本步超出速率上限（严格策略） */
+  MOVE_XYZ_OK       = 1    /* 已按策略写入新的关节角，并刷新了 Pos.rec */
+};
+
+/* 逼近策略 —— 三种，正好对应三个调用方:
+ *   MOVE_XYZ_TRACK 轨迹跟随（绘图的直线平移与绘制）：解算结果里任一关节本步
+ *                  需要的变化超过 maxDps×dtSec 就整点拒绝（轨迹参数不推进，
+ *                  调用方会折半位移重试）；反解被关节硬限位吸附同样算拒绝。
+ *   MOVE_XYZ_JOG   示教点动：超出上限的部分夹到上限（尽量走一点），被吸附
+ *                  仍然算失败 —— 手动操作宁可到不了请求点，也绝不原地卡住。
+ *   MOVE_XYZ_NOW   即时到位（串口 x/y/z）：不限速、一次调用直接落到目标姿态，
+ *                  并允许硬限位吸附 —— 与串口原来的"严格移动"逐位相同。
+ *                  【唯一差异】旧代码在 recFromServo() 失败时会打一句
+ *                  WEARM_DEBUG_SERIAL 调试警告，这里不打了（返回值本来就被丢弃，
+ *                  姿态、回包与结果码完全不变）。 */
+#define MOVE_XYZ_TRACK 0
+#define MOVE_XYZ_JOG   1
+#define MOVE_XYZ_NOW   2
+
+int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, int mode);
+
 #endif //WEARM_MOVE_H
