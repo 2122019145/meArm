@@ -7,7 +7,7 @@
 #
 # 做三件事：
 #   1. 严格编译 9 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）
-#   2. 严格编译并运行 10 个自检程序，逐个要求 "ALL PASS" 且退出码 0
+#   2. 严格编译并运行 11 个自检程序，逐个要求 "ALL PASS" 且退出码 0
 #   3. 汇总退出码（任一失败则 exit 1）
 #
 # 【注意 PowerShell / g++ 的坑】

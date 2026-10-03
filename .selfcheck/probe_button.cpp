@@ -240,7 +240,7 @@ int main(void) {
     snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d 位移=%.2f",
              rc, recMs, buttonRecordingEntries(), buttonRecordingTravel());
     check("结束录制并保存成功", rc == PROTO_RES_REC_SAVED && buttonHasRecording(), d);
-    check("长录像（11.6 秒，缓冲上限 12.8 秒内）照样保存", recMs > 10000UL, d);
+    check("长录像（11.6 秒，缓冲上限 38.4 秒内）照样保存", recMs > 10000UL, d);
     check("末端位移达到明显位移门槛(>=10)", buttonRecordingTravel() >= 10.0, d);
     check("条目数大于 0", buttonRecordingEntries() > 0, d);
     check("录制结束后状态回到空闲", strcmp(buttonStateName(), "空闲") == 0, buttonStateName());
@@ -405,12 +405,12 @@ int main(void) {
     rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
     /* 注意：位移与条目数是在"结束录制"里才结算的，录制过程中读只能读到 0 */
     double travel = buttonRecordingTravel();
-    snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d/128 位移=%.2f",
-             rc, recMs, entries, travel);
-    check("四路连续动 11 秒仍能保存成功（没被 128 条写满）",
+    snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d/%d 位移=%.2f",
+             rc, recMs, entries, (int) WEARM_REC_ENTRIES, travel);
+    check("四路连续动 11 秒仍能保存成功（没被缓冲写满）",
           rc == PROTO_RES_REC_SAVED && buttonHasRecording(), d);
-    check("最坏情况录制时长确实大于 10 秒（仍在 12.8 秒窗口内）", recMs > 10000UL, d);
-    check("条目数没有溢出缓冲", entries > 0 && entries <= 128, d);
+    check("最坏情况录制时长确实大于 10 秒（仍在 38.4 秒窗口内）", recMs > 10000UL, d);
+    check("条目数没有溢出缓冲", entries > 0 && entries <= (int) WEARM_REC_ENTRIES, d);
     check("四路动作产生了明显位移（>=10）", travel >= 10.0, d);
 
     /* 立刻回放这种"每个周期都有动作"的录制，确认新周期标志被正确还原 */
@@ -461,7 +461,7 @@ int main(void) {
     for (int a = 0; a < 4; a++) g_mockAnalog[a] = 512 - 500;
     advance(5000);
     for (int a = 0; a < 4; a++) g_mockAnalog[a] = 512 + 500;
-    advance(1500);                       /* 合计 11.5 秒（上限 12.8 秒内） */
+    advance(1500);                       /* 合计 11.5 秒（上限 38.4 秒内） */
     centerSticks();
     advance(200);
     SER recEnd = Pos.ser;                /* 按 P 这一刻的位姿 = 录制末态 */
@@ -482,6 +482,36 @@ int main(void) {
           e1 <= 1.5 && e2 <= 1.5 && e3 <= 1.5 && e4 <= 1.5, d);
     check("回放结束回到空闲", !buttonPlaybackActive() && strcmp(buttonStateName(), "空闲") == 0,
           buttonStateName());
+  }
+
+  /* ---------------- 12) 缓冲写满：超过录制上限就溢出判废 ---------------- */
+  printf("\n[12] 缓冲写满：%d 条 × %lu ms = %lu 秒上限\n",
+         (int) WEARM_REC_ENTRIES, (unsigned long) WEARM_REC_TICK_MS,
+         (unsigned long) WEARM_REC_ENTRIES * WEARM_REC_TICK_MS / 1000UL);
+  {
+    int rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
+    check("开始录制（准备写满缓冲）", rc == PROTO_RES_REC_STARTED && buttonIsRecording(), "rc=12");
+
+    /* 每个采样周期固定写一条，所以"什么时候写满"只取决于时间。一直推基座轴
+     * 保证有位移；写满那一刻 btnRecTick 会自己收尾，不用再发 R。 */
+    unsigned long t0 = g_mockMillis;
+    g_mockAnalog[0] = 512 + 500;
+    advance((unsigned long) (WEARM_REC_ENTRIES - 1) * WEARM_REC_TICK_MS);
+    int near = buttonRecordingEntries();
+    snprintf(d, sizeof(d), "已录 %lu ms 条目=%d/%d 仍在录制=%d",
+             g_mockMillis - t0, near, (int) WEARM_REC_ENTRIES, (int) buttonIsRecording());
+    check("写满前一刻仍在录制、条数顶到上限附近（uint16 计数不回绕）",
+          buttonIsRecording() && near >= (int) WEARM_REC_ENTRIES - 2 && near <= (int) WEARM_REC_ENTRIES, d);
+
+    advance(2UL * WEARM_REC_TICK_MS);    /* 越过上限：下一条记录写不进去 */
+    centerSticks();
+    advance(200);
+    snprintf(d, sizeof(d), "时长=%lu ms 仍在录制=%d 有数据=%d",
+             g_mockMillis - t0, (int) buttonIsRecording(), (int) buttonHasRecording());
+    check("写满缓冲后自动结束录制", !buttonIsRecording(), d);
+    check("溢出的录制判废：不留下半段数据", !buttonHasRecording(), d);
+    check("溢出判废后串口 P 报没有录像（EMPTY）",
+          buttonHandleCommand(PROTO_CMD_BTN_PLAY) == PROTO_RES_PLAY_NO_RECORD, "rc=16");
   }
 
   printf("\n");

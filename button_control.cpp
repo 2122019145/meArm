@@ -9,29 +9,37 @@
  *      时整段引脚扫描都被裁掉，四个功能全部改由串口 N/R/P/M/0 触发；
  *      原因见 weArm_config.h：右摇杆推到最前会压到 SW，假触发按键1 抢走操作。
  *
- *   2) Recording format (fixed 384-byte buffer, no dynamic allocation):
- *      one packed record per BTN_TICK_MS (100 ms) sampling tick holds the angle
- *      delta of all four joints, 6 signed bits each (unit = 0.5 deg):
- *         bits  0.. 5  joint 0 (base)      delta in recording units
- *         bits  6..11  joint 1 (upper arm)
- *         bits 12..17  joint 2 (forearm)
- *         bits 18..23  joint 3 (end effector)
- *      BTN_REC_ENTRIES = 128 records x 3 bytes = 384 bytes = 128 ticks = 12.8 s.
+ *   2) Recording format (fixed static buffer, no dynamic allocation):
+ *      one packed record per BTN_TICK_MS (= WEARM_REC_TICK_MS, default 200 ms)
+ *      sampling tick holds the angle delta of all four joints, 8 signed bits
+ *      each (unit = 0.5 deg):
+ *         byte 0  joint 0 (base)          delta in recording units
+ *         byte 1  joint 1 (upper arm)
+ *         byte 2  joint 2 (forearm)
+ *         byte 3  joint 3 (end effector)
+ *      BTN_REC_ENTRIES = 192 records x 4 bytes = 768 bytes = 192 ticks = 38.4 s
+ *      (see weArm_config.h section 5 for the SRAM / length trade-off).
  *      Every tick gets exactly one record, moving or not, so the playback time
  *      axis is the exact recording timeline; an all-zero record simply means
  *      "no motion".
- *      A joint delta wider than the 6-bit field (+-32 units = +-16 deg per tick)
+ *      A joint delta wider than the 8-bit field (+-128 units = +-64 deg per tick)
  *      is clamped, but s_snap[] follows the *emitted* position rather than the
  *      real one, so the remainder is carried into the next ticks: the recorded
  *      total displacement stays exact and only a very fast move arrives a tick
- *      or two later during playback.
+ *      or two later during playback.  (At 200 ms per tick the field limit is
+ *      317 deg/s per joint, so the slow and normal presets are covered exactly;
+ *      only the top of the fast preset - 400 deg/s - relies on the carry, and
+ *      btnStopRecording() flushes the leftover carry at the end.)
+ *      Playback spreads every record over BTN_PLAY_SUBSTEPS equal sub-steps so
+ *      a coarse sampling rate does not turn the replay into 200 ms jumps; the
+ *      last sub-step lands exactly on the recorded delta.
  *
  *   3) Save validation (the end-effector must have moved, otherwise the
  *      recording is dropped):
  *         end-effector travel on x/y/z >= BTN_REC_MIN_TRAVEL (10.0)
  *      【没有最小时长门槛】原来还要求"录制时长必须大于 10 秒"，已按要求删除：
- *      短动作（哪怕 1 秒）只要末端走够了 10 个单位就照样保存，最长仍受
- *      128 条 = 12.8 秒的缓冲上限约束（写满即溢出判废）。
+ *      短动作（哪怕 1 秒）只要末端走够了 10 个单位就照样保存，最长受
+ *      BTN_REC_ENTRIES = 192 条 = 38.4 秒的缓冲上限约束（写满即溢出判废）。
  *      A new recording reuses the same buffer from its first tick on, so a
  *      rejected recording also invalidates the previous one.  This keeps the
  *      longest possible recording inside the 2 KB SRAM of the Uno; the serial
@@ -74,13 +82,18 @@
 #endif
 
 #define BTN_DEBOUNCE_MS     25UL      /* button debounce time（仅物理按键用） */
-#define BTN_TICK_MS         100UL     /* recording sampling period */
+/* 采样周期与缓冲条数是 weArm_config.h 第 5 节的编译期开关：改短了回放更顺但同样
+ * SRAM 录得更短，改长了相反。默认 192 条 × 200 ms = 38.4 秒、768 B SRAM。 */
+#define BTN_TICK_MS         ((unsigned long) WEARM_REC_TICK_MS)  /* sampling period */
 #define BTN_RAMP_MS         1500UL    /* smooth ramp before playback / homing */
 #define BTN_REC_MIN_TRAVEL  10.0      /* minimum end-effector travel */
-#define BTN_REC_ENTRIES     128       /* record limit (128 * 3 = 384 bytes SRAM) */
-#define BTN_REC_BYTES       3         /* packed size of one 100 ms record */
-#define BTN_REC_LIMIT       32        /* 6-bit signed field range: -32..+31 units */
+#define BTN_REC_ENTRIES     WEARM_REC_ENTRIES  /* 192 * 4 = 768 bytes SRAM */
+#define BTN_REC_BYTES       4         /* packed size of one record: 4 x 8 bit */
+#define BTN_REC_LIMIT       128       /* 8-bit signed field range: -128..+127 units */
 #define BTN_ANGLE_UNIT      2.0       /* 1 deg = 2 recording units (unit = 0.5 deg) */
+/* 回放时把一条记录拆成几个子步（1 = 整条一次跳完，退回老行为）。200 ms 采样在
+ * 4 个子步下就是每 50 ms 走一小段，动作不会一顿一顿。必须能整除 BTN_TICK_MS。 */
+#define BTN_PLAY_SUBSTEPS   4
 
 #if WEARM_BUTTON_PINS
 static const uint8_t BTN_PIN[BTN_COUNT] = {
@@ -90,7 +103,8 @@ static const uint8_t BTN_PIN[BTN_COUNT] = {
 
 /* ---------------- recording buffer ---------------- */
 
-/* One packed record per 100 ms tick: four 6-bit signed joint deltas. */
+/* One packed record per sampling tick: four 8-bit signed joint deltas.
+ * 192 条 × 4 字节 = 768 B —— 这是整个固件最大的一块 SRAM。 */
 static uint8_t s_buf[BTN_REC_ENTRIES * BTN_REC_BYTES];
 
 /* ---------------- runtime state ---------------- */
@@ -103,8 +117,8 @@ static bool    s_recording   = false;    /* recording in progress */
 static bool    s_rampThenPlay = false;   /* after the ramp: play (true) or stop (false) */
 
 /* recording */
-static uint8_t       s_recCount     = 0;     /* records written by the current recording */
-static uint8_t       s_recLen       = 0;     /* records of the saved recording */
+static uint16_t      s_recCount     = 0;     /* records written by the current recording */
+static uint16_t      s_recLen       = 0;     /* records of the saved recording */
 static bool          s_hasRec       = false; /* a playable recording exists */
 static bool          s_recOverflow  = false; /* the buffer ran full */
 static unsigned long s_recStartMs    = 0;
@@ -122,8 +136,11 @@ static double        s_rampTo[4]   = {0.0, 0.0, 0.0, 0.0};
 static unsigned long s_rampStartMs = 0;
 
 /* playback */
-static uint8_t       s_playIdx   = 0;
+static uint16_t      s_playIdx   = 0;     /* uint16_t: 缓冲可达 256 条以上，uint8_t 会装不下 */
 static unsigned long s_playDueMs = 0;
+static uint8_t       s_subIdx    = 0;     /* 当前记录已插值走的子步数（0 = 还没装载） */
+static double        s_subDelta[4]   = {0.0, 0.0, 0.0, 0.0};  /* 整条记录的关节增量（度） */
+static double        s_subApplied[4] = {0.0, 0.0, 0.0, 0.0};  /* 子步已经贴上去的部分（度） */
 
 /* button debounce（只有物理按键在用；WEARM_BUTTON_PINS=0 时整个裁掉，
  * 省下 4+4+16 字节 SRAM 和 4 路 digitalRead） */
@@ -194,7 +211,7 @@ static double btnTravelSpan(void) {
 
 /* ---------------- recording ---------------- */
 
-/* Pack one record: four 6-bit signed joint deltas into BTN_REC_BYTES bytes. */
+/* Pack one record: four 8-bit signed joint deltas into BTN_REC_BYTES bytes. */
 static void btnRecPut(const int *u) {
   if (s_recCount >= BTN_REC_ENTRIES) {
     s_recOverflow = true;
@@ -203,19 +220,20 @@ static void btnRecPut(const int *u) {
   uint8_t *p = &s_buf[s_recCount * BTN_REC_BYTES];
   uint32_t v = 0;
   for (int j = 0; j < 4; j++) {
-    v |= ((uint32_t) (u[j] & 0x3F)) << (6 * j);
+    v |= ((uint32_t) (u[j] & 0xFF)) << (8 * j);
   }
   p[0] = (uint8_t) v;
   p[1] = (uint8_t) (v >> 8);
   p[2] = (uint8_t) (v >> 16);
+  p[3] = (uint8_t) (v >> 24);
   s_recCount++;
 }
 
 /* Collect what moved during one tick: the delta of every joint since the angle
- * the recording emitted last, clamped to the 6-bit field range (-32..+31, so the
- * positive limit is BTN_REC_LIMIT - 1: +32 would alias to -32).  s_snap[] is
- * advanced by the clamped amount (not by the real angle), so anything that does
- * not fit into this record is carried into the next one.  Returns true if
+ * the recording emitted last, clamped to the 8-bit field range (-128..+127, so
+ * the positive limit is BTN_REC_LIMIT - 1: +128 would alias to -128).  s_snap[]
+ * is advanced by the clamped amount (not by the real angle), so anything that
+ * does not fit into this record is carried into the next one.  Returns true if
  * anything moved. */
 static bool btnRecCollect(int *u) {
   bool moved = false;
@@ -255,7 +273,9 @@ static void btnStartRecording(void) {
   s_bbMin[2] = s_bbMax[2] = Pos.rec.z;
 
 #if WEARM_DEBUG_SERIAL
-  Serial.println(F("[btn] 开始录制：请用摇杆操控机械臂（要有明显位移，最长 12.8 秒）"));
+  Serial.print(F("[btn] 开始录制：请用摇杆操控机械臂（要有明显位移，最长 "));
+  Serial.print((unsigned long) BTN_REC_ENTRIES * BTN_TICK_MS / 1000UL);
+  Serial.println(F(" 秒）"));
   Serial.println(F("[btn] 提示：本次录制会覆盖上一次的录制数据"));
 #endif
 }
@@ -276,7 +296,9 @@ static void btnRecTick(unsigned long now) {
 
   if (s_recOverflow) {
 #if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 录制缓冲已满（128 条），自动结束录制"));
+    Serial.print(F("[btn] 录制缓冲已满（"));
+    Serial.print((unsigned int) BTN_REC_ENTRIES);
+    Serial.println(F(" 条），自动结束录制"));
 #endif
     (void) btnStopRecording();
   }
@@ -290,11 +312,14 @@ static int btnStopRecording(void) {
   unsigned long now = millis();
 
   if (!s_recOverflow) {
-    /* Flush the motion of the unfinished tick as one last record.  Without it the
-     * playback would stop one tick early, which is clearly visible in the fast
-     * speed preset (a whole tick of travel at the end). */
+    /* Flush the motion of the unfinished tick.  One record normally holds all of
+     * it, but a joint that outran the field range can still have a carry backlog
+     * left (the carry is drained one record per call), so keep flushing until
+     * nothing is left.  Without this the tail of a fast move would be dropped and
+     * the playback would stop short of where the recording ended. */
     int u[4];
-    if (btnRecCollect(u)) {
+    for (int i = 0; i < 8 && !s_recOverflow; i++) {
+      if (!btnRecCollect(u)) break;
       btnUpdateTravel(&Pos.rec);
       btnRecPut(u);
     }
@@ -319,7 +344,9 @@ static int btnStopRecording(void) {
   if (s_recOverflow) {
     ok = false;
 #if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 不合格：动作太长把 128 条缓冲写满了，尾部动作丢失"));
+    Serial.print(F("[btn] 不合格：动作太长把 "));
+    Serial.print((unsigned int) BTN_REC_ENTRIES);
+    Serial.println(F(" 条缓冲写满了，尾部动作丢失"));
 #endif
   } else if (s_recCount <= 0) {
     ok = false;
@@ -388,6 +415,7 @@ static void btnRampTick(unsigned long now) {
     s_state        = BS_PLAY;
     s_playIdx      = 0;
     s_playDueMs    = millis();
+    s_subIdx       = 0;
 #if WEARM_DEBUG_SERIAL
     Serial.println(F("[btn] 已摆到录制起点，开始播放"));
 #endif
@@ -401,27 +429,57 @@ static void btnRampTick(unsigned long now) {
 
 /* ---------------- playback ---------------- */
 
-/* Apply one whole 100 ms record: all four joint deltas belong to the same tick,
- * so they land together and the pose is re-clamped / re-solved once. */
-static void btnPlayRecord(void) {
+/* Load the record that is due now: sign-extend its four 8-bit fields into
+ * s_subDelta[] (degrees) and clear the sub-step progress. */
+static void btnPlayLoad(void) {
   const uint8_t *p = &s_buf[s_playIdx * BTN_REC_BYTES];
-  uint32_t v = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16);
+  uint32_t v = (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
+               ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
   for (int j = 0; j < 4; j++) {
-    /* Sign-extend the 6-bit field, then move that joint. */
-    int u = (int) ((v >> (6 * j)) & 0x3F);
-    u = (u ^ BTN_REC_LIMIT) - BTN_REC_LIMIT;
-    if (u != 0) *btnAngle(j) += btnFromUnits(u);
+    int u = (int) ((v >> (8 * j)) & 0xFF);
+    u = (u ^ BTN_REC_LIMIT) - BTN_REC_LIMIT;   /* sign-extend the 8-bit field */
+    s_subDelta[j]   = btnFromUnits(u);
+    s_subApplied[j] = 0.0;
+  }
+  s_subIdx = 0;
+}
+
+/* Move to the next sub-step of the current record.  All four joints of one
+ * record belong together, so they move in the same sub-step and the pose is
+ * re-clamped / re-solved once.  The target is an exact fraction k/N of the
+ * recorded delta and the last sub-step (k == N) therefore lands exactly on it,
+ * no matter how the fractions round in between. */
+static void btnPlaySub(void) {
+  s_subIdx++;
+  for (int j = 0; j < 4; j++) {
+    double target = s_subDelta[j] * (double) s_subIdx / (double) BTN_PLAY_SUBSTEPS;
+    *btnAngle(j) += target - s_subApplied[j];
+    s_subApplied[j] = target;
   }
   btnCommitAngles();
 }
 
 static void btnPlayTick(unsigned long now) {
+  /* The sub-steps of all records fall on one uniform time base: a record of
+   * BTN_TICK_MS is spread over BTN_PLAY_SUBSTEPS pieces of BTN_TICK_MS /
+   * BTN_PLAY_SUBSTEPS, so the whole playback is just "apply the next sub-step
+   * every subMs".  That keeps the total playback length exactly
+   * s_recLen * BTN_TICK_MS, like the plain per-record version did.
+   * btnPlayLoad() is idempotent (it re-reads the same record and clears the
+   * progress), so calling it on every pass while waiting is harmless. */
+  const unsigned long subMs = BTN_TICK_MS / (unsigned long) BTN_PLAY_SUBSTEPS;
+
   while (s_playIdx < s_recLen) {
-    unsigned long due = s_playDueMs + BTN_TICK_MS;   /* record 0 is due one tick in */
-    if ((long) (now - due) < 0L) break;              /* not yet: keep it for later */
+    if (s_subIdx == 0) btnPlayLoad();
+
+    unsigned long due = s_playDueMs + subMs;   /* the first sub-step is due one in */
+    if ((long) (now - due) < 0L) break;        /* not yet: keep it for later */
     s_playDueMs = due;
-    btnPlayRecord();
-    s_playIdx++;
+    btnPlaySub();
+    if (s_subIdx >= BTN_PLAY_SUBSTEPS) {
+      s_subIdx = 0;
+      s_playIdx++;
+    }
   }
 
   if (s_playIdx >= s_recLen) {
