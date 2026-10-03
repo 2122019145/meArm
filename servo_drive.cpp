@@ -23,8 +23,9 @@
 
 static uint8_t  s_pin[SERVO_CH_COUNT];          /* 通道 -> 引脚号，0xFF = 未绑定 */
 static volatile uint16_t s_ticks[SERVO_CH_COUNT]; /* 通道 -> 脉冲宽度（tick） */
-static uint8_t  s_ch;                           /* 当前正在输出的通道 */
-static uint8_t  s_phase;                        /* 0 = 待发帧首脉冲，1 = 正在输出脉冲 */
+/* 事件游标：0..3 表示"该通道的脉冲正在输出，下一次事件是把它拉低"；
+ * == SERVO_CH_COUNT 表示"4 路都发完了，下一次事件就是下一帧的帧边界"。 */
+static uint8_t  s_ch;
 
 uint16_t servoDriveTicksForDeg(double deg) {
   int a = (int)deg;                     /* 与原代码 (int) angle 的截断一致 */
@@ -40,11 +41,13 @@ void servoDriveBegin(void) {
     s_pin[i]   = SERVO_PIN_NONE;
     s_ticks[i] = SERVO_DEFAULT_TICKS;   /* 未写过角度时保持 1500us 中位（Servo 库 attach 同值） */
   }
-  s_ch    = 0u;
-  s_phase = 0u;
+  s_ch    = SERVO_CH_COUNT;   /* 第一次中断就当成帧边界：清零 TCNT1 并起第 0 路脉冲 */
 #if defined(__AVR__)
-  TCCR1A = 0;                 /* 普通模式，不用硬件 PWM 输出脚 */
-  TCCR1B = _BV(CS11);         /* 预分频 8：16MHz/8 = 2MHz => 0.5us/tick */
+  TCCR1A = 0;
+  /* 普通模式（WGM12 = 0，比较匹配**不**清零 TCNT1）+ 预分频 8：16MHz/8 = 2MHz => 0.5us/tick。
+   * 普通模式正是这里需要的：状态机排的是"绝对比较值"（当前计数 + 脉宽，以及帧长 40000），
+   * 计数器只在帧边界被软件清零，所以每个比较值都落在未来的确定时刻上，不会漂移。 */
+  TCCR1B = _BV(CS11);
   TCNT1  = 0;
   TIFR1 |= _BV(OCF1A);        /* 清掉可能挂起的比较中断标志 */
   OCR1A  = SERVO_FIRST_TICKS;
@@ -74,10 +77,21 @@ void servoDriveWrite(uint8_t ch, double deg) {
 
 /* 脉冲状态机（纯函数，PC 端可逐步验证时序） */
 uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks) {
-  if (s_phase == 0u) {
-    /* 帧起点：开始第一个通道的脉冲，并要求调用者把 TCNT1 清零（帧长因此恒为 20ms） */
-    s_ch    = 0u;
-    s_phase = 1u;
+  if (s_ch >= SERVO_CH_COUNT) {
+    /* 帧边界：上一次中断已经排好的 20ms 比较值到点了。
+     * 这里做两件事：把 TCNT1 清零（由调用者写寄存器），并**在同一次中断里**开始本帧
+     * 第 0 路的脉冲 —— 也就是"帧边界 = 第 0 路上升沿"。
+     *
+     * 【为什么帧尾的比较值必须在上一次中断里就算好】中断入口读到的 TCNT1 已经
+     * 越过比较值几个 tick。本分支真正被执行时计数器刚刚到达帧尾（≈40000），
+     * 若在这里现算"还差多少"：remain = (uint16_t)(SERVO_FRAME_TICKS - nowTicks)
+     * 会下溢成 65530 附近（uint16），于是 OCR1A 被排到一个**计数器刚刚过去的
+     * 值**上，要等 16 位计数器绕整整一圈（约 32.8ms）才会再次匹配 —— 帧长会变成
+     * 约 52.8ms（19Hz）、舵机刷新忽快忽慢。
+     * 所以帧尾比较值在"4 路都发完"那一次中断里就算成绝对计数 SERVO_FRAME_TICKS
+     * （见下面最后一段，那时 nowTicks 只有一万多，一定还在未来），
+     * 帧边界分支只负责清零 TCNT1 并起下一帧。 */
+    s_ch = 0u;
     if (s_pin[0] != SERVO_PIN_NONE) { digitalWrite(s_pin[0], HIGH); }
     *nextDelayTicks = s_ticks[0];
     return 1u;
@@ -93,11 +107,14 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks) {
     return 0u;
   }
 
-  /* 4 路都发完：等 20ms 帧边界（绝对比较值，与 Servo 库 usToTicks(REFRESH_INTERVAL) 一致） */
-  uint16_t remain = (uint16_t)(SERVO_FRAME_TICKS - nowTicks);
-  if (remain < 40u) { remain = 40u; }   /* 极端情况下也留出足够时间，别丢比较中断 */
-  *nextDelayTicks = (uint16_t)(nowTicks + remain);
-  s_phase = 0u;
+  /* 4 路都发完：把帧长本身写成比较值（相对本帧 TCNT1 清零点，即绝对计数 40000）。
+   * 此刻 nowTicks 只是四路脉宽之和（默认 4×3000 = 12000，最宽也不到 19184），
+   * 离 40000 还很远，所以这次比较一定命中、不会绕回；到点后由上面的帧边界分支
+   * 接着发下一帧，帧长因此严格是 40000 + 一次中断响应开销 ≈ 20ms。
+   * 注意这里**不能**写 nowTicks + remain 这种"现算剩余量"的等价形式：
+   * 一旦哪天这个分支被移动到帧尾中断里执行（那时 nowTicks ≈ 40006），
+   * uint16 减法下溢就会把下一帧推到 52.8ms 之后（见上面的长注释）。 */
+  *nextDelayTicks = SERVO_FRAME_TICKS;
   return 0u;
 }
 

@@ -85,6 +85,36 @@ static void attach1234(void) {
   servoDriveAttach(3, 6);   /* f 末端 */
 }
 
+/* 真实中断时序模型：比较值到点后，中断要 latency 个 tick 才真正执行，所以中断
+ * 入口读到的 TCNT1 = 比较值 + latency（这就是硬件上 nowTicks 的真实来源）。
+ * 这里走两个帧边界，返回第二个帧边界相对上一次 TCNT1 清零点的位置（tick）。
+ *
+ * 为什么要带延迟测：captureFrame() 是零延迟模型（nowTicks 正好等于上一次排定的
+ * 比较值），它只能验证"排出去的下一个比较值是多少"。带延迟的模型验证的是**真实
+ * 帧长**：帧尾比较值是绝对计数 40000，它会自我校正，所以中断延迟不会累积；
+ * 但如果哪天有人把帧尾改成"在帧尾中断里现算剩余量"（那时入口 TCNT1 ≈ 40006），
+ * uint16 下溢会把下一帧排到 ~52800 tick 之后（19Hz，舵机抖动），
+ * 这条用例会立刻报出来。 */
+static unsigned framePeriodTicks(unsigned latency) {
+  /* servo_drive.cpp 里 servoDriveBegin() 排的第一个比较值（SERVO_FIRST_TICKS = 1000），
+   * 那个宏是 .cpp 私有的，探针这边按已知值写死。 */
+  uint16_t cmp = 1000u;   /* 当前比较值（相对上一次 TCNT1 清零点） */
+  int boundaries = 0;
+
+  for (int guard = 0; guard < 64; guard++) {
+    uint16_t next = 0;
+    uint8_t start = servoDriveStep((uint16_t)(cmp + latency), &next);
+    if (start != 0u) {
+      if (++boundaries == 2) {
+        /* 第二个帧边界：此刻计数器刚从上一个清零点走到 cmp，中断入口又晚了 latency */
+        return (unsigned)cmp + latency;
+      }
+    }
+    cmp = next;
+  }
+  return 0xFFFFFFFFu;          /* 走不到第二个帧边界 */
+}
+
 int main(void) {
   printf("=== servo_drive 自检（脉宽映射 / 脉冲时序）===\n");
   Frame f;
@@ -188,6 +218,26 @@ int main(void) {
   captureFrame(&f);
   check("越界通道 attach/write 被忽略（引脚 5 没被驱动）",
         f.logCount == 2 && f.logPin[0] == 9 && f.logLevel[0] == HIGH, NULL);
+
+  /* 8) 带中断延迟的真实帧长：帧边界之间的间隔必须 ≈ 40000 tick（20ms），
+   *    不能因为"在帧尾中断里现算剩余量"而下溢成 ~52800 tick（19Hz）。
+   *    一帧里有 1 次帧边界中断 + 4 次换路/帧尾中断，所以延迟会被累加 4 次；
+   *    这里断言 [40000, 40000 + 8*latency]，既允许中断开销又不放过下溢。 */
+  const unsigned lat[3] = { 2u, 6u, 30u };
+  for (int i = 0; i < 3; i++) {
+    attach1234();
+    servoDriveWrite(0, 10.0);
+    servoDriveWrite(1, 60.0);
+    servoDriveWrite(2, 120.0);
+    servoDriveWrite(3, 170.0);
+    unsigned period = framePeriodTicks(lat[i]);
+    unsigned hi = FRAME_TICKS_EXPECT + 8u * lat[i];
+    snprintf(buf, sizeof buf, "中断延迟 %2u tick: 帧间隔 %6u tick (期望 %u..%u)", lat[i], period,
+             FRAME_TICKS_EXPECT, hi);
+    check(buf, period >= FRAME_TICKS_EXPECT && period <= hi, NULL);
+  }
+  check("带延迟的帧长没有下溢成 ~52800 tick（19Hz 抖动）",
+        framePeriodTicks(30u) < 45000u, NULL);
 
   printf(">>> %s (失败 %d 项)\n", g_fail == 0 ? "ALL PASS" : "HAS FAILURES", g_fail);
   return g_fail == 0 ? 0 : 1;

@@ -59,6 +59,17 @@
 #define JOY_DEADZONE   15   /* 中性区：偏转小于此值视为没推杆 */
 #define JOY_FULL_SCALE 500  /* 满偏参考幅度，用于把偏转量归一到 0~1 */
 
+/* ---------- 配置：中位自标定 ---------- */
+/* 真实手柄的机械中位很少正好是 ADC 的 512：实测常见偏 20~60 个计数。
+ * 偏 20 就已经超过死区（15），于是"手不碰摇杆"时每一路都被当成轻微推杆，
+ * 机械臂会持续缓慢地自己乱走 —— 这正是"无故乱动"的软件侧根因。
+ * 所以开机时（joystickSetup）把四路各平均若干次，把静态偏差记下来，
+ * 之后所有读数都先扣掉这个偏差，中位判据仍然只需要和 512 比。
+ * 上限 JOY_CAL_MAX_OFF 用来兜底：开机时若有人手压着摇杆，偏差会远超此值，
+ * 那就判定"这次标定不可信"，退回到标准中位 512（偏差记 0）。 */
+#define JOY_CAL_SAMPLES  8  /* 每路标定取多少次 ADC 求平均 */
+#define JOY_CAL_MAX_OFF 64  /* 允许的静态偏差上限（计数） */
+
 /* ---------- 配置：时序 ---------- */
 #define BTN_DEBOUNCE_MS 30  /* 按键消抖窗口（本套件默认无按键，保留供扩展） */
 #define LED_FAST_MS    100  /* 运动中闪烁半周期 */
@@ -104,6 +115,12 @@ static const unsigned char JOY_RAW_SLOT[JIDX_COUNT] PROGMEM = { 0, 1, 3, 2 };
 /* ---------- 内部状态 ---------- */
 /* 每个关节各自记录上次步进时刻：一个关节被推住不放，不会拖慢其它关节。 */
 static unsigned long lastStepTime[JIDX_COUNT] = { 0, 0, 0, 0 };
+
+/* 四路 ADC 的中位偏差（下标 = pin - A0，顺序 A0,A1,A2,A3），开机自标定得到。
+ * 只在这里保存，扣减发生在 readAxisAmp() 内部，所以下面所有
+ * "raw > JOY_CENTER" 的方向判断、以及死区计算都无需改动。 */
+static int s_centerOff[4] = { 0, 0, 0, 0 };
+
 #if WEARM_DEBUG_SERIAL
 static unsigned long lastBlockLogTime = 0;  /* 上次打印被挡提示的时刻（限流） */
 #endif
@@ -158,12 +175,25 @@ static bool buttonDown(uint8_t pin) {
 
 /* ---------- 单轴采样 ---------- */
 
+/* 开机自标定一路轴：平均若干次读数，把相对 512 的静态偏差记进 s_centerOff。
+ * 偏差超过 JOY_CAL_MAX_OFF 就判为"标定时手正压着摇杆"（真中位不可能偏这么多），
+ * 记 0 —— 退回到标准中位，宁可回到老行为也不要把一路轴标歪。 */
+static void joyCalibrateAxis(uint8_t pin) {
+  long sum = 0;
+  for (uint8_t i = 0; i < JOY_CAL_SAMPLES; i++) { sum += analogRead(pin); }
+  int off = (int)(sum / (long)JOY_CAL_SAMPLES) - JOY_CENTER;
+  if (off > JOY_CAL_MAX_OFF || off < -JOY_CAL_MAX_OFF) { off = 0; }
+  s_centerOff[pin - A0] = off;
+}
+
 /* 读取一根摇杆的一路轴：原始 ADC 值写入 *raw，带死区的偏转量返回。
  * 偏转量只表示"离中位多远"（恒为非负），方向要看原始值是大于还是小于中位。
  * 之所以扣掉死区，是为了让"离中位越远转得越快"的调速曲线从 0 平滑起步，
- * 而不是刚出中位就直接按死区边界算满速。 */
+ * 而不是刚出中位就直接按死区边界算满速。
+ * 读数先扣掉开机自标定的静态偏差：*raw 交出去的也是扣过的值，
+ * 于是下游 "raw > JOY_CENTER" 的方向判断照旧成立（校正后的中位就是 512）。 */
 static int readAxisAmp(uint8_t pin, int *raw) {
-  int v = analogRead(pin);
+  int v = analogRead(pin) - s_centerOff[pin - A0];
   if (raw != NULL) *raw = v;
   int d = v - JOY_CENTER;
   int a = (d >= 0) ? d : -d;
@@ -310,6 +340,14 @@ void joystickSetup(void) {
   JLOG("[joy] A0 -> b angle1 base   A1 -> r angle2 shoulder");
   JLOG("[joy] A3 -> c angle3 elbow  A2 -> f angle4 tool");
 #endif
+
+  /* 摇杆中位自标定：四路各平均 JOY_CAL_SAMPLES 次，把静态偏差存起来。
+   * 必须在这里、且在机械臂开始动作之前做完 —— 此刻没人碰摇杆，读到的就是真中位。
+   * 若某路偏差大得离谱（开机就被压住），joyCalibrateAxis() 会自己退回 0。 */
+  joyCalibrateAxis(JOY_LX_PIN);
+  joyCalibrateAxis(JOY_LY_PIN);
+  joyCalibrateAxis(JOY_RX_PIN);
+  joyCalibrateAxis(JOY_RY_PIN);
 
   /* 四个关节的"上次步进时刻"清零到当前时刻。
    * 注意：不要把 millis() 提到循环外只取一次 —— 实测那样做 GCC 会把这 4 次

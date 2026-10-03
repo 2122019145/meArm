@@ -15,7 +15,7 @@
 //   N / R / P / M / 0             四个实体按键的串口孪生（需要「按键」模块已编译且启用，默认已启用）：
 //                                 N=循环取放  R=录制（第一次按下开始，再按一次结束并保存）
 //                                 P=播放录制轨迹  M 或 0=回中。R 不会"无反应"：
-//                                 能开始时回 OK，正忙回 BUSY，录得太短被丢弃回 DISCARD。
+//                                 能开始时回 OK，正忙回 BUSY，没走出位移被丢弃回 DISCARD。
 //   F / D / G / E / Q / U / W     绘图（需要「绘图」模块已编译且启用，默认已启用）：
 //                                 选图形 / 开始 / 记一个示教点 / 撤销示教点 / 暂停 / 继续 / 取消
 //   p / n / o                     绘图标定：纸面高度 / 图形半宽 / 图形中心（如 p12.5、n6、o20,0）
@@ -65,7 +65,7 @@
  *   BUSY         命令看懂了但机械臂正忙（取放序列/录放/绘图进行中）
  *   REJECTED     这台固件没编进该模块；或坐标不可达/在地面以下；或绘图轨迹校验不过
  *   OFF          固件里有该模块，但被 !P/!B/!D 关掉了
- *   DISCARD      R 结束录制时数据不合格（太短/没位移/缓冲满），已丢弃
+ *   DISCARD      R 结束录制时数据不合格（没位移/没有动作/缓冲满），已丢弃
  *   EMPTY        P 播放时还没有录制数据
  *   ERR          语法错（比如把 x,y,z 写坏，或给单字符命令加了尾巴）
  *
@@ -94,7 +94,7 @@
 /* 按键命令的返回值（N/R/P/M，实现见 button_control.cpp） */
 #define PROTO_RES_REC_STARTED    12 /* R：开始录制 */
 #define PROTO_RES_REC_SAVED      13 /* R：结束录制且数据合格，已保存 */
-#define PROTO_RES_REC_REJECTED   14 /* R：结束录制但数据不合格（太短/没位移/缓冲满），已丢弃 */
+#define PROTO_RES_REC_REJECTED   14 /* R：结束录制但数据不合格（没位移/缓冲满），已丢弃 */
 #define PROTO_RES_PLAY_STARTED   15 /* P：开始播放 */
 #define PROTO_RES_PLAY_NO_RECORD 16 /* P：还没有录制数据可播 */
 #define PROTO_RES_HOME_STARTED   17 /* M/0：开始回中 */

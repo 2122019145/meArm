@@ -278,6 +278,62 @@ int main(void) {
     check("4000 轮随机推杆：零越界/零 NaN/坐标与角度始终自洽", bad == 0, buf);
   }
 
+  printf("=== 9) 摇杆中位自标定（修「无故乱动」）===\n");
+  {
+    /* 9a) 机械中位偏 +40 计数（远死区 15）：标定后静止不动 */
+    adjustSpeed(SPEED_NORMAL);
+    resetInputs();
+    g_mockAnalog[MOCK_AX] = 552;   /* 四路都偏 +40，模拟摇杆机械中位不在 512 */
+    g_mockAnalog[MOCK_AY] = 552;
+    g_mockAnalog[MOCK_TX] = 552;
+    g_mockAnalog[MOCK_TY] = 552;
+    joystickSetup();               /* 自标定在这里采样 */
+    posInit();
+    struct Joints jc = snap();
+    runLoop(30, 30);               /* 静止握杆 900ms：旧版会持续步进 */
+    snprintf(buf, sizeof(buf), "偏 +40 静止 30 轮: b %.2f->%.2f r %.2f->%.2f c %.2f->%.2f f %.2f->%.2f",
+             jc.b, Pos.ser.angle1, jc.r, Pos.ser.angle2, jc.c, Pos.ser.angle3, jc.f, Pos.ser.angle4);
+    check("中位偏 +40：标定后静止不动（旧版会一直乱走）",
+          fabs(Pos.ser.angle1 - jc.b) < 1e-9 && fabs(Pos.ser.angle2 - jc.r) < 1e-9 &&
+          fabs(Pos.ser.angle3 - jc.c) < 1e-9 && fabs(Pos.ser.angle4 - jc.f) < 1e-9, buf);
+
+    /* 9b) 同一个偏置下真正推杆：仍然按"越过 512"判方向 */
+    resetInputs();
+    g_mockAnalog[MOCK_AX] = 552;   /* 保持偏置，让扣偏差后为 0 */
+    g_mockAnalog[MOCK_AY] = 552;
+    g_mockAnalog[MOCK_TX] = 552;
+    g_mockAnalog[MOCK_TY] = 552;
+    joystickSetup();
+    posInit();
+    jc = snap();
+    g_mockAnalog[MOCK_AX] = 552 + 300;   /* 在偏置之上右推 300 */
+    runLoop(6, 30);
+    snprintf(buf, sizeof(buf), "偏置 +40 之上右推 300: b %.2f->%.2f", jc.b, Pos.ser.angle1);
+    check("标定只扣偏差、不改方向判定（右推仍使 b 增大）",
+          Pos.ser.angle1 > jc.b && onlyChanged(jc, snap(), 0), buf);
+
+    /* 9c) 偏置超过 JOY_CAL_MAX_OFF（64）视为"开机手压着摇杆"：偏差按 0 处理 */
+    resetInputs();
+    g_mockAnalog[MOCK_AX] = 512 + 100;   /* 偏 +100 > 64 */
+    joystickSetup();
+    posInit();
+    jc = snap();
+    runLoop(30, 30);               /* 不推杆，但偏置没被采纳 => 仍被当成推杆 */
+    snprintf(buf, sizeof(buf), "偏 +100 静止: b %.2f->%.2f（期望被当成推杆而离开起点）",
+             jc.b, Pos.ser.angle1);
+    check("偏置 >64 不采纳（防开机手压摇杆时把中位学歪）",
+          fabs(Pos.ser.angle1 - jc.b) > 1e-9, buf);
+
+    /* 9d) 回到标准 512 中位：标定结果必须是 0，行为与历史版本一致 */
+    resetInputs();
+    joystickSetup();
+    posInit();
+    jc = snap();
+    runLoop(30, 30);
+    snprintf(buf, sizeof(buf), "标准 512 中位静止: b %.2f->%.2f", jc.b, Pos.ser.angle1);
+    check("标准 512 中位：标定后静止不动", fabs(Pos.ser.angle1 - jc.b) < 1e-9, buf);
+  }
+
   printf("\n>>> %s (失败 %d 项)\n", failures == 0 ? "ALL PASS" : "HAS FAILURES", failures);
   return failures == 0 ? 0 : 1;
 }

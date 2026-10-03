@@ -34,6 +34,12 @@ $inc = @("-I$root", "-I$mock")
 #   而 PC 自检要覆盖 v1.0.0 及以前验证过的全部行为，所以在这里用 -D 覆盖回来：
 #   调试日志开 -> 历史行为逐字不变；同时也能规避"调试关掉后某函数/变量没人用"的告警。
 $cfg = @('-DWEARM_DEBUG_SERIAL=1', '-DWEARM_ENABLE_PICK_PLACE=1', '-DWEARM_ENABLE_BUTTONS=1', '-DWEARM_ENABLE_DRAW=1')
+
+# 【物理按键】固件默认 WEARM_BUTTON_PINS=0（不读 D2~D5，本机没有独立按键，见
+#   weArm_config.h 第 4 节）。但 probe_button / probe_draw 就是靠模拟 D2~D5 的
+#   电平来测按键逻辑的，所以**探针**这一侧把引脚路径打开；上面第 1 步编译固件
+#   TU 时保持默认 0，这样"两条路径"都会在本脚本里被严格编译一遍。
+$probeCfg = $cfg + @('-DWEARM_BUTTON_PINS=1')
 $fail = 0
 
 Write-Host '================ 1) 固件严格编译（0 警告才算过）================'
@@ -57,12 +63,16 @@ Write-Host '================ 2) 自检程序（必须 ALL PASS）===============
 # 结果 $fw 里已经含 move.cpp、又在 extra 里再列一次，触发
 # "multiple definition of moveJointStep(int, double)" 链接错误。
 # 全部链接既简单又不会漏（未用到的目标文件由链接器按需取舍）。
-$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place', 'probe_button', 'probe_draw', 'probe_servo_drive')
+$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place', 'probe_button', 'probe_draw', 'probe_servo_drive', 'probe_pins_off')
 foreach ($n in $probes) {
     $src  = Join-Path $sc ($n + '.cpp')
     $exe  = Join-Path $out ($n + '.exe')
     $srcs = @($src) + $fw + @((Join-Path $mock 'Arduino.cpp'))
-    $clog = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow @cfg @inc @srcs -o $exe 2>&1
+    # probe_pins_off 测的正是"出厂默认不读 D2~D5"，所以它必须用 WEARM_BUTTON_PINS=0
+    # 编译（其余探针靠模拟引脚电平测按键，用 1）。
+    $pcfg = $probeCfg
+    if ($n -eq 'probe_pins_off') { $pcfg = $cfg + @('-DWEARM_BUTTON_PINS=0') }
+    $clog = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow @pcfg @inc @srcs -o $exe 2>&1
     $cn = ($clog | Measure-Object).Count
     if ($LASTEXITCODE -ne 0 -or $cn -gt 0) {
         Write-Host ("  [FAIL] {0} 编译  EXIT={1}  输出 {2} 行" -f $n, $LASTEXITCODE, $cn) -ForegroundColor Red

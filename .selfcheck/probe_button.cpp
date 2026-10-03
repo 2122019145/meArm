@@ -4,7 +4,8 @@
  * 【为什么存在】按键模块里最容易出错、又最难在真机上复现的几件事：
  *   - 消抖与"只认按下沿"（真机上双击、长按都会踩）
  *   - 按键1 的循环顺序与"忙时不推进"
- *   - 录制的三条保存门槛（时长 >10 秒、位移 >=10、缓冲不溢出）
+ *   - 录制的保存门槛（末端位移 >=10、缓冲不溢出；**最小时长限制已删除**，
+ *     所以短录像只要动了就保存，见 [3]）
  *   - 录制期间摇杆必须可用、播放/回中期间摇杆必须让位
  *   - 串口忙守卫必须放行 N/R/P/M（否则录制中发 R 结束不了录制）
  * 这些都在 PC 上用 mock 时钟跑完整流程来验证。
@@ -153,7 +154,7 @@ int main(void) {
   }
 
   /* ---------------- 3) 录制：不达标要被拒 ---------------- */
-  printf("\n[3] 录制门槛\n");
+  printf("\n[3] 录制门槛（只有位移，没有最小时长）\n");
   {
     int rc = buttonHandleCommand(PROTO_CMD_BTN_PLAY);
     check("还没有录制时按播放：回 PLAY_NO_RECORD",
@@ -177,22 +178,41 @@ int main(void) {
 
     advance(3000);
     rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
-    check("只录 3 秒就结束：回 REC_REJECTED",
+    check("只录 3 秒但完全没动：回 REC_REJECTED（现在是位移不够，不是时长）",
           rc == PROTO_RES_REC_REJECTED && !buttonIsRecording(), "rc=14");
-    check("太短的录制没有被保存", !buttonHasRecording(), "hasRecording=false");
+    check("不达标的录制没有被保存", !buttonHasRecording(), "hasRecording=false");
 
-    /* 时长够、但机械臂完全没动 */
+    /* 时长限制已删除的回归：短录像（<10 秒）只要末端真的走了 >=10 就保存。
+     * 旧的"时长必须 >10 秒"规则会把这一条整段判废。 */
+    rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
+    check("重新开始录制（准备一段短录像）", rc == PROTO_RES_REC_STARTED, "rc=12");
+    g_mockAnalog[0] = 512 + 500;      /* 基座推到底 */
+    advance(5000);
+    g_mockAnalog[0] = 512 - 500;      /* 再反推回来：包围盒跨度更大，稳稳超过 10 */
+    advance(3000);
+    centerSticks();
+    advance(200);
+    unsigned long shortMs = buttonRecordingMs();
+    rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
+    snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d 位移=%.2f",
+             rc, shortMs, buttonRecordingEntries(), buttonRecordingTravel());
+    check("短录像（不到 10 秒）只要位移够就保存：回 REC_SAVED",
+          rc == PROTO_RES_REC_SAVED && buttonHasRecording(), d);
+    check("这段录像的时长确实小于 10 秒（旧规则一定判废）",
+          shortMs < 10000UL, d);
+
+    /* 位移门槛还在：录得再久，机械臂完全没动也要判废 */
     rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
     check("重新开始录制", rc == PROTO_RES_REC_STARTED, "rc=12");
     advance(11500);
     rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
     snprintf(d, sizeof(d), "rc=%d 时长=%lu 位移=%.2f", rc, buttonRecordingMs(), buttonRecordingTravel());
-    check("时长够但没位移：回 REC_REJECTED",
+    check("只有时长、没有位移：回 REC_REJECTED",
           rc == PROTO_RES_REC_REJECTED && !buttonHasRecording(), d);
   }
 
   /* ---------------- 4) 录制：用摇杆真的走一段 ---------------- */
-  printf("\n[4] 录制一段真实摇杆动作（>10 秒、有明显位移）\n");
+  printf("\n[4] 录制一段真实摇杆动作（长录像 11 秒 + 有明显位移）\n");
   {
     SER before = Pos.ser;
     int rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
@@ -220,7 +240,7 @@ int main(void) {
     snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d 位移=%.2f",
              rc, recMs, buttonRecordingEntries(), buttonRecordingTravel());
     check("结束录制并保存成功", rc == PROTO_RES_REC_SAVED && buttonHasRecording(), d);
-    check("录制时长大于 10 秒", recMs > 10000UL, d);
+    check("长录像（11.6 秒，缓冲上限 12.8 秒内）照样保存", recMs > 10000UL, d);
     check("末端位移达到明显位移门槛(>=10)", buttonRecordingTravel() >= 10.0, d);
     check("条目数大于 0", buttonRecordingEntries() > 0, d);
     check("录制结束后状态回到空闲", strcmp(buttonStateName(), "空闲") == 0, buttonStateName());
@@ -361,7 +381,7 @@ int main(void) {
   }
 
   /* ---------------- 9) 最坏情况录制：四路摇杆同时连续动 ---------------- */
-  printf("\n[9] 最坏情况录制：四路摇杆连续推动 >10 秒（每周期 4 条增量）\n");
+  printf("\n[9] 最坏情况录制：四路摇杆连续推动 11 秒（每周期都在动）\n");
   {
     /* 历史教训：早先"每个采样周期都写一条 WAIT(1)"的格式下，四关节同时动
      * 每周期要花 5 条，512 条只够 103 个周期（100ms tick 下 10.3 秒，
@@ -385,12 +405,12 @@ int main(void) {
     rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
     /* 注意：位移与条目数是在"结束录制"里才结算的，录制过程中读只能读到 0 */
     double travel = buttonRecordingTravel();
-    snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d/512 位移=%.2f",
+    snprintf(d, sizeof(d), "rc=%d 时长=%lu ms 条目=%d/128 位移=%.2f",
              rc, recMs, entries, travel);
-    check("四路连续动 11 秒仍能保存成功（没被 512 条写满）",
+    check("四路连续动 11 秒仍能保存成功（没被 128 条写满）",
           rc == PROTO_RES_REC_SAVED && buttonHasRecording(), d);
-    check("最坏情况录制时长确实大于 10 秒", recMs > 10000UL, d);
-    check("条目数没有溢出缓冲", entries > 0 && entries <= 512, d);
+    check("最坏情况录制时长确实大于 10 秒（仍在 12.8 秒窗口内）", recMs > 10000UL, d);
+    check("条目数没有溢出缓冲", entries > 0 && entries <= 128, d);
     check("四路动作产生了明显位移（>=10）", travel >= 10.0, d);
 
     /* 立刻回放这种"每个周期都有动作"的录制，确认新周期标志被正确还原 */
@@ -406,6 +426,60 @@ int main(void) {
              d1, d2, d3, d4);
     check("回放终态与录制末态一致（每轴 <= 1.5 度：0.5 度量化漂移）",
           d1 <= 1.5 && d2 <= 1.5 && d3 <= 1.5 && d4 <= 1.5, d);
+    check("回放结束回到空闲", !buttonPlaybackActive() && strcmp(buttonStateName(), "空闲") == 0,
+          buttonStateName());
+  }
+
+  /* ---------------- 11) 录制中直接按 P ---------------- */
+  /* 现场问题："录完动作后再输入 P，就会触发 busy，录的动作执行不了"。
+   * 以前 btnActionPlay 第一句就查 s_recording -> BUSY；而"手动完了"并不等于
+   * "录制停了"，于是用户觉得录完了却永远收到 BUSY。
+   * 现在改成：录制中按 P 先调用 btnStopRecording() 收尾 —— 合格就接着播放，
+   * 不合格（没位移/缓冲溢出）就回 REC_REJECTED 让用户重录，不再是 BUSY。 */
+  printf("\n[11] 录制中直接按 P：先收尾再播放\n");
+  {
+    /* 11a) 不合格的短录制：按 P 应当收尾 + 回 DISCARD，且不开始播放。
+     * 注意：原来这条是靠"2 秒 < 10 秒门槛"判废的；时长门槛删除后，改成录一段
+     * **没有位移**的动作来走同一条 DISCARD 路径（合格的短录像见 [3]）。 */
+    centerSticks();
+    int rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
+    check("开始录制（短）", rc == PROTO_RES_REC_STARTED && buttonIsRecording(), "rc=12");
+    advance(2000);                       /* 只录 2 秒且四路摇杆居中：位移 0，判废 */
+    centerSticks();
+    rc = buttonHandleCommand(PROTO_CMD_BTN_PLAY);
+    snprintf(d, sizeof(d), "rc=%d 仍在录制=%d 播放中=%d", rc, (int)buttonIsRecording(),
+             (int)buttonPlaybackActive());
+    check("录制中按 P（没有位移）：回 DISCARD 且没有开始播放",
+          rc == PROTO_RES_REC_REJECTED && !buttonIsRecording() && !buttonPlaybackActive(), d);
+
+    /* 11b) 合格录制（11.7 秒、有明显位移）：按 P 立刻收尾并接着播放 */
+    centerSticks();
+    rc = buttonHandleCommand(PROTO_CMD_BTN_RECORD);
+    check("开始录制（合格）", rc == PROTO_RES_REC_STARTED && buttonIsRecording(), "rc=12");
+    for (int a = 0; a < 4; a++) g_mockAnalog[a] = 512 + 500;
+    advance(5000);
+    for (int a = 0; a < 4; a++) g_mockAnalog[a] = 512 - 500;
+    advance(5000);
+    for (int a = 0; a < 4; a++) g_mockAnalog[a] = 512 + 500;
+    advance(1500);                       /* 合计 11.5 秒（上限 12.8 秒内） */
+    centerSticks();
+    advance(200);
+    SER recEnd = Pos.ser;                /* 按 P 这一刻的位姿 = 录制末态 */
+    rc = buttonHandleCommand(PROTO_CMD_BTN_PLAY);
+    snprintf(d, sizeof(d), "rc=%d 仍在录制=%d 播放中=%d", rc, (int)buttonIsRecording(),
+             (int)buttonPlaybackActive());
+    check("录制中按 P（合格）：先收尾保存再立刻播放，不再回 BUSY",
+          rc == PROTO_RES_PLAY_STARTED && !buttonIsRecording() && buttonPlaybackActive(), d);
+    check("收尾后确实有录制数据", buttonHasRecording(), "hasRecording=true");
+
+    (void) runUntilIdle(600000);
+    double e1 = fabs(Pos.ser.angle1 - recEnd.angle1);
+    double e2 = fabs(Pos.ser.angle2 - recEnd.angle2);
+    double e3 = fabs(Pos.ser.angle3 - recEnd.angle3);
+    double e4 = fabs(Pos.ser.angle4 - recEnd.angle4);
+    snprintf(d, sizeof(d), "末态差 b=%.2f r=%.2f c=%.2f f=%.2f 度", e1, e2, e3, e4);
+    check("回放终态 == 按 P 那一刻的位姿（每轴 <= 1.5 度）",
+          e1 <= 1.5 && e2 <= 1.5 && e3 <= 1.5 && e4 <= 1.5, d);
     check("回放结束回到空闲", !buttonPlaybackActive() && strcmp(buttonStateName(), "空闲") == 0,
           buttonStateName());
   }

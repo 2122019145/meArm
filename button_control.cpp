@@ -5,6 +5,9 @@
  *
  *   1) Hardware: buttons 1~4 are wired to D2~D5, INPUT_PULLUP, a press reads LOW.
  *      Software debounce is BTN_DEBOUNCE_MS and only the press edge acts.
+ *      【本机默认不走这条路】WEARM_BUTTON_PINS = 0（见 weArm_config.h 第 4 节）
+ *      时整段引脚扫描都被裁掉，四个功能全部改由串口 N/R/P/M/0 触发；
+ *      原因见 weArm_config.h：右摇杆推到最前会压到 SW，假触发按键1 抢走操作。
  *
  *   2) Recording format (fixed 384-byte buffer, no dynamic allocation):
  *      one packed record per BTN_TICK_MS (100 ms) sampling tick holds the angle
@@ -13,19 +16,22 @@
  *         bits  6..11  joint 1 (upper arm)
  *         bits 12..17  joint 2 (forearm)
  *         bits 18..23  joint 3 (end effector)
- *      BTN_REC_ENTRIES = 128 records x 3 bytes = 384 bytes = 128 ticks = 12.8 s,
- *      which is still more than BTN_REC_MIN_MS (10 s).  Every tick gets exactly
- *      one record, moving or not, so the playback time axis is the exact
- *      recording timeline; an all-zero record simply means "no motion".
+ *      BTN_REC_ENTRIES = 128 records x 3 bytes = 384 bytes = 128 ticks = 12.8 s.
+ *      Every tick gets exactly one record, moving or not, so the playback time
+ *      axis is the exact recording timeline; an all-zero record simply means
+ *      "no motion".
  *      A joint delta wider than the 6-bit field (+-32 units = +-16 deg per tick)
  *      is clamped, but s_snap[] follows the *emitted* position rather than the
  *      real one, so the remainder is carried into the next ticks: the recorded
  *      total displacement stays exact and only a very fast move arrives a tick
  *      or two later during playback.
  *
- *   3) Save validation (both must hold, otherwise the recording is dropped):
- *         duration > BTN_REC_MIN_MS (10 s, strictly greater)
+ *   3) Save validation (the end-effector must have moved, otherwise the
+ *      recording is dropped):
  *         end-effector travel on x/y/z >= BTN_REC_MIN_TRAVEL (10.0)
+ *      【没有最小时长门槛】原来还要求"录制时长必须大于 10 秒"，已按要求删除：
+ *      短动作（哪怕 1 秒）只要末端走够了 10 个单位就照样保存，最长仍受
+ *      128 条 = 12.8 秒的缓冲上限约束（写满即溢出判废）。
  *      A new recording reuses the same buffer from its first tick on, so a
  *      rejected recording also invalidates the previous one.  This keeps the
  *      longest possible recording inside the 2 KB SRAM of the Uno; the serial
@@ -53,25 +59,34 @@
 /* ---------------- tunables ---------------- */
 
 /* Button pins: D2/D3/D4/D5 are the only four spare easy-to-wire digital pins
- * on this board (D0/D1 serial, D6~D9 servos, D13 led, A0~A3 joystick). */
+ * on this board (D0/D1 serial, D6~D9 servos, D13 led, A0~A3 joystick).
+ *
+ * 【默认不接物理按键】本机没接独立按键，只有摇杆自带的 SW 脚；而右摇杆推到
+ * 最前时机械上会压到那颗轻触开关，接到 D2 就会假触发"按键1 循环取放"、
+ * 把正在手动推杆的操作抢走。所以下面这一整段"读引脚"的代码默认被
+ * WEARM_BUTTON_PINS=0 裁掉（见 weArm_config.h 第 4 节），按键功能全部改走
+ * 串口 N / R / P / M（或 0）。把 WEARM_BUTTON_PINS 改回 1 即可恢复物理按键。 */
+#if WEARM_BUTTON_PINS
 #define BTN_PIN_CYCLE   2
 #define BTN_PIN_RECORD  3
 #define BTN_PIN_PLAY    4
 #define BTN_PIN_HOME    5
+#endif
 
-#define BTN_DEBOUNCE_MS     25UL      /* button debounce time */
+#define BTN_DEBOUNCE_MS     25UL      /* button debounce time（仅物理按键用） */
 #define BTN_TICK_MS         100UL     /* recording sampling period */
 #define BTN_RAMP_MS         1500UL    /* smooth ramp before playback / homing */
-#define BTN_REC_MIN_MS      10000UL   /* minimum recording time (must be > 10 s) */
 #define BTN_REC_MIN_TRAVEL  10.0      /* minimum end-effector travel */
 #define BTN_REC_ENTRIES     128       /* record limit (128 * 3 = 384 bytes SRAM) */
 #define BTN_REC_BYTES       3         /* packed size of one 100 ms record */
 #define BTN_REC_LIMIT       32        /* 6-bit signed field range: -32..+31 units */
 #define BTN_ANGLE_UNIT      2.0       /* 1 deg = 2 recording units (unit = 0.5 deg) */
 
+#if WEARM_BUTTON_PINS
 static const uint8_t BTN_PIN[BTN_COUNT] = {
   BTN_PIN_CYCLE, BTN_PIN_RECORD, BTN_PIN_PLAY, BTN_PIN_HOME
 };
+#endif
 
 /* ---------------- recording buffer ---------------- */
 
@@ -110,10 +125,13 @@ static unsigned long s_rampStartMs = 0;
 static uint8_t       s_playIdx   = 0;
 static unsigned long s_playDueMs = 0;
 
-/* button debounce */
+/* button debounce（只有物理按键在用；WEARM_BUTTON_PINS=0 时整个裁掉，
+ * 省下 4+4+16 字节 SRAM 和 4 路 digitalRead） */
+#if WEARM_BUTTON_PINS
 static bool          s_btnStable[BTN_COUNT] = {false, false, false, false};
 static bool          s_btnArmed[BTN_COUNT]  = {false, false, false, false};
 static unsigned long s_btnChangeAt[BTN_COUNT] = {0UL, 0UL, 0UL, 0UL};
+#endif
 
 /* ---------------- small helpers ---------------- */
 
@@ -237,7 +255,7 @@ static void btnStartRecording(void) {
   s_bbMin[2] = s_bbMax[2] = Pos.rec.z;
 
 #if WEARM_DEBUG_SERIAL
-  Serial.println(F("[btn] 开始录制：请用摇杆操控机械臂（时长需 >10 秒，且要有明显位移）"));
+  Serial.println(F("[btn] 开始录制：请用摇杆操控机械臂（要有明显位移，最长 12.8 秒）"));
   Serial.println(F("[btn] 提示：本次录制会覆盖上一次的录制数据"));
 #endif
 }
@@ -307,11 +325,6 @@ static int btnStopRecording(void) {
     ok = false;
 #if WEARM_DEBUG_SERIAL
     Serial.println(F("[btn] 不合格：缓冲里没有任何动作"));
-#endif
-  } else if (s_recDurationMs <= BTN_REC_MIN_MS) {
-    ok = false;
-#if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 不合格：录制时长必须大于 10 秒"));
 #endif
   } else if (s_recTravel < BTN_REC_MIN_TRAVEL) {
     ok = false;
@@ -470,11 +483,16 @@ static int btnActionRecord(void) {
 }
 
 static int btnActionPlay(void) {
+  /* 录制还开着就直接播放。旧行为是回 BUSY，实机上表现为"录完动作再输入 P 就
+   * 一直 busy、录的动作执行不了"：录制只能由"结束录制"（按键2 / 串口 R）停掉，
+   * 而用户按播放键 / 输入 P 时，他心里已经是"我录完了"。所以这里改成先把录制
+   * 收尾（等价于按一次结束录制），合格就接着播放；不合格（没动 / 太长溢出）
+   * 就如实返回 DISCARD，让他重录 —— 而不是含糊地回 BUSY。 */
   if (s_recording) {
-#if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 正在录制，按键3 忽略（先按按键2 结束录制）"));
-#endif
-    return PROTO_RES_BUSY;
+    int stopped = btnStopRecording();
+    if (stopped != PROTO_RES_REC_SAVED) {
+      return stopped;   /* PROTO_RES_REC_REJECTED -> 串口回 DISCARD */
+    }
   }
   if (pickPlaceIsBusy() || s_state != BS_IDLE) {
 #if WEARM_DEBUG_SERIAL
@@ -552,6 +570,7 @@ static int btnAction(int key) {
 
 /* ---------------- key scanning ---------------- */
 
+#if WEARM_BUTTON_PINS
 /* Returns true when this scan confirmed one press edge (release never does). */
 static bool btnEdge(int key) {
   bool raw = (digitalRead(BTN_PIN[key]) == LOW);
@@ -572,16 +591,19 @@ static bool btnEdge(int key) {
   s_btnArmed[key]  = false;
   return raw;
 }
+#endif /* WEARM_BUTTON_PINS */
 
 /* ---------------- public interface ---------------- */
 
 void buttonSetup(void) {
+#if WEARM_BUTTON_PINS
   for (int k = 0; k < BTN_COUNT; k++) {
     pinMode(BTN_PIN[k], INPUT_PULLUP);
     s_btnStable[k]   = (digitalRead(BTN_PIN[k]) == LOW);
     s_btnArmed[k]    = false;
     s_btnChangeAt[k] = 0UL;
   }
+#endif
 
   s_state        = BS_IDLE;
   s_recording    = false;
@@ -594,10 +616,16 @@ void buttonSetup(void) {
 
 #if WEARM_DEBUG_SERIAL
   Serial.println(F("[btn] 按键初始化："));
+#if WEARM_BUTTON_PINS
   Serial.println(F("[btn]   按键1 D2  循环执行（每次按顺序夹 A -> B -> C，串口 N）"));
-  Serial.println(F("[btn]   按键2 D3  录制 开/关（时长需 >10 秒且有明显位移，串口 R）"));
+  Serial.println(F("[btn]   按键2 D3  录制 开/关（有明显位移即可，串口 R）"));
   Serial.println(F("[btn]   按键3 D4  播放上一次录制的内容（串口 P）"));
   Serial.println(F("[btn]   按键4 D5  回中：回到开机初始位姿（串口 M 或 0）"));
+#else
+  Serial.println(F("[btn]   不读 D2~D5 物理按键（WEARM_BUTTON_PINS=0）："));
+  Serial.println(F("[btn]     N 循环执行（夹 A -> B -> C）  R 录制开/关"));
+  Serial.println(F("[btn]     P 播放上一次录制            M 或 0 回中"));
+#endif
 #endif
 }
 
@@ -608,10 +636,12 @@ void buttonLoop(void) {
   if (s_state == BS_RAMP)     btnRampTick(now);
   else if (s_state == BS_PLAY) btnPlayTick(now);
 
+#if WEARM_BUTTON_PINS
   for (int k = 0; k < BTN_COUNT; k++) {
     if (!btnEdge(k)) continue;
     (void) btnAction(k);   /* the action itself reports and answers the serial port */
   }
+#endif
 }
 
 int buttonHandleCommand(char c) {

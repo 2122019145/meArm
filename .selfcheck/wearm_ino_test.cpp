@@ -18,6 +18,7 @@
 //   它验证的是"真正会被输出到引脚上的脉宽"。
 //
 #include "Arduino.h"
+#include "../weArm_config.h"
 #include "servo_drive.h"
 #include "../wearm.ino"
 
@@ -29,6 +30,20 @@ static int g_fail = 0;
 static void check(const char *name, bool ok, const char *detail) {
   printf("  %-46s %s  %s\n", name, ok ? "PASS" : "FAIL", detail ? detail : "");
   if (!ok) g_fail++;
+}
+
+/* 逻辑角 -> 真正会被输出到引脚上的脉宽（tick）：把 writeServo() 的方向镜像算进去。
+ * 基座（通道 0 / b）与末端夹爪（通道 3 / f）在这台机器上是反向装配的，
+ * writeServo() 把这两个通道的物理角算成 (min + max) - logical；
+ * 限位、反解、录制、绘图用的全都是逻辑角（见 weArm_config.h 第 3 节）。 */
+static unsigned physTicks(int ch, double logical) {
+#if WEARM_MIRROR_BASE
+  if (ch == 0) logical = (servoLimit.minB + servoLimit.maxB) - logical;
+#endif
+#if WEARM_MIRROR_TOOL
+  if (ch == 3) logical = (servoLimit.minF + servoLimit.maxF) - logical;
+#endif
+  return servoDriveTicksForDeg(logical);
 }
 
 /* 从 mock 的 digitalWrite 日志里取出"拉高事件"的引脚顺序 */
@@ -91,8 +106,8 @@ int main(void) {
   for (int i = 0; i < 4; i++) {
     double want = (i == 0) ? Pos.ser.angle1 : (i == 1) ? Pos.ser.angle2
                 : (i == 2) ? Pos.ser.angle3 : Pos.ser.angle4;
-    unsigned wantTicks = servoDriveTicksForDeg(want);
-    snprintf(buf, sizeof buf, "上电脉宽 通道%d=%u tick (Pos=%.6f -> %u)", i, width[i], want, wantTicks);
+    unsigned wantTicks = physTicks(i, want);
+    snprintf(buf, sizeof buf, "上电脉宽 通道%d=%u tick (逻辑=%.6f -> %u)", i, width[i], want, wantTicks);
     check(buf, width[i] == wantTicks, NULL);
   }
   snprintf(buf, sizeof buf, "帧长 %u tick = %.2f ms (期望 40000 tick = 20ms)", frameTicks, frameTicks * 0.5);
@@ -113,8 +128,8 @@ int main(void) {
   snprintf(buf, sizeof buf, "末端上电取行程中位 f=%.1f (期望 %.1f)", Pos.ser.angle4, wantF);
   check(buf, fabs(Pos.ser.angle4 - wantF) < 1e-9, NULL);
   check("上电脉宽非 0° 脉宽（不会甩向原点）",
-        width[0] != servoDriveTicksForDeg(0.0) && width[1] != servoDriveTicksForDeg(0.0) &&
-        width[2] != servoDriveTicksForDeg(0.0), NULL);
+        width[0] != physTicks(0, 0.0) && width[1] != physTicks(1, 0.0) &&
+        width[2] != physTicks(2, 0.0), NULL);
   check("上电脉冲顺序 = 引脚 9,7,8,6",
         pins[0] == 9 && pins[1] == 7 && pins[2] == 8 && pins[3] == 6, NULL);
 
@@ -136,11 +151,39 @@ int main(void) {
   g_mockMillis += 5000;                     /* 跨过最大步进间隔 */
   loop();
   captureFrame(pins, width, &frameTicks);
-  unsigned wantNew = servoDriveTicksForDeg(Pos.ser.angle1);
-  snprintf(buf, sizeof buf, "推 A0 后 通道0 脉宽 %u tick (Pos.angle1=%.3f -> %u)", width[0],
+  unsigned wantNew = physTicks(0, Pos.ser.angle1);
+  snprintf(buf, sizeof buf, "推 A0 后 通道0 脉宽 %u tick (angle1=%.3f -> %u)", width[0],
            Pos.ser.angle1, wantNew);
   check(buf, width[0] == wantNew && Pos.ser.angle1 > 90.0, NULL);
   g_mockAnalog[MOCK_AX] = 512;
+
+  /* 5) 方向镜像：把基座与夹爪的逻辑角放到偏离中位的地方，检查真正输出到引脚的
+   *    脉宽是"镜像后"的那个角，而不是逻辑角本身。这条用例正面锁住用户报的两个
+   *    现象：左右旋转的舵机转向反了、抓取时 O/S 反了。
+   *    夹爪的镜像尤其要看：f 的行程 [60,150] 镜像后仍落在原区间内，所以就算
+   *    开关关掉也不会把爪子推出危险区，但方向会反。 */
+#if WEARM_MIRROR_BASE || WEARM_MIRROR_TOOL
+  Pos.ser.angle1 = 30.0;
+  Pos.ser.angle4 = 60.0;
+  writeServo();
+  captureFrame(pins, width, &frameTicks);
+  unsigned mir0 = physTicks(0, 30.0);
+  unsigned mir3 = physTicks(3, 60.0);
+  snprintf(buf, sizeof buf, "镜像 通道0: 逻辑30° -> 输出 %u tick (未镜像会写 %u)", width[0],
+           servoDriveTicksForDeg(30.0));
+  check(buf, width[0] == mir0, NULL);
+  snprintf(buf, sizeof buf, "镜像 通道3: 逻辑60° -> 输出 %u tick (未镜像会写 %u)", width[3],
+           servoDriveTicksForDeg(60.0));
+  check(buf, width[3] == mir3, NULL);
+  check("镜像确实改变了输出（b 30° 与 f 60° 都不是原值）",
+        mir0 != servoDriveTicksForDeg(30.0) && mir3 != servoDriveTicksForDeg(60.0), NULL);
+  /* 镜像落点仍在各自行程内：夹爪不可能被镜像推到行程外 */
+  check("镜像后物理角仍在 f 行程 [60,150] 内",
+        (servoLimit.minF + servoLimit.maxF - 60.0) >= servoLimit.minF &&
+        (servoLimit.minF + servoLimit.maxF - 60.0) <= servoLimit.maxF, NULL);
+  posInit();
+  writeServo();
+#endif
 
   printf(">>> %s (失败 %d 项)\n", g_fail == 0 ? "ALL PASS" : "HAS FAILURES", g_fail);
   return g_fail == 0 ? 0 : 1;
