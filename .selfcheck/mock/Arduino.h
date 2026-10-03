@@ -43,27 +43,31 @@ inline bool mockSerialOn(void) {
 
 struct MockSerial {
   void begin(unsigned long) {}
+  void clearOutput() { output.clear(); }
+  const std::string &getOutput() const { return output; }
+  std::string output;
   int  available();
   int  read();
-  void print(const char *s)                { if (mockSerialOn()) fputs(s, stdout); }
-  void print(const __FlashStringHelper *s) { if (mockSerialOn()) fputs(reinterpret_cast<const char *>(s), stdout); }
-  void print(int v)                        { if (mockSerialOn()) printf("%d", v); }
-  void print(unsigned int v)               { if (mockSerialOn()) printf("%u", v); }
-  void print(long v)                       { if (mockSerialOn()) printf("%ld", v); }
-  void print(unsigned long v)              { if (mockSerialOn()) printf("%lu", v); }
-  void print(double v)                     { if (mockSerialOn()) printf("%f", v); }
-  void print(double v, int digits)         { if (mockSerialOn()) printf("%.*f", digits, v); }
-  void println()                           { if (mockSerialOn()) fputc('\n', stdout); }
-  void println(const char *s)              { if (mockSerialOn()) { fputs(s, stdout); fputc('\n', stdout); } }
-  void println(const __FlashStringHelper *s) { if (mockSerialOn()) { fputs(reinterpret_cast<const char *>(s), stdout); fputc('\n', stdout); } }
-  void println(int v)                      { if (mockSerialOn()) printf("%d\n", v); }
-  void println(unsigned int v)             { if (mockSerialOn()) printf("%u\n", v); }
-  void println(long v)                     { if (mockSerialOn()) printf("%ld\n", v); }
-  void println(unsigned long v)            { if (mockSerialOn()) printf("%lu\n", v); }
-  void println(double v)                   { if (mockSerialOn()) printf("%f\n", v); }
+  void print(const char *s) { output += s; if (mockSerialOn()) fputs(s, stdout); }
+  void print(const __FlashStringHelper *s) { print(reinterpret_cast<const char *>(s)); }
+  void print(char c) { char b[2] = {c, '\0'}; print(b); }
+  void print(int v) { char b[24]; snprintf(b, sizeof(b), "%d", v); print(b); }
+  void print(unsigned int v) { char b[24]; snprintf(b, sizeof(b), "%u", v); print(b); }
+  void print(long v) { char b[24]; snprintf(b, sizeof(b), "%ld", v); print(b); }
+  void print(unsigned long v) { char b[24]; snprintf(b, sizeof(b), "%lu", v); print(b); }
+  void print(double v) { char b[48]; snprintf(b, sizeof(b), "%f", v); print(b); }
+  void print(double v, int digits) { char b[64]; snprintf(b, sizeof(b), "%.*f", digits, v); print(b); }
+  void println() { print('\n'); }
+  void println(const char *s) { print(s); println(); }
+  void println(const __FlashStringHelper *s) { println(reinterpret_cast<const char *>(s)); }
+  void println(int v) { print(v); println(); }
+  void println(unsigned int v) { print(v); println(); }
+  void println(long v) { print(v); println(); }
+  void println(unsigned long v) { print(v); println(); }
+  void println(double v) { print(v); println(); }
   /* 真 Arduino 的 Stream 同时有 print(double,int) 与 println(double,int)，
    * 这里补齐后者（draw_control.cpp 用它打印带小数位的坐标）。 */
-  void println(double v, int digits)       { if (mockSerialOn()) printf("%.*f\n", digits, v); }
+  void println(double v, int digits) { print(v, digits); println(); }
 };
 extern MockSerial Serial;
 

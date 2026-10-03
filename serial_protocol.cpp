@@ -52,6 +52,16 @@ static bool protoParseNumber(const char **pp, double *out);
 static void protoApplyAngles(const double angles[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
+#define PROTO_FEATURE_PICK   0x01u
+#define PROTO_FEATURE_BUTTON 0x02u
+#define PROTO_FEATURE_DRAW   0x04u
+
+static bool protoRuntimeEnabled(uint8_t feature);
+static uint8_t protoCompiledFeatures(void);
+static uint8_t s_runtimeFeatures =
+    (WEARM_ENABLE_PICK_PLACE ? PROTO_FEATURE_PICK : 0u) |
+    (WEARM_ENABLE_BUTTONS ? PROTO_FEATURE_BUTTON : 0u) |
+    (WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u);
 
 /* Skip blanks (space / tab) and return the first significant character.
  * Out of line on purpose: a dozen call sites share this one copy. Measured:
@@ -128,19 +138,21 @@ static const char s_rOk[] PROGMEM = "OK";
 static const char s_rErr[] PROGMEM = "ERR";
 static const char s_rRej[] PROGMEM = "REJECTED";
 static const char s_rOkN[] PROGMEM = "OK #";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z";
+static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
 
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
 #define R_REJ()  protoReply(s_rRej)
 #define R_OKN()  protoReply(s_rOkN)
 #define R_BOOT() protoReply(s_rBoot)
+#define R_FEATURE() do { protoPut('P'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0'); protoPut(' '); protoPut('B'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0'); protoPut(' '); protoPut('D'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0'); protoPut(10); } while (0)
 #else
 #define R_OK()   do { } while (0)
 #define R_ERR()  do { } while (0)
 #define R_REJ()  do { } while (0)
 #define R_OKN()  do { } while (0)
 #define R_BOOT() do { } while (0)
+#define R_FEATURE() do { } while (0)
 #endif
 
 /* ========== command class bitmaps ========== */
@@ -222,6 +234,18 @@ void serialProtocolLoop(void)
 
 /* ========== dispatch ========== */
 /* Dispatch the buffered line to the command handler */
+static bool protoRuntimeEnabled(uint8_t feature)
+{
+  return (s_runtimeFeatures & feature) != 0;
+}
+
+static uint8_t protoCompiledFeatures(void)
+{
+  return (WEARM_ENABLE_PICK_PLACE ? PROTO_FEATURE_PICK : 0u) |
+         (WEARM_ENABLE_BUTTONS ? PROTO_FEATURE_BUTTON : 0u) |
+         (WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u);
+}
+
 static void protoFlushLine(void)
 {
   s_line[s_len] = '\0';
@@ -257,6 +281,59 @@ int protoHandleLine(const char *line)
   PROTO_SKIP_BLANKS(tail);
   const bool single = (*tail == '\0');
 
+  if (cmd == '!' && !single) {
+    const char *q = tail;
+    uint8_t feature;
+    if (q[1] != '\0' || (q[0] != 'P' && q[0] != 'B' && q[0] != 'D')) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+    feature = q[0] == 'P' ? PROTO_FEATURE_PICK :
+              q[0] == 'B' ? PROTO_FEATURE_BUTTON : PROTO_FEATURE_DRAW;
+    if (!(protoCompiledFeatures() & feature)) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+    if (!protoRuntimeEnabled(feature)) s_runtimeFeatures |= feature;
+    else s_runtimeFeatures &= (uint8_t)~feature;
+    R_FEATURE();
+    return PROTO_RES_SPEED_LEVEL;
+  }
+  if (cmd == '!' && single) {
+    R_FEATURE();
+    return PROTO_RES_NONE;
+  }
+
+  if (!single && (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
+      cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME ||
+      cmd == PROTO_CMD_BTN_HOME_ALT)) {
+    R_ERR();
+    return PROTO_RES_BAD_SYNTAX;
+  }
+  if (single && (cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B || cmd == PROTO_CMD_PICK_C)) {
+    if (!WEARM_ENABLE_PICK_PLACE || !protoRuntimeEnabled(PROTO_FEATURE_PICK)) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+  }
+  if (single && (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
+      cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME ||
+      cmd == PROTO_CMD_BTN_HOME_ALT)) {
+    if (!WEARM_ENABLE_BUTTONS || !protoRuntimeEnabled(PROTO_FEATURE_BUTTON)) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+  }
+  if (single && (cmd == PROTO_CMD_DRAW_TASK || cmd == PROTO_CMD_DRAW_START ||
+       cmd == PROTO_CMD_DRAW_RECORD || cmd == PROTO_CMD_DRAW_UNDO ||
+       cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
+       cmd == PROTO_CMD_DRAW_CANCEL || cmd == PROTO_CMD_DRAW_PAPER_Z ||
+       cmd == PROTO_CMD_DRAW_HALF || cmd == PROTO_CMD_DRAW_CENTER) &&
+      (!WEARM_ENABLE_DRAW || !protoRuntimeEnabled(PROTO_FEATURE_DRAW))) {
+    R_REJ();
+    return PROTO_RES_UNKNOWN;
+  }
+
   /* Busy decision: while a pick/place sequence runs, or the button module is
    * recording/playing/homing, or a drawing task is running, every other serial
    * motion command gives way.
@@ -276,6 +353,7 @@ int protoHandleLine(const char *line)
    * Measured: -8 bytes versus pickPlaceIsBusy() first. */
   if (drawControlBusy() || buttonControlBusy() || pickPlaceIsBusy()) {
     if (!protoCmdBit(s_liveBits, cmd)) {
+      R_REJ();
       return PROTO_RES_BUSY;
     }
   }
@@ -292,6 +370,7 @@ int protoHandleLine(const char *line)
       }
       DEBUG_PRINT(F("[tool] angle4 -> "));
       DEBUG_PRINTLN(Pos.ser.angle4);
+      R_OKN();
       return PROTO_RES_TOOL_STEP;
     }
 
@@ -299,7 +378,9 @@ int protoHandleLine(const char *line)
      * switch, so they are handled here: the emitted jump table stays 23 entries
      * wide instead of 40. */
     if (cmd == PROTO_CMD_BTN_HOME_ALT) {
-      return buttonHandleCommand(cmd);
+      int result = buttonHandleCommand(cmd);
+      if (result >= 0) R_OK(); else R_REJ();
+      return result >= 0 ? result : PROTO_RES_UNKNOWN;
     }
     if (cmd >= PROTO_CMD_SPEED_SLOW && cmd <= PROTO_CMD_SPEED_FAST) {
       /* '1','2','3' are SPEED_SLOW..SPEED_FAST in that order */
@@ -307,6 +388,7 @@ int protoHandleLine(const char *line)
       adjustSpeed(level);
       DEBUG_PRINT(F("[speed] serial cmd -> "));
       DEBUG_PRINTLN(speedLevelName(level));
+      R_OK();
       return PROTO_RES_SPEED_LEVEL;
     }
 
@@ -330,6 +412,7 @@ int protoHandleLine(const char *line)
 
     } else if (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN) {
         protoSpeedStep((cmd == PROTO_CMD_SPEED_UP) ? +1 : -1);
+        R_OK();
         return (cmd == PROTO_CMD_SPEED_UP) ? PROTO_RES_SPEED_UP : PROTO_RES_SPEED_DOWN;
 
     } else if (cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B ||
@@ -358,7 +441,12 @@ int protoHandleLine(const char *line)
      * sending R to stop a recording would be blocked. */
     } else if (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
                cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME) {
-        return buttonHandleCommand(cmd);
+      int result = buttonHandleCommand(cmd);
+      if (result == PROTO_RES_BUSY || result == PROTO_RES_REC_REJECTED ||
+          result == PROTO_RES_PLAY_NO_RECORD) R_REJ();
+      else if (result < 0) R_ERR();
+      else R_OK();
+      return result < 0 ? PROTO_RES_UNKNOWN : result;
 
     /* F/D/G/E/Q/U/W: drawing commands (pick task / start / teach point / undo /
      * pause / resume / cancel). Whether they can run (already drawing, not
@@ -370,7 +458,11 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_RECORD || cmd == PROTO_CMD_DRAW_UNDO ||
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
-        return drawHandleCommand(cmd);
+      int result = drawHandleCommand(cmd);
+      if (result == PROTO_RES_BUSY || result == PROTO_RES_DRAW_REJECTED) R_REJ();
+      else if (result < 0) R_ERR();
+      else R_OK();
+      return result;
     }
     /* unknown single character command: fall through to angle parsing */
   }
@@ -378,10 +470,16 @@ int protoHandleLine(const char *line)
   /* Paper calibration p/n/o: multi character (p12.5 / n6 / o20,0). Handled
    * before angle parsing because the 'o' line contains a comma and would
    * otherwise be taken for "an angle command with a syntax error". */
-  if (cmd == PROTO_CMD_DRAW_PAPER_Z ||
-      cmd == PROTO_CMD_DRAW_HALF ||
-      cmd == PROTO_CMD_DRAW_CENTER) {
-    return protoHandleDrawCalib(p, cmd);
+  if ((cmd == PROTO_CMD_DRAW_PAPER_Z ||
+       cmd == PROTO_CMD_DRAW_HALF ||
+       cmd == PROTO_CMD_DRAW_CENTER) && !single) {
+    if (!WEARM_ENABLE_DRAW || !protoRuntimeEnabled(PROTO_FEATURE_DRAW)) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+    int result = protoHandleDrawCalib(p, cmd);
+    if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
+    return result;
   }
 
   int rc = PROTO_RES_UNKNOWN;
@@ -637,6 +735,7 @@ static int protoSpeedStep(int delta)
 void serialProtocolBegin(void)
 {
   Serial.begin(PROTO_BAUD);
+  s_runtimeFeatures = protoCompiledFeatures();
 
   /* command table: kept under WEARM_SERIAL_RESPONSES so the host still gets the
    * command list with WEARM_DEBUG_SERIAL=0. Deliberately terse: every character

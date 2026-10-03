@@ -226,6 +226,8 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 
 - **串口协议处理**（`serial_protocol.h` 与 `.cpp`）：
   - 字符读取、行缓冲、命令解析与落地写入
+  - `!` 查询当前功能状态（P=取放、B=按键、D=绘图）；`!P` / `!B` / `!D` 切换运行时启用状态。只能切换编译进固件的模块，无法开启编译裁掉的代码。
+  - 开启 `WEARM_SERIAL_RESPONSES` 后，每条识别命令都回 `OK`、`REJECTED` 或 `ERR`（O/S/k/K 会附带夹爪角度）；先确认串口助手设为 115200 baud，并且固件已烧录。
   - 对外接口：`serialProtocolBegin()`、`serialProtocolLoop()`、`protoHandleLine(const char*)`
   - 命令语义：`O`=爪子开、`S`=爪子关、`H/L`=速度档升降、`x角度,y角度,z角度`格式指令
 

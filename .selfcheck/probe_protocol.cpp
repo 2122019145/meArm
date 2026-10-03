@@ -102,6 +102,12 @@ int main(void) {
   posInit();
 
   char buf[260];
+  Serial.clearOutput();
+  check("feature help advertises runtime status command", protoHandleLine("!") == PROTO_RES_NONE && Serial.getOutput() == "P=1 B=1 D=1\n", Serial.getOutput().c_str());
+  Serial.clearOutput();
+  protoHandleLine("H");
+  check("speed acknowledgement follows debug output", Serial.getOutput().find("OK\n") != std::string::npos, Serial.getOutput().c_str());
+  Serial.clearOutput();
 
   printf("=== 1) 固定指令 O / S（绝对到位） ===\n");
   {
@@ -598,6 +604,27 @@ int main(void) {
              violations, exampleCount, Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3, Pos.ser.angle4,
              Pos.rec.x, Pos.rec.y, Pos.rec.z);
     check("3000轮随机压力测试：零越界/零NaN/坐标与角度始终自洽", violations == 0, buf);
+  }
+
+  printf("=== 13) 串口应答与运行时功能开关 ===\n");
+  {
+    resetInputs();
+    serialProtocolBegin();
+    Serial.clearOutput();
+    check("运行时功能开关可查询", protoHandleLine("!") == PROTO_RES_NONE &&
+          Serial.getOutput() == "P=1 B=1 D=1\n", Serial.getOutput().c_str());
+    check("编译内功能可切换后恢复", protoHandleLine("!P") == PROTO_RES_SPEED_LEVEL &&
+          protoHandleLine("!P") == PROTO_RES_SPEED_LEVEL, "!P toggles then toggles back");
+    Serial.clearOutput();
+    (void)protoHandleLine("!B");
+    (void)protoHandleLine("N");
+    check("runtime-disabled button command returns REJECTED", Serial.getOutput().find("REJECTED\n") != std::string::npos, Serial.getOutput().c_str());
+    check("compiled button feature toggles back on", protoHandleLine("!B") == PROTO_RES_SPEED_LEVEL, "!B toggles back");
+    check("compiled draw feature toggles off/on", protoHandleLine("!D") == PROTO_RES_SPEED_LEVEL &&
+          protoHandleLine("!D") == PROTO_RES_SPEED_LEVEL, "!D toggles twice");
+    Serial.clearOutput();
+    check("speed command responds", protoHandleLine("H") == PROTO_RES_SPEED_UP &&
+          Serial.getOutput().find("OK\n") != std::string::npos, Serial.getOutput().c_str());
   }
 
   printf("\n>>> %s (失败 %d 项)\n", failures == 0 ? "ALL PASS" : "HAS FAILURES", failures);
