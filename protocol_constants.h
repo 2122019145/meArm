@@ -59,7 +59,7 @@
 /* 绘图命令（v1.0.0 新增，实现见 draw_control.cpp）。
  * 选这些字母的理由：都是此前未被占用的字符，且不与 x/X/y/Y/z/Z 三个角度轴字母冲突
  * （轴字母开头的行会走角度解析，绘图命令一律用别的字母）。 */
-#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母N/三角形/字母Z/字母V/五点折线/五点曲线 */
+#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母V/五点折线/五点曲线 */
 #define PROTO_CMD_DRAW_START   'D'   /* 开始绘制（内置图形直接画；示教任务进入五点示教） */
 #define PROTO_CMD_DRAW_RECORD  'G'   /* 记录一个示教点（等价于示教中按按键1） */
 #define PROTO_CMD_DRAW_UNDO    'E'   /* 撤销一个示教点（等价于示教中按按键2） */

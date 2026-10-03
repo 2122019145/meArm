@@ -26,6 +26,15 @@
  *   比上一轮跳得太多，就把这一步的位移折半重试（最多 4 次），还是超限就本轮不动、
  *   轨迹参数也不推进 —— 宁可慢一点，也不允许舵机猛跳或笔尖偏离轨迹。
  *
+ * 【精细化插值（本分支）】
+ *   上面算出的 step 送去执行前先过一道上限：单次写入的位移不超过
+ *   DRAW_STEP_MAX（0.02 工作区单位）。配合放慢后的速度（3 单位/秒、加减速 6、
+ *   关节上限 70°/s），笔尖的轨迹由几百个密排的点组成，舵机每步只动零点几度，
+ *   看上去是"缓慢匀速滑过去"，顶点附近也不会甩过冲。
+ *   正常 loop 周期（1~5 ms）下算出来的 step 只有 0.003~0.015 单位，上限不生效；
+ *   只有 loop 被拖长的那一轮才限住（少走一点，剩下的下一轮补），宁慢不跳。
+ *   路径校验的采样步长也同步从 0.5 收紧到 0.25。
+ *
  * 【示教点动】
  *   示教模式下摇杆由本模块自己读（joystickReadState），推动改变的是笔尖 x/y/z
  *   （笛卡尔点动），不是关节角。每步都做一次完整校验（limit + 可达 + 反解不被吸附），
@@ -68,12 +77,20 @@
  * 若该高度在工作空间外会自动降低（见 liftZFor），所以取得高一点没关系。 */
 #define DRAW_LIFT_DZ           4.0
 
-/* --- 速度 --- */
-#define DRAW_V_MAX             8.0   /* 笔尖最大线速度（工作区单位/秒） */
-#define DRAW_ACCEL            12.0   /* 加减速度（单位/秒^2） */
-#define DRAW_MAX_DPS         110.0   /* 关节角速度硬上限（度/秒） */
+/* --- 速度（本分支：整体放慢，见下） --- */
+/* 【本分支改了什么】把绘制运动调慢调细：
+ *   线速度 8 -> 3 单位/秒、加速度 12 -> 6、关节角硬上限 110 -> 70°/s，
+ *   并且每一轮最多只走 DRAW_STEP_MAX（见 pathTick）。
+ *   于是每条轨迹都变成"很多个很小的位移点"，舵机是一小格一小格叠上去的。 */
+#define DRAW_V_MAX             3.0   /* 笔尖最大线速度（工作区单位/秒） */
+#define DRAW_ACCEL             6.0   /* 加减速度（单位/秒^2） */
+#define DRAW_MAX_DPS          70.0   /* 关节角速度硬上限（度/秒） */
 #define DRAW_HOME_DPS         50.0   /* 回待机位的关节角速度（度/秒） */
 #define DRAW_JOG_MAX_DPS     200.0   /* 示教点动的关节角速度上限（度/秒，比自动绘制宽松：手动操作宁快勿卡） */
+/* 单次写入的最大位移（工作区单位）：一轮里要走的距离超过它就只走这么多，
+ * 剩下的留给下一轮（正常 loop 周期下用不到它）。
+ * 0.02 相当于"一条 12 单位的直线至少分 600 步"，关节角每步只动零点几度。 */
+#define DRAW_STEP_MAX          0.02
 
 /* --- 时间 --- */
 #define DRAW_TICK_MAX_MS      50UL   /* 单次推进最多认 50ms（串口打印卡顿保护） */
@@ -81,7 +98,7 @@
 #define DRAW_HOME_TOL_DEG      0.4   /* 回待机位的到位容差（度） */
 
 /* --- 轨迹校验（与 pick_place 同一套门限思想） --- */
-#define DRAW_PATH_SAMPLE_STEP  0.5
+#define DRAW_PATH_SAMPLE_STEP  0.25  /* 轨迹校验的采样步长（本分支 0.5 -> 0.25，校验更细） */
 #define DRAW_PATH_SAMPLE_MAX  96
 #define DRAW_BRANCH_JUMP_DEG  25.0
 
@@ -104,31 +121,19 @@ struct drawVertex {
 };
 
 /* The tables live in flash (PROGMEM): they are read-only lookups, so keeping a
- * RAM copy would waste data space for nothing. Read them with pgm_read_float.
- * Sizes stay 16/32/32/32/24 bytes, values and order are unchanged. */
+ * RAM copy would waste data space for nothing. Read them with pgm_read_float. */
 static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
   { -1.0,  0.0 }, {  1.0,  0.0 }
-};
-/* 字母 N：左竖（下->上）-> 斜线（左上->右下）-> 右竖（下->上） */
-static const struct drawVertex SHAPE_N[4] PROGMEM = {
-  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
-};
-/* 三角形：底边 -> 右边 -> 左边回到起点（闭合） */
-static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
-  { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
-};
-/* 字母 Z：上横（左->右）-> 斜线（右上->左下）-> 下横（左->右） */
-static const struct drawVertex SHAPE_Z[4] PROGMEM = {
-  { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
 };
 /* 字母 V：左上 -> 底尖 -> 右上 */
 static const struct drawVertex SHAPE_V[3] PROGMEM = {
   { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
 };
 
-/* 任务名（下标即 DRAW_TASK_*） */
+/* 任务名（下标即 DRAW_TASK_*）。
+ * 本分支只有 4 个任务：原来的 字母N / 三角形 / 字母Z 连表一起删掉了。 */
 static const char *const DRAW_TASK_NAME[DRAW_TASK_COUNT] = {
-  "直线", "字母N", "三角形", "字母Z", "字母V", "五点折线", "五点曲线"
+  "直线", "字母V", "五点折线", "五点曲线"
 };
 
 /* 阶段名（下标即 DRAW_PHASE_*） */
@@ -137,9 +142,9 @@ static const char *const DRAW_PHASE_NAME[] = {
 };
 
 /* --- 任务与状态 --- */
-/* Small-range state is stored in 1-byte types: ranges are (task 0..6), (phase 0..8),
+/* Small-range state is stored in 1-byte types: ranges are (task 0..3), (phase 0..8),
  * (counts 0..5), (afterHome 0..2), so nothing observable changes. */
-static int8_t s_task     = DRAW_TASK_TRIANGLE;  /* 当前选中的任务（默认三角形） */
+static int8_t s_task     = DRAW_TASK_LINE;      /* 当前选中的任务（本分支默认直线） */
 static int8_t s_phase    = DRAW_PHASE_IDLE;
 static bool s_paused   = false;
 static int  s_lastRes  = PROTO_RES_NONE;
@@ -246,9 +251,6 @@ static int shapeTable(int task, const struct drawVertex **tbl)
 {
   switch (task) {
     case DRAW_TASK_LINE:     *tbl = SHAPE_LINE;     return 2;
-    case DRAW_TASK_N:        *tbl = SHAPE_N;        return 4;
-    case DRAW_TASK_TRIANGLE: *tbl = SHAPE_TRIANGLE; return 4;
-    case DRAW_TASK_Z:        *tbl = SHAPE_Z;        return 4;
     case DRAW_TASK_V:        *tbl = SHAPE_V;        return 3;
     default:                 *tbl = NULL;           return 0;
   }
@@ -694,7 +696,9 @@ static void polyPointAt(double s, double *px, double *py, double *pz)
   }
 }
 
-/* 沿轨迹走一步。成功返回 true 并把 s_done/s_span/s_u/s_v 推进；
+/* 沿轨迹走一步。成功返回 true 并把 s_done/s_span/s_u 推进，
+ * s_v 按"本步实际走出去的位移 / 本轮时长"更新（若折半过，记下的就是
+ * 真正走成的速度）；
  * 若关节速率限制不允许（折半 4 次仍超限）则什么都不改、返回 false。 */
 static bool pathAdvance(double step)
 {
@@ -738,6 +742,16 @@ static void pathTick(void)
   double step = v * s_dtSec;
   if (step > remain) step = remain;
 
+  /* 【精细化插值】这一轮最多只送出去 DRAW_STEP_MAX（0.02 工作区单位）的位移。
+   *   - 正常情况（loop 周期 1~5 ms、巡航 3 单位/秒）算出来的 step 只有
+   *     0.003~0.015 单位，**这个上限根本不会生效**，速度完全按梯形规划走。
+   *   - 只有当某一轮 loop 被拖长（串口打印、别的模块占时间）时才会限住，
+   *     那一轮就少走一点、剩下的留给下一轮 —— 宁可慢，也不让舵机一次跳一大步。
+   *   - 为什么不做"一轮里拆成多小步循环送出"：本工程用 LTO + -Os，
+   *     把 pathAdvance() 放进循环里会让它无法被内联，实测同样功能要多花
+   *     662 B flash（Uno 只剩 512 B 余量，装不下）。限一步的写法只多 32 B，
+   *     效果一样：**任何一次写入的位移都不会超过 0.02 单位**。 */
+  if (step > DRAW_STEP_MAX) step = DRAW_STEP_MAX;
   (void) pathAdvance(step);
 
   /* 过点统计：走过了第 i 个目标点的弧长位置就量一下笔尖离它多远 */
@@ -893,7 +907,7 @@ static int teachFinish(void)
 
 void drawSetup(void)
 {
-  s_task   = DRAW_TASK_TRIANGLE;
+  s_task   = DRAW_TASK_LINE;   /* 本分支默认任务 = 直线 */
   s_phase  = DRAW_PHASE_IDLE;
   s_paused = false;
   s_lastMs = millis();
