@@ -373,6 +373,133 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 - **卡死保护**：连续 `DRAW_STALL_LIMIT 500` 轮没能让状态前进（关节速率或可达性受限），
   就退回空闲并打印原因，不会永远停在某个阶段。
 
+## v1.1.0 —— Uno 容量压缩与配置开关
+
+**问题**：v1.0.0 把取放、四按键、绘图三套功能全编进同一个固件，Arduino IDE 直接报
+
+    Sketch uses 51452 bytes (159%) of program storage space. Maximum is 32256 bytes.
+    Global variables use 2319 bytes (113%) of dynamic memory, leaving -271 bytes for
+    local variables. Maximum is 2048 bytes.
+    Sketch too big; ... text section exceeds available space in board
+
+**结论**：逐函数压过一轮之后，三功能同时编进去是 **32842 B / 1163 B**
+（比 v1.0.0 小 36%，其中 SRAM 从 2319 B 降到 1163 B，早就不超了），
+但 **flash 仍然差 586 B**，所以 v1.1.0 的出厂默认只开「取放 + 绘图」两功能
+（29476 B / 638 B），四按键在 `weArm_config.h` 里把 1 个数字改回 1 就能换回来。
+
+### 第一步：把调试日志关掉（−9260 B）
+
+`weArm_config.h` 的 `WEARM_DEBUG_SERIAL` 默认 0。六个模块各自的中文
+`Serial.print(F("..."))` 日志加起来 **9260 B**（51452 → 42192）。
+顺带纠正 v1.0.0 注释里的一个错误说法：**AVR 的 `.rodata` 是并进 `.text` 的
+（`avr-size -A` 实测），字符串常量只在 flash 里，不占 SRAM**；
+真正让 SRAM 涨的是 `button_control.cpp` 那个 1024 B 的录制缓冲和一堆 `static` 表。
+
+同时把「必须保留的应答」和「可删的调试明细」拆成两级开关：
+`WEARM_DEBUG_SERIAL`（明细，默认 0）与 `WEARM_SERIAL_RESPONSES`（`OK`/`REJECTED`
+这类应答，默认 1）。v1.0.0 里所有 `Serial.print` 都被 `#if WEARM_DEBUG_SERIAL`
+包着，**一旦关调试整机就变成哑巴**——开机没有任何输出、任何命令都没有回显。
+
+### 第二步：逐函数压缩（42192 → 32842，−9350 B）
+
+一轮一轮实测出来的，按收益从大到小：
+
+- **合并三个模块重复的几何核心**（−936 B）：`pick_place.cpp` 与 `draw_control.cpp`
+  各自有一份 `solveJoint` / `pointOk` / `segmentOk` / `setJoints`，LTO 已经把
+  它们复制成 2~3 份（`lto_priv.*`）。抽到新文件 `path_core.h`，用
+  **非 static 的 `inline`**（走 COMDAT，链接器保证只留一份），
+  `draw_control.cpp` 保留同名转发函数，调用点一行不用改。
+- **`constant_and_positions.cpp`**（−542 B）：`getAngleEx` 去掉冗余的候选角枚举
+  （2530 → 2040）；删掉整个 `applyJointLimits` 与它的备份/回滚——进函数前
+  angle1..3 已被**同样容差**的区间判断筛过，"微小负角归零"只会把角推向区间内部，
+  于是只需要判 angle4 并且在写 `Pos.ser` **之前**返回 false，回滚自然就不需要了。
+- **`move.cpp` + `joystick_control.cpp`**（−814 B）：改为"副本试算、全通过才提交"；
+  6 个 `switch` 分支折成 PROGMEM 打包表 `DIR_CODE[7]`；`posOutOfRange`/`samePose`
+  改成 3 轴循环与逐位比较；摇杆的浮点比例夹取改成整数夹取。
+- **`serial_protocol.cpp`**（−86 B）：`protoHandleLine` 的 19 路 `switch` 换成
+  `if/else` 链——原来 GCC 会生成 64 项 `.rodata` 跳表 + 24 位范围检查 + `_tablejump2`。
+  这个文件里很多"看起来能省"的写法实测是**变大的**（例如给 `protoFlushLine`
+  加 `noinline` 反而 +150 B）。
+- **`button_control.cpp`**（−264 B）：录制缓冲从 512 × 2 B 的 `(code, arg)` 条目
+  改成 **128 × 3 B 的打包记录**（每 100 ms 一条，四个关节的 6 位有符号增量、
+  0.5° 为单位），`s_buf` 从 1024 B 掉到 384 B；12.8 s 的录制长度仍大于
+  `BTN_REC_MIN_MS`（10 s）。
+- **`draw_control.cpp`**（−2020 B）：5 张图形表进 PROGMEM；`s_segLen[5]` 删掉
+  （弧长现算）；`curveSpan` 从 2398 B 压到 1470 B；状态变量收窄成 `int8_t`。
+- 常量表一律 PROGMEM，但注意：**这只能省 SRAM，省不了 flash**——
+  `.data` 的初值本来就在 flash 里有一份（`Program = .text + .data`），
+  搬进 `.rodata` 还是那一份，只是不用再拷进 RAM。
+
+### 实测容量矩阵（`avr-size --mcu=atmega328p`）
+
+| 配置 | Program | 占 32256 | Data | 占 2048 |
+|---|---|---|---|---|
+| 取放 + 四按键 + 绘图（v1.0.0 默认） | 51452 | **159%** | 2319 | **113%** |
+| 同上，仅关调试日志 | 42192 | 130.8% | 2133 | 104.2% |
+| 取放 + 四按键 + 绘图（压缩后） | 32842 | **101.8%** | 1163 | 56.8% |
+| 取放 + 绘图（**v1.1.0 默认**） | 29476 | 91.4% | 638 | 31.2% |
+| 绘图 + 四按键 | 30074 | 93.2% | 1129 | 55.1% |
+| 取放 + 四按键 | 20126 | 62.4% | 953 | 46.5% |
+| 只要取放 | 16866 | 52.3% | 428 | 20.9% |
+| 只要绘图 | 26922 | 83.5% | 605 | 29.5% |
+| 只要四按键 | 15796 | 49.0% | 919 | 44.9% |
+
+复现任意一行：
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\avr_build.ps1 `
+        -SketchDir . -BuildRoot .selfcheck\out\chk `
+        -ExtraDefs @('-DWEARM_ENABLE_BUTTONS=0')
+
+### 为什么三功能不再挤一挤（剩下的 586 B 在哪）
+
+最大的一笔"外部"开销是 **Arduino 的 `Serial` 栈：实测 1014 B flash / 181 B RAM**。
+量法：同一个最小 sketch，只做 4 个 `Servo` 的 `attach`/`write` 是
+Program 1876 / Data 63，再加一句 `Serial.begin(115200); Serial.print("boot");`
+就变成 2890 / 244（两个 sketch 留在
+`.selfcheck/out/probe/a_noserial/sk.ino` 与 `.selfcheck/out/probe/b_serial/sk.ino`）。
+另外 `Serial`/`Servo` 的全局对象还有 202 B 的构造代码（`_GLOBAL__I_...`），
+反汇编看就是库自己的 `servo_info[]` 注册循环。
+
+也就是说，要再挤出 586 B 只剩"把 `Serial` 换成裸 UART 寄存器读写"这一条路。
+它要重写 `begin/print/println/write/available/read/flush` 一整层、
+自己管接收中断，属于**在硬件通信这个最不能出错的地方动刀**，
+不适合放在一个"修编译错误"的版本里，所以 v1.1.0 不做，如实记录在这里。
+
+顺带发现但**没有采纳**的几个写法（实测不划算或不等价）：
+
+- `-Wl,--relax` 能再省 400 B 出头，但要用户在 `platform.local.txt` 里加链接参数，
+  默认编译享受不到，所以不作为交付方案。
+- `constant_and_positions.cpp` 里只剩一处 `acos`（`acos(cosC)` 消分支用），
+  删掉能省 100~150 B，但改写会动到反解的数值，而探针对反解残差很敏感。
+- 位折叠命令分派（`'M'/'N'/'P'/'R'` 折成 0/1/2/3）看着能省几十字节，
+  实测**直接打断功能**：那四个字符的差值其实是 0/1/3/5，`'R'` 会被判成未知命令，
+  串口再也结束不了录制。这一处已经在 `button_control.cpp` 里加了警示注释。
+
+### 怎么选配置
+
+改 `weArm_config.h` 里三个数字即可（0 = 关，1 = 开），别的文件都不用动：
+
+    WEARM_ENABLE_PICK_PLACE   取放序列（串口 A/B/C、按键1 循环取放）
+    WEARM_ENABLE_BUTTONS      四按键（录制/播放/回中/循环取放）
+    WEARM_ENABLE_DRAW         绘图（铅笔轨迹）
+
+关掉的功能会被链接器整段丢掉（头文件里退化成空 inline 桩），
+命令行 `-D` 依然可以覆盖本文件的默认值。
+
+**注意**：`mock/Arduino.h` 为配合 `draw_control.cpp` / `pick_place.cpp` 的
+`PROGMEM` 常量表，新增了 `pgm_read_byte/word/dword/float/ptr`；
+因为 PC 上 `double` 是 64 位而 AVR 上就是 32 位 float，`pgm_read_float`
+在 mock 里直接按 `double` 读，才能让两端算出一模一样的结果。
+
+### 两个新踩到的坑
+
+1. **LTO 偶发 `lto1.exe: internal compiler error: resolution sub id ... not in object file`**：
+   换一个全新的 `-BuildRoot`（清掉 `core.a` 之外的中间 `.o`/`.ltrans`）重试即可，
+   是 avr-gcc 7.3.0 的 LTO 缓存问题，不是代码问题。
+2. **写完新构建目录记得先更新 `.gitignore`**：`avr_build.ps1` 默认的
+   `-BuildRoot` 是 `.selfcheck/avrbuild`，`git add -A` 会把 `core.a`
+   和几十个中间文件一起提交进去。
+
 ## PowerShell 的两个坑
 
 1. **`& $gpp ... 2>&1` 赋给变量后 `$LASTEXITCODE` 仍是 0** —— g++ 的 warning 走

@@ -29,6 +29,19 @@
 
 #include "constant_and_positions.h"
 
+/* ===== second-level switch: responses the host must keep =====
+ * WEARM_SERIAL_RESPONSES=1 makes the firmware print the boot command table and
+ * answer every command with a very short UPPERCASE line (OK / REJECTED / ERR /
+ * the angle echo of O and S / the calibration echo of p,n,o), so the host still
+ * sees what happened even when the verbose WEARM_DEBUG_SERIAL traces are off.
+ * The per-step traces stay behind WEARM_DEBUG_SERIAL in serial_protocol.cpp.
+ * The response layer avoids Serial.print() for numbers: that would drag the
+ * Arduino number/float formatting layer (~9.5 KB) into the image. It writes
+ * through Serial.write() straight out of PROGMEM. */
+#ifndef WEARM_SERIAL_RESPONSES
+#define WEARM_SERIAL_RESPONSES 1
+#endif
+
 /* protoHandleLine() 的返回值，同时也是"这条命令做了什么"的记号 */
 #define PROTO_RES_NONE          0  /* 空行或只有空白，什么都没做 */
 #define PROTO_RES_GRIPPER_OPEN  1  /* O 爪子张开 */

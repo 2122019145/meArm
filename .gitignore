@@ -23,6 +23,9 @@
 *.map
 *.i
 
+# avr_build.ps1 的 AVR 真实构建缓存（core.a 很大，且是可再生产物）
+.selfcheck/avrbuild/
+
 # Arduino 构建目录与编辑器临时目录（本工程里出现过 *.tmpdir 残留）
 build/
 *.tmpdir/

@@ -17,6 +17,16 @@ typedef const __FlashStringHelper *PGM_P;
 #ifndef PROGMEM
 #define PROGMEM
 #endif
+/* PC 上 PROGMEM 是空操作，pgm_read_* 直接解引用即可。
+ * 注意：AVR 上 double 就是 32 位 float，所以固件里的 pgm_read_float() 读的是
+ * 表中的 double 元素；宿主机上 double 是 64 位，这里按 double 读回同一个值。 */
+#ifndef pgm_read_byte
+#define pgm_read_byte(addr)  (*(const unsigned char *)(addr))
+#define pgm_read_word(addr)  (*(const unsigned short *)(addr))
+#define pgm_read_dword(addr) (*(const unsigned long *)(addr))
+#define pgm_read_float(addr) (*(const double *)(addr))
+#define pgm_read_ptr(addr)   (*(void * const *)(addr))
+#endif
 #define F(str) (reinterpret_cast<const __FlashStringHelper *>(str))
 typedef std::string String;
 
@@ -68,6 +78,22 @@ extern MockSerial Serial;
 #define INPUT 0
 #define OUTPUT 1
 #define INPUT_PULLUP 2
+
+/* ---------------------------------------------------------------------------
+ * AVR 的 IO 寄存器与位宏。joystick_control.cpp 为了省 flash 在
+ * joystickSetup()/updateLed() 里直接写寄存器（见 README 的「v1.1.0 容量压缩」），
+ * PC 上没有硬件，这里只提供同名变量让固件能编译、能链接。
+ * 取值与 ATmega328P 一致：PB5 = D13（板载 LED），PC0..PC3 = A0..A3。
+ * 注意探针**不断言**这些寄存器的内容 —— 引脚语义仍由 g_mockPinMode /
+ * g_mockDigital 承担，所以这里的变量只求"存在且可写"。
+ * ------------------------------------------------------------------------ */
+#define _BV(bit) (1 << (bit))
+#define PB5 5
+#define PC0 0
+#define PC1 1
+#define PC2 2
+#define PC3 3
+extern volatile uint8_t DDRB, PORTB, DDRC, PORTC;
 
 unsigned long millis(void);
 unsigned long micros(void);

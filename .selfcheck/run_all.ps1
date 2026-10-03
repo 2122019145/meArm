@@ -28,12 +28,18 @@ if (-not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null 
 
 $fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp', 'pick_place.cpp', 'button_control.cpp', 'draw_control.cpp') | ForEach-Object { Join-Path $root $_ }
 $inc = @("-I$root", "-I$mock")
+
+# 【v1.1.0】PC 端自检固定用「全功能 + 调试日志开」的配置。
+#   weArm_config.h 的默认值是"能装进 Uno"的裁剪配置（WEARM_DEBUG_SERIAL=0），
+#   而 PC 自检要覆盖 v1.0.0 及以前验证过的全部行为，所以在这里用 -D 覆盖回来：
+#   调试日志开 -> 历史行为逐字不变；同时也能规避"调试关掉后某函数/变量没人用"的告警。
+$cfg = @('-DWEARM_DEBUG_SERIAL=1', '-DWEARM_ENABLE_PICK_PLACE=1', '-DWEARM_ENABLE_BUTTONS=1', '-DWEARM_ENABLE_DRAW=1')
 $fail = 0
 
 Write-Host '================ 1) 固件严格编译（0 警告才算过）================'
 foreach ($f in $fw) {
     $name = Split-Path -Leaf $f
-    $log = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow -Wconversion -c @inc $f -o (Join-Path $out ($name + '.o')) 2>&1
+    $log = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow -Wconversion @cfg -c @inc $f -o (Join-Path $out ($name + '.o')) 2>&1
     $n = ($log | Measure-Object).Count
     if ($LASTEXITCODE -ne 0 -or $n -gt 0) {
         Write-Host ("  [FAIL] {0}  EXIT={1}  输出 {2} 行" -f $name, $LASTEXITCODE, $n) -ForegroundColor Red
@@ -56,7 +62,7 @@ foreach ($n in $probes) {
     $src  = Join-Path $sc ($n + '.cpp')
     $exe  = Join-Path $out ($n + '.exe')
     $srcs = @($src) + $fw + @((Join-Path $mock 'Arduino.cpp'), (Join-Path $mock 'Servo.cpp'))
-    $clog = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow @inc @srcs -o $exe 2>&1
+    $clog = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow @cfg @inc @srcs -o $exe 2>&1
     $cn = ($clog | Measure-Object).Count
     if ($LASTEXITCODE -ne 0 -or $cn -gt 0) {
         Write-Host ("  [FAIL] {0} 编译  EXIT={1}  输出 {2} 行" -f $n, $LASTEXITCODE, $cn) -ForegroundColor Red

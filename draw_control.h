@@ -81,6 +81,7 @@
 #include "Arduino.h"
 #include "constant_and_positions.h"
 #include "serial_protocol.h"
+#include "weArm_config.h"
 
 /* ---------- 绘图任务编号 ---------- */
 #define DRAW_TASK_LINE      0   /* 直线（内置） */
@@ -114,6 +115,7 @@
 #define DRAW_PHASE_TEACH_WAIT 7 /* 5 点记录完的小停顿，之后自动开始绘制 */
 #define DRAW_PHASE_RETURN    8  /* 绘制结束后回待机位 */
 
+#if WEARM_ENABLE_DRAW
 /* ---------- 生命周期 ---------- */
 /* 初始化（在 setup() 里调用一次）。不占用任何引脚：按键与摇杆都由各自模块读。 */
 void drawSetup(void);
@@ -198,5 +200,59 @@ int drawLastPointsHit(void);
 int drawLastPointsTotal(void);
 /* 最近一次操作的返回码（PROTO_RES_*），方便串口/探针回看。 */
 int drawLastResult(void);
+#else
+/* 生命周期 */
+/* 绘图功能已关闭，这里是空实现 */ static inline void drawSetup(void) { }
+/* 绘图功能已关闭，这里是空实现 */ static inline void drawLoop(void) { }
+
+/* ---------- 任务选择与启动 ---------- */
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawSelectTask(int task) { (void)task; return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawTaskCycle(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawGetTask(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline const char *drawTaskName(int task) { (void)task; return ""; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawStartTask(void) { return -1; }
+
+/* 串口命令 */
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawHandleCommand(char c) { (void)c; return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawIsCommandChar(char c) { (void)c; return false; }
+
+/* 标定 */
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawSetPaperZ(double z) { (void)z; return false; }
+/* 绘图功能已关闭，这里是空实现 */ static inline double drawGetPaperZ(void) { return 0.0; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawSetHalfSize(double half) { (void)half; return false; }
+/* 绘图功能已关闭，这里是空实现 */ static inline double drawGetHalfSize(void) { return 0.0; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawSetCenter(double x, double y) { (void)x; (void)y; return false; }
+/* 绘图功能已关闭，这里是空实现 */ static inline double drawGetCenterX(void) { return 0.0; }
+/* 绘图功能已关闭，这里是空实现 */ static inline double drawGetCenterY(void) { return 0.0; }
+
+/* ---------- 示教 ---------- */
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawTeachRecord(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawTeachUndo(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawTeachFinish(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawTeachCount(void) { return 0; }
+
+/* ---------- 绘图过程控制 ---------- */
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawPause(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawResume(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawCancel(void) { return -1; }
+
+/* 按键入口 */
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawHandleButton(int key) { (void)key; return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawAcceptButton(int key) { (void)key; return false; }
+
+/* ---------- 状态查询（探针与调试用） ---------- */
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawControlBusy(void) { return false; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawControlLocked(void) { return false; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawGetPhase(void) { return -1; }
+/* 绘图功能已关闭，这里是空实现 */ static inline const char *drawPhaseName(void) { return ""; }
+/* 绘图功能已关闭，这里是空实现 */ static inline const char *drawStateName(void) { return ""; }
+/* 绘图功能已关闭，这里是空实现 */ static inline bool drawIsPaused(void) { return false; }
+
+/* 上一次绘制的结果 */
+/* 绘图功能已关闭，这里是空实现 */ static inline unsigned long drawLastRunMs(void) { return 0UL; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawLastPointsHit(void) { return 0; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawLastPointsTotal(void) { return 0; }
+/* 绘图功能已关闭，这里是空实现 */ static inline int drawLastResult(void) { return -1; }
+#endif
 
 #endif /* DRAW_CONTROL_H */

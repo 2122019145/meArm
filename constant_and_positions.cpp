@@ -8,7 +8,7 @@
 /* ---------- 编译开关 ---------- */
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 本开关需与 joystick_control.cpp 中的同名开关保持一致，否则串口输出会缺失。 */
-#define WEARM_DEBUG_SERIAL 1
+#include "weArm_config.h"
 
 #if WEARM_DEBUG_SERIAL
   #define WEARM_LOG(msg)   Serial.println(F(msg))
@@ -161,21 +161,35 @@ struct servoLimitCfg servoLimit = {
 /* 关节越界策略：吸附到最近限位（动作到极限为止，不会突然停住） */
 int servoLimitMode = SERVO_LIMIT_CLAMP;
 
-/* 关节越界提示的限流时间戳（避免持续越限把串口刷爆） */
+/* 关节越界提示的限流时间戳（避免持续越限把串口刷爆）。
+ * 这条提示只在 WEARM_DEBUG_SERIAL 打开时才有意义，所以连变量一起裁掉，
+ * 免得关掉调试后它变成"定义了但没人用"的告警源。 */
+#if WEARM_DEBUG_SERIAL
 static unsigned long lastServoLogTime = 0;
+#endif
 
 /* 当前档位。-1 = 自定义(由 setSpeed 直接写入)，否则为 SPEED_* 之一 */
 static int speedLevel = SPEED_NORMAL;
 
 /* ---------- 内部小工具 ---------- */
 
-/* 判断浮点数是否有效（排除 NaN 与 Inf）。 */
-static bool isFiniteNum(double v) {
-  return !isnan(v) && !isinf(v);
+/* True for every finite value (NaN and +-Inf rejected).
+ * "v - v == 0" is bit-exact equivalent to "!isnan(v) && !isinf(v)": a finite
+ * value minus itself is +0.0, while NaN/Inf minus itself is NaN, which compares
+ * unequal to 0.0. The build uses -Os -flto without -ffast-math /
+ * -ffinite-math-only, so the compiler may not fold v - v away.
+ * Kept out-of-line on purpose: inlining it at all ~13 call sites costs more
+ * flash than one tiny shared function plus a call. */
+static bool __attribute__((noinline)) isFiniteNum(double v) {
+  return (v - v) == 0.0;
 }
 
-/* 把一个 double 限定到 [lo, hi]，且 lo/hi 写反时自动交换。 */
-static double clampDouble(double v, double lo, double hi) {
+/* 把一个 double 限定到 [lo, hi]，且 lo/hi 写反时自动交换。
+ * Kept out-of-line on purpose: it is used by three different loops
+ * (clampServoAngles / clampToRange / posSetAngle4) and inlining the
+ * "swap the bounds, then two comparisons" sequence in each of them costs
+ * more flash than one shared copy plus a call. */
+static double __attribute__((noinline)) clampDouble(double v, double lo, double hi) {
   if (lo > hi) { double t = lo; lo = hi; hi = t; }
   if (v < lo) return lo;
   if (v > hi) return hi;
@@ -184,151 +198,98 @@ static double clampDouble(double v, double lo, double hi) {
 
 /* ---------- 关节硬限位 ---------- */
 
-/* 各关节的限位映射表：把 servoLimit 里的 b/r/c/f 区间与 SER 字段对应起来。
- * 用表格而不是四段重复代码，加关节时只改这张表。 */
-struct jointRule {
-  char   name;          /* 单字符关节名，仅用于串口提示 */
-  double minAngle;
-  double maxAngle;
-};
+/* The four joints are stored as eight consecutive doubles inside servoLimitCfg
+ * (minB,maxB,minR,maxR,minC,maxC,minF,maxF). All members have the same type and
+ * alignment, so the struct has no padding and the four (min,max) pairs can be
+ * walked with one pointer instead of a four-entry mapping table.
+ *
+ * This is also why the old jointMin[]/jointMax[] mirror tables are gone: reading
+ * servoLimit directly yields exactly the values those mirrors were refreshed to
+ * (servoSelfCheck normalizes servoLimit in place and nothing else writes it),
+ * while the mirrors cost 72 bytes of RAM plus a refresh loop in every call. */
+#define JOINT_PAIR(i) (&servoLimit.minB + 2 * (i))
 
-static struct jointRule jointMin[4] = { {'b', 0, 0}, {'r', 0, 0}, {'c', 0, 0}, {'f', 0, 0} };
-static struct jointRule jointMax[4] = { {'b', 0, 0}, {'r', 0, 0}, {'c', 0, 0}, {'f', 0, 0} };
+/* 单字符关节名，仅用于串口提示（调试关闭时整块被裁掉） */
+#if WEARM_DEBUG_SERIAL
+static const char jointName[4] PROGMEM = { 'b', 'r', 'c', 'f' };
+#endif
 
-/* 把当前 servoLimit 刷新进映射表，并返回被修正（写反或超出 0~180）的项数。
- * 舵机物理行程只有 0~180°，所以越界的限位本身也是配置错误。 */
+/* 修正写反或超出 0~180 的关节限位，返回被修正的项数。
+ * 舵机物理行程只有 0~180°，所以越界的限位本身也是配置错误。
+ * Sorting and clamping each joint in turn gives exactly the same final values
+ * and the same corrected-item count as the old "sort all four, then clamp all
+ * four" two-pass version, because the four joints are independent. */
 int servoSelfCheck(void) {
   int bad = 0;
-
-  /* 1) 四项限位先各自排序、并夹进 0~180 */
-  if (servoLimit.minB > servoLimit.maxB) { double t = servoLimit.minB; servoLimit.minB = servoLimit.maxB; servoLimit.maxB = t; bad++; }
-  if (servoLimit.minR > servoLimit.maxR) { double t = servoLimit.minR; servoLimit.minR = servoLimit.maxR; servoLimit.maxR = t; bad++; }
-  if (servoLimit.minC > servoLimit.maxC) { double t = servoLimit.minC; servoLimit.minC = servoLimit.maxC; servoLimit.maxC = t; bad++; }
-  if (servoLimit.minF > servoLimit.maxF) { double t = servoLimit.minF; servoLimit.minF = servoLimit.maxF; servoLimit.maxF = t; bad++; }
-
-  double *mins[4] = { &servoLimit.minB, &servoLimit.minR, &servoLimit.minC, &servoLimit.minF };
-  double *maxs[4] = { &servoLimit.maxB, &servoLimit.maxR, &servoLimit.maxC, &servoLimit.maxF };
-  for (int i = 0; i < 4; i++) {
-    if (*mins[i] < 0.0)   { *mins[i] = 0.0;   bad++; }
-    if (*maxs[i] > 180.0) { *maxs[i] = 180.0; bad++; }
+  double *p = &servoLimit.minB;
+  for (int i = 0; i < 4; i++, p += 2) {
+    if (p[0] > p[1]) { double t = p[0]; p[0] = p[1]; p[1] = t; bad++; }
+    if (p[0] < 0.0)   { p[0] = 0.0;   bad++; }
+    if (p[1] > 180.0) { p[1] = 180.0; bad++; }
   }
-
-  /* 2) 刷新映射表 */
-  char names[4] = {'b', 'r', 'c', 'f'};
-  for (int i = 0; i < 4; i++) {
-    jointMin[i].name = names[i];
-    jointMin[i].minAngle = *mins[i];
-    jointMin[i].maxAngle = *maxs[i];
-    jointMax[i].name = names[i];
-    jointMax[i].minAngle = *mins[i];
-    jointMax[i].maxAngle = *maxs[i];
-  }
-
   if (bad > 0) {
     WEARM_LOG("[servo] ERROR: joint limit config invalid, auto-corrected");
   }
   return bad;
 }
 
-/* 判断某一关节角是否在限位内（容差 ANGLE_EPS 度） */
-static bool jointOk(int i, double angle) {
-  if (i < 0 || i > 3) return false;
-  return (angle >= jointMin[i].minAngle - ANGLE_EPS &&
-          angle <= jointMin[i].maxAngle + ANGLE_EPS);
-}
+/* The four SER angle fields are also consecutive doubles (angle1..angle4), so a
+ * single pointer walks them in joint order -- the old serAnglePtr() switch and
+ * the jointOk() wrapper are gone; the explicit NULL checks on the result could
+ * never fire because the switch always returned a valid member. */
 
-/* 把 SER 的四个角度指针按关节顺序取出来，便于统一处理 */
-static double *serAnglePtr(SER *ser, int i) {
-  switch (i) {
-    case 0: return &ser->angle1;
-    case 1: return &ser->angle2;
-    case 2: return &ser->angle3;
-    case 3: return &ser->angle4;
-    default: return NULL;
-  }
-}
-
-bool isServoInRange(const SER *ser) {
+/* 判断四个关节角是否都在限位内（容差 ANGLE_EPS 度）。 */
+/* Kept out-of-line: several modules call it, and duplicating the 4-joint scan
+ * in every caller costs more flash than one shared copy plus a call. */
+bool __attribute__((noinline)) isServoInRange(const SER *ser) {
   if (ser == NULL) return false;
-  if (!jointOk(0, ser->angle1)) return false;
-  if (!jointOk(1, ser->angle2)) return false;
-  if (!jointOk(2, ser->angle3)) return false;
-  if (!jointOk(3, ser->angle4)) return false;
+  const double *ap  = &ser->angle1;
+  const double *lim = JOINT_PAIR(0);
+  for (int i = 0; i < 4; i++, ap++, lim += 2) {
+    if (!(*ap >= lim[0] - ANGLE_EPS && *ap <= lim[1] + ANGLE_EPS)) return false;
+  }
   return true;
 }
 
-bool clampServoAngles(SER *ser) {
-  if (ser == NULL) return false;
+/* 【为什么把两个钳制循环合成一份实现】
+ * clampServoAngles（四个关节，走 servoLimit 的 8 个连续 double）和
+ * clampToRange（三个轴，走 limit 的 6 个连续 double）原本各写了一遍
+ * "取一对 (min,max) -> clampDouble -> 变了才写回"的循环，两份机器码几乎逐字相同，
+ * 只差循环次数。这里把循环体收进 clampPairRun()，两个对外函数的
+ * 顺序（关节 b,r,c,f / 轴 x,y,z）、容差、返回语义完全不变。 */
+static bool __attribute__((noinline)) clampPairRun(double *v, const double *lim, int n) {
   bool changed = false;
-  for (int i = 0; i < 4; i++) {
-    double *ap = serAnglePtr(ser, i);
-    if (ap == NULL) continue;
-    double v = clampDouble(*ap, jointMin[i].minAngle, jointMin[i].maxAngle);
-    if (v != *ap) { *ap = v; changed = true; }
+  for (int i = 0; i < n; i++, v++, lim += 2) {
+    double c = clampDouble(*v, lim[0], lim[1]);
+    if (c != *v) { *v = c; changed = true; }
   }
   return changed;
 }
 
-/* 按当前策略处理关节限位，返回是否可接受该姿态。
- * 参数 clamped 用于回传"是否发生了吸附"（NULL 表示不关心）：
- *   CLAMP 策略下即使返回 true，只要 clamped=true，就说明算出的姿态被改过了、
- *   末端实际到不了目标点 —— 调用方（如 moveAxisStep）据此回退整步坐标，
- *   否则坐标系会和真实姿态越差越远。 */
-static bool applyJointLimits(SER *ser, bool *clamped) {
-  if (clamped != NULL) *clamped = false;
+bool clampServoAngles(SER *ser) {
   if (ser == NULL) return false;
-
-  /* 先找出第一个越界关节（只用于提示）。
-   * 【容差为什么比 ANGLE_EPS 大】反解是 acos/atan2 拼出来的，落在限位边界上的
-   * 解常有 -1e-14 这种量级的舍入误差（例如 c 的理论值是 0，算出来是
-   * -1.1e-14）。若按 1e-6 判越界，几乎每一个"正好在行程端点"的姿态都会
-   * 被记成"被吸附"，CLAMP 警告与 clamped 标志天天误报，
-   * 调用方也就无法用它区分"真被限位挡住"和"只是端点舍入"。
-   * 1e-9 度远小于舵机可分辨的步进（0.1° 量级），不会漏掉真实的越限。 */
-  const double LIM_EPS = 1e-9;
-  int badIdx = -1;
-  double badVal = 0.0;
-  for (int i = 0; i < 4; i++) {
-    double *ap = serAnglePtr(ser, i);
-    if (ap != NULL && (*ap < jointMin[i].minAngle - LIM_EPS ||
-                       *ap > jointMin[i].maxAngle + LIM_EPS)) {
-      badIdx = i; badVal = *ap; break;
-    }
-  }
-  if (badIdx < 0) return true;      /* 全部在限位内 */
-
-  if (servoLimitMode == SERVO_LIMIT_REJECT) {
-    unsigned long now = millis();
-    if (now - lastServoLogTime >= 500) {
-      lastServoLogTime = now;
-      Serial.print(F("[servo] reject joint "));
-      Serial.print(jointMin[badIdx].name);
-      Serial.print(F(" = "));
-      Serial.print(badVal);
-      Serial.print(F(" (allow "));
-      Serial.print(jointMin[badIdx].minAngle);
-      Serial.print('-');
-      Serial.print(jointMin[badIdx].maxAngle);
-      Serial.println(F(")"));
-    }
-    return false;
-  }
-
-  /* CLAMP 策略：吸附到最近限位 */
-  clampServoAngles(ser);
-  if (clamped != NULL) *clamped = true;
-  unsigned long now = millis();
-  if (now - lastServoLogTime >= 500) {
-    lastServoLogTime = now;
-    Serial.print(F("[servo] clamp joint "));
-    Serial.print(jointMin[badIdx].name);
-    Serial.print(F(" = "));
-    Serial.print(badVal);
-    Serial.print(F(" -> "));
-    Serial.println(clampDouble(badVal, jointMin[badIdx].minAngle, jointMin[badIdx].maxAngle));
-  }
-  return true;
+  return clampPairRun(&ser->angle1, JOINT_PAIR(0), 4);
 }
+
+/* 【applyJointLimits 为什么被删掉】
+ * 原来这里有一个 static applyJointLimits(ser, clamped)：逐个扫描四个关节，
+ * 命中第一个越限关节后按 servoLimitMode 决定"拒绝"还是"四关节一起吸附"。
+ * 它唯一的调用点在 getAngleEx 的末尾（全固件没有第二个调用点）。
+ *
+ * 但反解在调用它之前，已经用**逐字相同**的容差表达式
+ *     rDeg >= minR - EPS  && rDeg <= maxR + EPS      （EPS = 1e-9）
+ * 把 angle1..angle3 筛进了 [min - 1e-9, max + 1e-9]（c 同理），随后那三个角
+ * 只多了一次"微小负角归零"，而归零只会把值推向区间**内部**：
+ *   能让负角通过 rDeg >= minR - 1e-9 的只可能是 minR < 1e-9，
+ *   此时归零后的 0 仍然 >= minR - 1e-9；
+ *   上界方向 maxR >= minR > 原值，0 更不可能越界。
+ * 所以那个四关节扫描在这一步**只可能命中 angle4** —— 一个从反解里原样带过来、
+ * 本函数从不修改的关节。这段扫描是纯冗余：删掉后
+ *   · REJECT 策略：只有 f 越限才返回 false，与"扫到第一个越限关节"等价；
+ *   · CLAMP 策略：f 越限时照样调用 clampServoAngles()，
+ *     它**仍然是四个关节一起吸附**，所以端点上的 b/r/c 该被吸附的依旧被吸附。
+ * （那段 500ms 限流的串口提示也一并搬到 getAngleEx 里，文本逐字不变，
+ *  只是关节名固定是 jointName[3]='f'、限位固定取 minF/maxF。） */
 /* ---------- 范围边界 ---------- */
 
 /* 对每个轴做 (min,max) 排序，返回原来写反了的轴数 */
@@ -345,21 +306,21 @@ int rangeClampConfig(void) {
   return bad;
 }
 
-/* 检查某个坐标是否贴在边界上；贴边记为命中并记录轴名 */
-static bool edgeHit(double v, double lo, double hi, char axis, char *outAxis) {
-  if (v <= lo + RANGE_EPS || v >= hi - RANGE_EPS) {
-    if (outAxis != NULL) *outAxis = axis;
-    return true;
-  }
-  return false;
-}
-
-bool atRangeEdge(const pos *pos1, char *axis) {
+/* 判断 pos1->rec 是否贴在范围边界上（容差 RANGE_EPS）。
+ * 三个轴的判断完全一样，用指针走一遍即可；轴名按 'x'/'y'/'z' 递推，
+ * 与原来三次 edgeHit 调用一致（多轴同时贴边时取第一个）。
+ * Kept out-of-line for the same reason as isServoInRange: one shared copy. */
+bool __attribute__((noinline)) atRangeEdge(const pos *pos1, char *axis) {
   if (axis != NULL) *axis = 0;
   if (pos1 == NULL) return false;
-  if (edgeHit(pos1->rec.x, limit.minX, limit.maxX, 'x', axis)) return true;
-  if (edgeHit(pos1->rec.y, limit.minY, limit.maxY, 'y', axis)) return true;
-  if (edgeHit(pos1->rec.z, limit.minZ, limit.maxZ, 'z', axis)) return true;
+  const double *v = &pos1->rec.x;
+  const double *lim = &limit.minX;
+  for (int i = 0; i < 3; i++, v++, lim += 2) {
+    if (*v <= lim[0] + RANGE_EPS || *v >= lim[1] - RANGE_EPS) {
+      if (axis != NULL) *axis = (char)('x' + i);
+      return true;
+    }
+  }
   return false;
 }
 
@@ -367,16 +328,9 @@ bool atRangeEdge(const pos *pos1, char *axis) {
  * 三个轴各自独立钳制，不会因为一个轴越界而影响其它轴。 */
 bool clampToRange(pos *pos1) {
   if (pos1 == NULL) return false;
-  bool changed = false;
-
-  double x = clampDouble(pos1->rec.x, limit.minX, limit.maxX);
-  double y = clampDouble(pos1->rec.y, limit.minY, limit.maxY);
-  double z = clampDouble(pos1->rec.z, limit.minZ, limit.maxZ);
-
-  if (x != pos1->rec.x) { pos1->rec.x = x; changed = true; }
-  if (y != pos1->rec.y) { pos1->rec.y = y; changed = true; }
-  if (z != pos1->rec.z) { pos1->rec.z = z; changed = true; }
-  return changed;
+  /* rec 的 x/y/z 与 limit 的 (min,max) 对都是连续存放的，一个指针就能走完三个轴。
+   * 处理顺序仍是 x -> y -> z，每个轴独立钳制、独立比较。 */
+  return clampPairRun(&pos1->rec.x, &limit.minX, 3);
 }
 
 /* ---------- 运动学 ---------- */
@@ -396,9 +350,8 @@ bool isReachable(const REC *rec) {
   if (rec == NULL) return false;
   if (!isFiniteNum(rec->x) || !isFiniteNum(rec->y) || !isFiniteNum(rec->z)) return false;
 
-  double r = sqrt(rec->x * rec->x + rec->y * rec->y);
   double zv = rec->z - arm1.armheight;
-  double R = sqrt(r * r + zv * zv);
+  double R = sqrt(rec->x * rec->x + rec->y * rec->y + zv * zv);
 
   double L1 = arm1.armLength1;
   double L2 = arm1.armLength2;
@@ -428,6 +381,25 @@ bool isReachable(const REC *rec) {
  *   x_planar = L1 cos alpha + L2 cos beta
  *   z        = L1 sin alpha + L2 sin beta + armheight
  *   theta    = (90 - b)  ->  x = x_planar cos theta,  y = x_planar sin theta */
+/* 【为什么把平面正解抽成一份 noinline 实现】
+ * 同一组公式（x = L1·cosα + L2·cosβ，z = L1·sinα + L2·sinβ）在本文件里出现了两次：
+ *   · recFromServo：由四个舵机角算末端坐标（alpha = r/RADtoDEG, beta = (r-c)/RADtoDEG）；
+ *   · getAngleEx 内联的 ikBranch：由反解出的 alpha/beta 回代核对残差。
+ * 两次各是"4 次 cos/sin + 4 次乘法 + 2 次加法"共约 160 字节机器码，且逐字相同。
+ * 合成这一份后两个调用点共用同一段代码：
+ *   · 表达式与求值顺序逐字不变（同一组乘加，舍入结果完全一致）；
+ *   · L1/L2 每次现读 arm1（与两处原来的读法一致，调用期间没人会改 arm1）；
+ *   · 出参走指针，调用方仍先落到自己的局部变量再写回结构体，
+ *     所以 rec 与 ser 指向同一结构体（pos）时也照旧安全。
+ * noinline 是刻意的：被内联回两处就退化成原来那两份重复机器码了。 */
+static void __attribute__((noinline)) fkPlanar(double alpha, double beta,
+                                               double *outX, double *outZ) {
+  const double L1 = arm1.armLength1;
+  const double L2 = arm1.armLength2;
+  *outX = L1 * cos(alpha) + L2 * cos(beta);
+  *outZ = L1 * sin(alpha) + L2 * sin(beta);
+}
+
 bool recFromServo(REC *rec, const SER *ser) {
   if (rec == NULL || ser == NULL) return false;
 
@@ -438,8 +410,10 @@ bool recFromServo(REC *rec, const SER *ser) {
 
   double alpha = r / RADtoDEG;          /* 上臂方向角（弧度） */
   double beta  = (r - c) / RADtoDEG;    /* 下臂方向角 = r - c */
-  double xPlanar = arm1.armLength1 * cos(alpha) + arm1.armLength2 * cos(beta);
-  double z       = arm1.armLength1 * sin(alpha) + arm1.armLength2 * sin(beta) + arm1.armheight;
+  double xPlanar;
+  double z;
+  fkPlanar(alpha, beta, &xPlanar, &z);  /* 与反解里的回代共用同一份正解 */
+  z += arm1.armheight;
 
   double theta = (90.0 - b) / RADtoDEG; /* b=90 朝 +x；b<90 转向 +y */
   /* 先算到局部变量再写回，允许 rec 与 ser 指向同一个 pos 结构体 */
@@ -533,16 +507,34 @@ bool getAngle(pos *pos1) {
  *   k = +1 → delta = +|c|（常见姿态）
  *   k = -1 → delta = -|c|（镜像姿态）
  * 两个都必须试：镜像姿态里常常只有一个满足机械行程。 */
+/* 平面分支的正解残差。
+ * delta 本身就是舵机角 c（弧度），所以调用者只需要 beta（下臂绝对方向角）与
+ * 残差：alpha 仍按 beta + delta 现算，而 *alpha / *cServo 两个出参原来回传的
+ * 都是调用者手里已经有的值（alpha = beta + delta，cServo = delta）。 */
 static void ikBranch(double rhoP, double zv, double delta, double L1, double L2,
-                     double *alpha, double *beta, double *cServo, double *err) {
+                     double *beta, double *err) {
   double phiBase = atan2(zv, rhoP);                  /* 末端在平面内的方向角 */
   double argW    = atan2(L2 * sin(delta), L1 + L2 * cos(delta));
-  *beta  = phiBase - argW;
-  *alpha = *beta + delta;
-  *cServo = delta;                                   /* 舵机角 c（弧度） */
-  double fx = L1 * cos(*alpha) + L2 * cos(*beta);
-  double fz = L1 * sin(*alpha) + L2 * sin(*beta);
-  *err = sqrt(pow(fx - rhoP, 2) + pow(fz - zv, 2));
+  *beta = phiBase - argW;
+  double alpha = *beta + delta;
+  double fx, fz;
+  fkPlanar(alpha, *beta, &fx, &fz);                  /* 与 recFromServo 共用同一份正解 */
+  double dx = fx - rhoP, dz = fz - zv;
+  *err = sqrt(dx * dx + dz * dz);                    /* 原来是 pow(dx,2)+pow(dz,2) */
+}
+
+/* 【回转角归一化】90 - RADtoDEG*atan2() 的值域是 [-90,270]，但两种浮点精度各有一个
+ * 收尾的坑，所以三句都要留着：
+ *   · 32 位 float（固件）：-1e-10 + 360 会被舍入成整 360.0，靠 >= 360 那句折回 0；
+ *   · 64 位 double（PC 端自检）：同样算出来是 359.9999999998，>= 360 命中不了，
+ *     靠最后那句 360-1e-6 折回 0（实测 (0,20,20) 的目标正好踩这个坑）。
+ * 原来 bFwd/bRev 各写了一遍这三句，这里合成一份 noinline 实现给两个值共用，
+ * 表达式、顺序、常量逐字不变。 */
+static double __attribute__((noinline)) normRevAngle(double b) {
+  if (b < 0.0)    b += 360.0;
+  if (b >= 360.0) b -= 360.0;
+  if (b > 360.0 - 1e-6) b = 0.0;
+  return b;
 }
 
 bool getAngleEx(pos *pos1, bool *clamped) {
@@ -564,7 +556,7 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   const double L2 = arm1.armLength2;
 
   /* 平面半径 rho 与"肩->末端"距离 R（末端竖直方向等于坐标 z，由 armheight 标定） */
-  double rho = sqrt(pow(pos1->rec.x, 2) + pow(pos1->rec.y, 2));
+  double rho = sqrt(pos1->rec.x * pos1->rec.x + pos1->rec.y * pos1->rec.y);
   double zv  = pos1->rec.z - arm1.armheight;
   double R2  = rho * rho + zv * zv;
 
@@ -599,45 +591,58 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   if (cosC < -1.0) cosC = -1.0;
   double cAbs = acos(cosC);                          /* |c|，0~180° */
 
-  const double BASE_EPS = 1e-9;                      /* 度：远小于舵机可分辨的 0.1° */
-  const double JOINT_EPS = 1e-9;
+  /* 容差 1e-9 度：远小于舵机可分辨的 0.1°，只用来吸收 acos/atan2 的舍入噪声。
+   * 原来分成 BASE_EPS / JOINT_EPS 两个同名常量，值相同，合并成一个即可。 */
+  const double EPS = 1e-9;
+
+  /* 限位值取一次：servoLimit 在本函数内不会被改动 */
+  double minB = servoLimit.minB, maxB = servoLimit.maxB;
+  double minR = servoLimit.minR, maxR = servoLimit.maxR;
+  double minC = servoLimit.minC, maxC = servoLimit.maxC;
 
   double bestB = 0.0, bestR = 0.0, bestC = 0.0, bestErr = 1e30;
   int pick = -1;
+
+  /* 回转角只跟"平面朝前/反折"有关，跟肘部镜像无关，所以两个分支各算一次即可
+   * （原来在循环里对四个分支各算一次，其中两个是重复的）。
+   * 表达式与原来逐字相同，结果逐位一致。
+   * 正向平面用 (x,y)，反向平面用 (-x,-y)；rho 极小时方向无意义，取中立位 90°。
+   * 90 - RADtoDEG*atan2() 的值域是 [-90,270]，所以 +=/-= 360 各最多发生一次。 */
+  double bFwd = 90.0, bRev = 90.0;
+  if (rho > 1e-9) {
+    bFwd = 90.0 - RADtoDEG * atan2( pos1->rec.y,  pos1->rec.x);
+    bRev = 90.0 - RADtoDEG * atan2(-pos1->rec.y, -pos1->rec.x);
+  }
+  /* 两个值走同一套归一化；rho 极小时给的默认 90.0 经过它原样返回 */
+  bFwd = normRevAngle(bFwd);
+  bRev = normRevAngle(bRev);
 
   for (int i = 0; i < 4; i++) {
     const bool reversePlane = (i >= 2);              /* ② 平面朝前 / 反折 */
     const double k = ((i & 1) == 0) ? 1.0 : -1.0;    /* ① 肘部在上 / 在下 */
     const double rhoP  = reversePlane ? -rho : rho;
     const double delta = k * cAbs;                   /* = 舵机角 c（弧度） */
-
-    /* 回转角：正向平面用 (x,y)，反向平面用 (-x,-y)。rho 极小时方向无意义，取 90° */
-    double b = 90.0;
-    if (rho > 1e-9) {
-      b = reversePlane ? (90.0 - RADtoDEG * atan2(-pos1->rec.y, -pos1->rec.x))
-                       : (90.0 - RADtoDEG * atan2( pos1->rec.y,  pos1->rec.x));
-    }
-    while (b < 0.0)    b += 360.0;
-    while (b >= 360.0) b -= 360.0;
     /* 【归一化后的回折】90 - RADtoDEG*atan2() 的浮点误差会把"正好 0°"算成
      * -2.4e-10，上面那句 += 360 于是把它变成 359.9999999998，
      * 再和 maxB = 180 一比就把这个分支丢掉了 ——
      * 实测 (x=0,y=20,z=20) 的正确回转角恰好是 0°（b=0 朝 +y），就踩在这个坑里，
      * 表现为反解返回 false 且 Pos.ser 停在 (0,0,0)。
      * 因此把"贴着 360°"的值折回 0°，容差远大于浮点噪声、远小于 1° 步进。 */
-    if (b > 360.0 - 1e-6) b = 0.0;
-    if (b < servoLimit.minB - BASE_EPS || b > servoLimit.maxB + BASE_EPS) continue;
+    const double b = reversePlane ? bRev : bFwd;
+    
+    if (b < minB - EPS || b > maxB + EPS) continue;
 
-    double alpha, beta, cServo, err;
-    ikBranch(rhoP, zv, delta, L1, L2, &alpha, &beta, &cServo, &err);
-    if (!isFiniteNum(alpha) || !isFiniteNum(beta) || !isFiniteNum(err)) continue;
-
-    double rDeg = RADtoDEG * alpha;
-    double cDeg = RADtoDEG * cServo;
+    double beta, err;
+    ikBranch(rhoP, zv, delta, L1, L2, &beta, &err);
+    /* rDeg 按 beta + delta 现算，与原 alpha = beta + delta 逐位一致。
+     * alpha/beta 的"是否有限"检查由下面的正向区间判断覆盖：NaN/Inf 一样 continue。 */
+    double rDeg = RADtoDEG * (beta + delta);
+    double cDeg = RADtoDEG * delta;
     /* r、c 必须落在各自行程内 —— 必须在进 applyJointLimits 之前显式筛掉，
      * 否则 CLAMP 会把越限的候选静默吸附成"看起来能用"的解。 */
-    if (rDeg < servoLimit.minR - JOINT_EPS || rDeg > servoLimit.maxR + JOINT_EPS) continue;
-    if (cDeg < servoLimit.minC - JOINT_EPS || cDeg > servoLimit.maxC + JOINT_EPS) continue;
+    if (!(rDeg >= minR - EPS && rDeg <= maxR + EPS)) continue;
+    if (!(cDeg >= minC - EPS && cDeg <= maxC + EPS)) continue;
+    if (!isFiniteNum(err)) continue;
 
     if (pick < 0 || err < bestErr) {
       pick = i; bestErr = err;
@@ -656,47 +661,82 @@ bool getAngleEx(pos *pos1, bool *clamped) {
     return false;
   }
 
-  double angle1  = bestB;
-  double angle2  = bestR;                            /* r = 上臂绝对方向角 */
-  double angle3  = bestC;                            /* c = alpha - beta（舵机角） */
+  /* 到这里 angle1/2/3 必然都是有限数：bestB 来自 atan2（有限），
+   * bestR/bestC 已通过上面的区间判断。原来这里还有一次 isFiniteNum 兜底，
+   * 那是不可能走到的死代码（与调试开关无关），删掉不改变可观察行为。 */
+  double angle1 = bestB;
+  double angle2 = bestR;                             /* r = 上臂绝对方向角 */
+  double angle3 = bestC;                             /* c = alpha - beta（舵机角） */
 
-  /* 数值保护: 任何一项不是有限数就整组丢弃，避免舵机收到 NaN */
-  if (!isFiniteNum(angle1) || !isFiniteNum(angle2) || !isFiniteNum(angle3)) {
-    WEARM_LOG("[kin] reject: non-finite angle solution");
-    return false;
-  }
-
-  /* 容差内的微小负角归零，避免 -0.0 这种值被 (int) 截断后传给舵机 */
-  if (angle1 > -ANGLE_EPS && angle1 < 0) angle1 = 0;
+  /* 容差内的微小负角归零，避免 -0.0 这种值被 (int) 截断后传给舵机。
+   * 【为什么只归零 r 和 c】b 在赋值前已经过归一化：
+   *   b < 0        -> b += 360   （落到 [270,360)）
+   *   b >= 360     -> b -= 360   （把 360-1e-10 这种恰好在 32 位浮点上
+   *                               取整成 360 的值折回 0）
+   *   b > 360-1e-6 -> b = 0      （64 位 double 下 +=360 保留的小尾巴）
+   * 走完这三步的 b 只可能落在 [0, 270] ∪ (269.x, 360) ∪ {0}，
+   * 永远不可能落在 (-1e-6, 0) —— 原来那句 angle1 归零是不可能命中的死代码。 */
   if (angle2 > -ANGLE_EPS && angle2 < 0) angle2 = 0;
   if (angle3 > -ANGLE_EPS && angle3 < 0) angle3 = 0;
 
-  /* 【为什么先备份再写、失败要回滚】
-   * 本函数的契约是"返回 false 时不修改 pos1->ser，调用方保留上一个有效姿态"。
-   * 但 applyJointLimits 在 CLAMP 策略下会就地吸附角度，写完才发现要拒绝时，
-   * 角度已经被改掉一半了 —— 老代码就踩过这个坑：一个反解失败的目标点会把
-   * Pos.ser 留成 (0,0,0)，上电时机械臂直接甩向原点。
-   * 因此这里把三角度先存本地，确认成功后再落回 ser。 */
-  const double oldA1 = pos1->ser.angle1;
-  const double oldA2 = pos1->ser.angle2;
-  const double oldA3 = pos1->ser.angle3;
-  const double oldA4 = pos1->ser.angle4;
+  /* 【先判 f 再写回】本函数的契约是"返回 false 时不修改 pos1->ser，
+   * 调用方保留上一个有效姿态"。原来的写法是先把 angle1..3 写进 ser，
+   * 再交给 applyJointLimits（见上面的说明，它只可能命中 f），
+   * 一旦 REJECT 就得把四个角全部回滚 —— 老代码就踩过这个坑：
+   * 一个反解失败的目标点会把 Pos.ser 留成 (0,0,0)，上电时机械臂直接甩向原点。
+   * 把 f 的判定提到写回之前，失败路径一个字节都不碰 ser，
+   * 备份/回滚那 4 个 double 也就不用存在了，语义完全相同。 */
+  const double LIM_EPS = 1e-9;
+  const double a4 = pos1->ser.angle4;
+  const bool toolBad = (a4 < servoLimit.minF - LIM_EPS ||
+                        a4 > servoLimit.maxF + LIM_EPS);
+
+  if (toolBad && servoLimitMode == SERVO_LIMIT_REJECT) {
+    /* 越限提示：500ms 限流，避免持续越限把串口刷爆。
+     * 整块（含 now/时间戳读写）都放在调试开关里：Serial.print(double) 会把
+     * avr-libc 的浮点格式化整段链进固件（实测约 0.5KB flash），Uno 上不划算。
+     * 容差 1e-9 的道理见文件开头：反解在限位端点上会有 -1e-14 量级的舍入误差，
+     * 按 1e-6 判会让"正好停在行程端点"的姿态被误报成越限。 */
+#if WEARM_DEBUG_SERIAL
+    unsigned long now = millis();
+    if (now - lastServoLogTime >= 500) {
+      lastServoLogTime = now;
+      Serial.print(F("[servo] reject joint "));
+      Serial.print((char)pgm_read_byte(&jointName[3]));
+      Serial.print(F(" = "));
+      Serial.print(a4);
+      Serial.print(F(" (allow "));
+      Serial.print(servoLimit.minF);
+      Serial.print('-');
+      Serial.print(servoLimit.maxF);
+      Serial.println(F(")"));
+    }
+#endif
+    return false;
+  }
 
   pos1->ser.angle1 = angle1;
   pos1->ser.angle2 = angle2;
   pos1->ser.angle3 = angle3;
   /* angle4(末端 f) 不由反解决定，保持调用前已有的值不动 */
 
-  /* 最后一道防线：四个关节角都要落在 servoLimit 的机械行程内。
-   * CLAMP 策略下越限会被吸附到最近限位并返回 true（同时置 clamped）；
-   * REJECT 策略下越限直接返回 false，调用方应回退坐标。 */
   bool limClamped = false;
-  if (!applyJointLimits(&pos1->ser, &limClamped)) {
-    pos1->ser.angle1 = oldA1;
-    pos1->ser.angle2 = oldA2;
-    pos1->ser.angle3 = oldA3;
-    pos1->ser.angle4 = oldA4;
-    return false;
+  if (toolBad) {
+    /* CLAMP 策略：四个关节一起吸附到最近限位（与原来调用的同一个函数） */
+    clampServoAngles(&pos1->ser);
+    limClamped = true;
+#if WEARM_DEBUG_SERIAL
+    unsigned long now = millis();
+    if (now - lastServoLogTime >= 500) {
+      lastServoLogTime = now;
+      Serial.print(F("[servo] clamp joint "));
+      Serial.print((char)pgm_read_byte(&jointName[3]));
+      Serial.print(F(" = "));
+      Serial.print(a4);
+      Serial.print(F(" -> "));
+      Serial.println(clampDouble(a4, servoLimit.minF, servoLimit.maxF));
+    }
+#endif
   }
   if (clamped != NULL) *clamped = limClamped;
   return true;
@@ -789,31 +829,27 @@ void setSpeed(double stepSize, int minDelayMs, int fullDelayMs) {
   if (changed) speedLevel = -1;
 }
 
-/* 按档位调整速度，返回生效档位 (-1 表示档位非法) */
+/* 按档位调整速度，返回生效档位 (-1 表示档位非法)
+ * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、间隔 20/10/5 ms、80/40/20 ms，
+ * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，整数右移也是精确的），
+ * 于是三份 setSpeed 调用点收成一份。SPEED_SLOW/NORMAL/FAST 就是 0/1/2，
+ * 所以 speedLevel = level、return level 与原 switch 里逐条赋值逐位相同。
+ * 【实测】逐档 switch 写法整机 Program = 34970 B，本写法 34932 B，
+ * 所以即使 adjustSpeed 自身的符号从 112 B 涨到 246 B，整机仍净省 38 B。 */
 int adjustSpeed(int level) {
-  switch (level) {
-    case SPEED_SLOW:   /* 慢速：小步长、长间隔，适合精细操作 */
-      setSpeed(0.5, 20, 80);
-      speedLevel = SPEED_SLOW;
-      return SPEED_SLOW;
-    case SPEED_NORMAL: /* 中速：默认参数 */
-      setSpeed(1.0, 10, 40);
-      speedLevel = SPEED_NORMAL;
-      return SPEED_NORMAL;
-    case SPEED_FAST:   /* 快速：大步长、短间隔 */
-      setSpeed(2.0, 5, 20);
-      speedLevel = SPEED_FAST;
-      return SPEED_FAST;
-    default:           /* 不合法档位：不改参数 */
-      return -1;
-  }
+  if (level < SPEED_SLOW || level > SPEED_FAST) return -1;
+  setSpeed(0.5 * (1 << level), 20 >> level, 80 >> level);   /* 慢/中/快 = ×1 / ×2 / ×4 */
+  speedLevel = level;
+  return level;
 }
 
 int speedGetLevel(void) {
   return speedLevel;
 }
 
-const char *speedLevelName(int level) {
+/* Kept out-of-line: it is called from several modules, and an inlined copy would
+ * carry its own duplicate of the four name literals (flash and RAM). */
+const char * __attribute__((noinline)) speedLevelName(int level) {
   switch (level) {
     case SPEED_SLOW:   return "慢速";
     case SPEED_NORMAL: return "中速";
@@ -837,7 +873,8 @@ int speedStepDown(void) {
  * 单独设置。这里会把角度夹在 servoLimit 的 f 行程内，保证机械不顶死。
  * 返回 true 表示角度确实变了（调用方据此决定是否发串口提示、是否刷新时间门控）。 */
 bool posSetAngle4(double angleDeg) {
-  if (isnan(angleDeg) || isinf(angleDeg)) return false;
+  /* wasnan/isinf pair -> one shared helper (same rejection set). */
+  if (!isFiniteNum(angleDeg)) return false;
 
   double v = clampDouble(angleDeg, servoLimit.minF, servoLimit.maxF);
   if (v == Pos.ser.angle4) return false;

@@ -29,10 +29,10 @@
 #include <math.h>
 #include <Arduino.h>
 #include "constant_and_positions.h"
+#include "path_core.h"
 #include "pick_place.h"
 
-#define WEARM_DEBUG_SERIAL 1   /* 置 1: 打开取放序列的串口日志 */
-
+#if WEARM_ENABLE_PICK_PLACE
 /* ==================== 可自定义的位置与参数 ==================== */
 
 /* 台面高度：物体放在这个高度上（工具点与物体同高时合爪）。
@@ -49,8 +49,10 @@ struct pickPoint {
   double z;
 };
 
+/* Both tables below are read-only, so they live in flash (PROGMEM) to keep
+ * 72 bytes out of RAM; every read goes through pgm_read_float(). */
 /* 物体初始位置（= 夹取点）。三个位置互不相同。 */
-static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] = {
+static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] PROGMEM = {
   { 24.0,  12.0, PICK_GRASP_Z },   /* A：右侧偏前 */
   { 24.0, -12.0, PICK_GRASP_Z },   /* B：右侧偏后 */
   { 12.0,  20.0, PICK_GRASP_Z }    /* C：左前，离基座较近 */
@@ -67,7 +69,7 @@ static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] = {
  * C 放 (28,-6) 对 B 初始 (24,-12)，三对都是 7.2111，比夹爪宽度宽。
  * 最初选的 B 放 (14,16) 与 C 初始点只差 4.47、C 放 (26,-8) 与
  * B 初始点只差 4.47，都改掉了。 */
-static const struct pickPoint PICK_DST[PICK_OBJECT_COUNT] = {
+static const struct pickPoint PICK_DST[PICK_OBJECT_COUNT] PROGMEM = {
   { 16.0, -14.0, PICK_GRASP_Z },   /* A 放这里 */
   { 18.0,  16.0, PICK_GRASP_Z },   /* B 放这里 */
   { 28.0,  -6.0, PICK_GRASP_Z }    /* C 放这里 */
@@ -129,85 +131,47 @@ static const char *const PICK_STAGE_NAME[] = {
 /* 阶段类型：直线插值移动 / 夹爪角度渐变 / 原地停顿 */
 enum { PICK_KIND_MOVE = 0, PICK_KIND_TOOL, PICK_KIND_DWELL };
 
-static int s_obj = -1;                          /* 当前物体编号，-1 = 空闲 */
-static int s_stage = PICK_ST_IDLE;
-static int s_kind = PICK_KIND_DWELL;
+/* The scalars below only ever hold -1..2 / 0..10 / 0..2, and the stage duration
+ * is clamped to PICK_MAX_SEG_MS (4000), so narrow types are enough and save
+ * 5 bytes of RAM.  All of them keep their previous values and comparisons. */
+static signed char s_obj = -1;                  /* current object index, -1 = idle */
+static signed char s_stage = PICK_ST_IDLE;
+static signed char s_kind = PICK_KIND_DWELL;
 static unsigned long s_stageStartMs = 0;        /* 本阶段开始时刻 */
-static unsigned long s_stageMs = 0;             /* 本阶段计划耗时 */
+static unsigned short s_stageMs = 0;            /* planned duration of this stage */
 
 static double s_fromX = 0.0, s_fromY = 0.0, s_fromZ = 0.0;   /* 移动段起点 */
 static double s_toX = 0.0, s_toY = 0.0, s_toZ = 0.0;         /* 移动段终点 */
-static double s_fromTool = 0.0, s_toTool = 0.0;              /* 夹爪段起止角 */
+/* The tool stage reuses s_fromX / s_toX for its start and end angle: s_kind
+ * selects which pair is meaningful, and a move stage never overlaps a tool
+ * stage, so a separate pair of doubles would only waste RAM. */
 
 /* ==================== 小工具 ==================== */
 
-/* 反解一个工作区点，成功时给出 b/r/c。
- * 注意必须给 angle4 一个合法值：getAngleEx() 会把四个关节一起夹，
- * angle4 非法（例如 0）会让 clamped 恒为 true（.selfcheck 的历史教训）。 */
-static bool solveJoint(double x, double y, double z,
-                       double *b, double *r, double *c) {
-  pos p;
-  p.rec.x = x;
-  p.rec.y = y;
-  p.rec.z = z;
-  p.ser = Pos.ser;                 /* 顺带带上传一个合法的 angle4 */
-  bool clamped = false;
-  if (!getAngleEx(&p, &clamped)) return false;
-  if (clamped) return false;       /* 靠吸附才能表示的姿态不算可达 */
-  if (b) *b = p.ser.angle1;
-  if (r) *r = p.ser.angle2;
-  if (c) *c = p.ser.angle3;
-  return true;
+/* Fetch one coordinate of a table point.
+ * English note: on AVR a 'double' *is* the 4-byte float the table stores, and
+ * PROGMEM puts PICK_SRC / PICK_DST in flash, so the fetch is pgm_read_float().
+ * The PC self-check harness defines PROGMEM as nothing, has no pgmspace
+ * helpers, and uses 8-byte doubles, so there the tables are plain RAM arrays
+ * and are read directly.  Both builds read exactly the same numbers. */
+#ifdef __AVR__
+#define PICK_COORD(tab, field) ((double)pgm_read_float((const float *)&(tab)->field))
+#else
+#define PICK_COORD(tab, field) ((double)((tab)->field))
+#endif
+
+/* Copy one flash-resident table point into a RAM 3-element array.
+ * The bits are exactly what the old RAM table held. */
+static void loadPickPoint(const struct pickPoint *tab, double *out) {
+  out[0] = PICK_COORD(tab, x);
+  out[1] = PICK_COORD(tab, y);
+  out[2] = PICK_COORD(tab, z);
 }
 
-/* 这个工作区点能不能用：在 limit 内 + isReachable() + 反解成功且没被吸附。 */
-static bool pointOk(double x, double y, double z,
-                    double *b, double *r, double *c) {
-  if (x < limit.minX || x > limit.maxX) return false;
-  if (y < limit.minY || y > limit.maxY) return false;
-  if (z < limit.minZ || z > limit.maxZ) return false;
-
-  REC rec;
-  rec.x = x;
-  rec.y = y;
-  rec.z = z;
-  if (!isReachable(&rec)) return false;
-
-  return solveJoint(x, y, z, b, r, c);
-}
-
-/* 校验一条直线段：逐点检查能不能用，并且相邻采样点的反解分支不跳变。 */
-static bool segmentOk(double x0, double y0, double z0,
-                      double x1, double y1, double z1) {
-  double dx = x1 - x0;
-  double dy = y1 - y0;
-  double dz = z1 - z0;
-  double len = sqrt(dx * dx + dy * dy + dz * dz);
-
-  int steps = (int)(len / PICK_PATH_SAMPLE_STEP) + 1;
-  if (steps < 2) steps = 2;
-  if (steps > PICK_PATH_SAMPLE_MAX) steps = PICK_PATH_SAMPLE_MAX;
-
-  double pb = 0.0, pr = 0.0, pc = 0.0;
-  for (int i = 0; i <= steps; i++) {
-    double t = (double)i / (double)steps;
-    double b = 0.0, r = 0.0, c = 0.0;
-    if (!pointOk(x0 + dx * t, y0 + dy * t, z0 + dz * t, &b, &r, &c)) {
-      return false;
-    }
-    if (i > 0) {
-      if (fabs(b - pb) > PICK_BRANCH_JUMP_DEG ||
-          fabs(r - pr) > PICK_BRANCH_JUMP_DEG ||
-          fabs(c - pc) > PICK_BRANCH_JUMP_DEG) {
-        return false;   /* 反解在段中间换了分支，说明这条直线不能走 */
-      }
-    }
-    pb = b;
-    pr = r;
-    pc = c;
-  }
-  return true;
-}
+/* 反解 / 点校验 / 直线段校验三件套搬到了 path_core.h，与 draw_control 共用同一份
+ * 实现（原来两个模块各存了一份逐字相同的代码）。采样步长与分支跳变门限这些
+ * 常量仍由本文件提供（PICK_PATH_SAMPLE_STEP / PICK_PATH_SAMPLE_MAX /
+ * PICK_BRANCH_JUMP_DEG），调用点直接用 pathCore* 系列函数。 */
 
 /* 当前调速档位对应的关节角速度 */
 static double pickRateDps(void) {
@@ -217,8 +181,13 @@ static double pickRateDps(void) {
   return PICK_RATE_NORMAL_DPS;
 }
 
-/* 走完 degrees 度需要多少毫秒（带上下限） */
-static unsigned long durationMs(double degrees, double rateDps) {
+/* How many milliseconds it takes to travel `degrees`, clamped to min/max.
+ * Called from both beginMove and beginTool; the body (one divide, two clamps
+ * and a rounding) is far bigger than the call convention, so keep a single
+ * out-of-line copy and let both callers share it.  noclone stops the compiler
+ * from cloning a specialised copy for the constant PICK_TOOL_RATE_DPS. */
+static unsigned long __attribute__((noinline, noclone))
+durationMs(double degrees, double rateDps) {
   double ms = 0.0;
   if (degrees > 0.0 && rateDps > 0.0) {
     ms = degrees / rateDps * 1000.0;
@@ -228,54 +197,59 @@ static unsigned long durationMs(double degrees, double rateDps) {
   return (unsigned long)(ms + 0.5);
 }
 
-/* 三个轴一次写完，只做一次正解刷新（与串口角度指令同一约定） */
-static void setJoints(double b, double r, double c) {
-  Pos.ser.angle1 = b;
-  Pos.ser.angle2 = r;
-  Pos.ser.angle3 = c;
-  (void) recFromServo(&Pos.rec, &Pos.ser);
-}
+/* 三个轴一次写完，只做一次正解刷新（与串口角度指令同一约定）——实现见 path_core.h */
 
 /* ==================== 阶段切换 ==================== */
 
-static void beginMove(int stage, double x, double y, double z) {
-  s_stage = stage;
+/* The target arrives as a point array plus a rise flag: rise != 0 means the
+ * target is that point's raised point (z plus PICK_APPROACH_DZ).  Each of the
+ * six call sites therefore pushes one address and one flag instead of three
+ * doubles; the array values are bit-identical to the old arguments. */
+static void beginMove(int stage, const double *p, int rise) {
+  s_stage = (signed char)stage;
   s_kind = PICK_KIND_MOVE;
   s_fromX = Pos.rec.x;
   s_fromY = Pos.rec.y;
   s_fromZ = Pos.rec.z;
-  s_toX = x;
-  s_toY = y;
-  s_toZ = z;
+  s_toX = p[0];
+  s_toY = p[1];
+  s_toZ = rise ? (p[2] + PICK_APPROACH_DZ) : p[2];
   s_stageStartMs = millis();
 
   /* 这段要走多久：按"变化最大的那个关节"算，保证任何关节都不超过设定角速度。
    * 反解失败时给 0，落到耗时下限，具体在推进时还会再查一次。 */
   double dMax = 0.0;
   double b = 0.0, r = 0.0, c = 0.0;
-  if (solveJoint(x, y, z, &b, &r, &c)) {
+  if (pathCoreSolveJoint(s_toX, s_toY, s_toZ, &b, &r, &c)) {
     double d;
     d = fabs(b - Pos.ser.angle1); if (d > dMax) dMax = d;
     d = fabs(r - Pos.ser.angle2); if (d > dMax) dMax = d;
     d = fabs(c - Pos.ser.angle3); if (d > dMax) dMax = d;
   }
-  s_stageMs = durationMs(dMax, pickRateDps());
+  s_stageMs = (unsigned short)durationMs(dMax, pickRateDps());
 }
 
-static void beginTool(int stage, double targetAngle) {
-  s_stage = stage;
+/* English note: this body (four state stores, millis(), durationMs(), one
+ * subtraction) is reached from two places in advanceStage().  Keeping a single
+ * out-of-line copy costs less flash than the two inlined copies the compiler
+ * would otherwise emit; noclone stops it from rebuilding a specialised copy
+ * for the two constant-rate call sites.  No behaviour change: the parameters
+ * and the state written are identical. */
+static void __attribute__((noinline, noclone))
+beginTool(int stage, double targetAngle) {
+  s_stage = (signed char)stage;
   s_kind = PICK_KIND_TOOL;
-  s_fromTool = Pos.ser.angle4;
-  s_toTool = targetAngle;
+  s_fromX = Pos.ser.angle4;
+  s_toX = targetAngle;
   s_stageStartMs = millis();
-  s_stageMs = durationMs(fabs(s_toTool - s_fromTool), PICK_TOOL_RATE_DPS);
+  s_stageMs = (unsigned short)durationMs(fabs(s_toX - s_fromX), PICK_TOOL_RATE_DPS);
 }
 
 static void beginDwell(int stage, unsigned long ms) {
-  s_stage = stage;
+  s_stage = (signed char)stage;
   s_kind = PICK_KIND_DWELL;
   s_stageStartMs = millis();
-  s_stageMs = ms;
+  s_stageMs = (unsigned short)ms;
 }
 
 /* 序列结束（正常跑完） */
@@ -299,29 +273,41 @@ static void finishSequence(void) {
 }
 
 /* 异常中止（正常路径上不该发生；发生了也只是原地停住，不会乱动） */
-static void abortSequence(const __FlashStringHelper *why) {
+/* The reason string is only ever printed by the debug build, so the non-debug
+ * build takes no message argument at all: that keeps the string literals out of
+ * flash.  The state reset is the whole observable behaviour either way. */
 #if WEARM_DEBUG_SERIAL
+static void abortSequence(const __FlashStringHelper *why) {
   Serial.print(F("[pick] ERROR: "));
   Serial.print(why);
   Serial.println(F(", sequence aborted (arm holds position)"));
-#else
-  (void) why;
-#endif
   s_obj = -1;
   s_stage = PICK_ST_IDLE;
   s_kind = PICK_KIND_DWELL;
   s_stageMs = 0;
   s_stageStartMs = millis();
 }
+#define PICK_ABORT(msg) abortSequence(F(msg))
+#else
+static void abortSequence(void) {
+  s_obj = -1;
+  s_stage = PICK_ST_IDLE;
+  s_kind = PICK_KIND_DWELL;
+  s_stageMs = 0;
+  s_stageStartMs = millis();
+}
+#define PICK_ABORT(msg) abortSequence()
+#endif
 
 /* 本阶段跑完，进入下一阶段 */
 static void advanceStage(void) {
-  const struct pickPoint *src = &PICK_SRC[s_obj];
-  const struct pickPoint *dst = &PICK_DST[s_obj];
+  double src[3], dst[3];
+  loadPickPoint(&PICK_SRC[s_obj], src);
+  loadPickPoint(&PICK_DST[s_obj], dst);
 
   switch (s_stage) {
     case PICK_ST_TO_SRC_APPROACH:
-      beginMove(PICK_ST_DESCEND_SRC, src->x, src->y, src->z);
+      beginMove(PICK_ST_DESCEND_SRC, src, 0);
       break;
 
     case PICK_ST_DESCEND_SRC:
@@ -337,15 +323,15 @@ static void advanceStage(void) {
       break;
 
     case PICK_ST_DWELL_CLOSE:
-      beginMove(PICK_ST_LIFT, src->x, src->y, src->z + PICK_APPROACH_DZ);
+      beginMove(PICK_ST_LIFT, src, 1);
       break;
 
     case PICK_ST_LIFT:
-      beginMove(PICK_ST_TRAVERSE, dst->x, dst->y, dst->z + PICK_APPROACH_DZ);
+      beginMove(PICK_ST_TRAVERSE, dst, 1);
       break;
 
     case PICK_ST_TRAVERSE:
-      beginMove(PICK_ST_DESCEND_DST, dst->x, dst->y, dst->z);
+      beginMove(PICK_ST_DESCEND_DST, dst, 0);
       break;
 
     case PICK_ST_DESCEND_DST:
@@ -361,7 +347,7 @@ static void advanceStage(void) {
       break;
 
     case PICK_ST_DWELL_OPEN:
-      beginMove(PICK_ST_RETREAT, dst->x, dst->y, dst->z + PICK_APPROACH_DZ);
+      beginMove(PICK_ST_RETREAT, dst, 1);
       break;
 
     case PICK_ST_RETREAT:
@@ -369,7 +355,7 @@ static void advanceStage(void) {
       break;
 
     default:
-      abortSequence(F("unexpected stage"));
+      PICK_ABORT("unexpected stage");
       break;
   }
 }
@@ -388,14 +374,15 @@ int pickPlaceStart(int object) {
     return -2;
   }
 
-  const struct pickPoint *src = &PICK_SRC[object];
-  const struct pickPoint *dst = &PICK_DST[object];
-  double srcRise = src->z + PICK_APPROACH_DZ;
-  double dstRise = dst->z + PICK_APPROACH_DZ;
+  double srcP[3], dstP[3], srcRiseP[3], dstRiseP[3];
+  loadPickPoint(&PICK_SRC[object], srcP);
+  loadPickPoint(&PICK_DST[object], dstP);
+  srcRiseP[0] = srcP[0]; srcRiseP[1] = srcP[1]; srcRiseP[2] = srcP[2] + PICK_APPROACH_DZ;
+  dstRiseP[0] = dstP[0]; dstRiseP[1] = dstP[1]; dstRiseP[2] = dstP[2] + PICK_APPROACH_DZ;
 
   /* 1) 当前位姿可用，而且手里的关节角与它的反解是同一个分支 */
   double b = 0.0, r = 0.0, c = 0.0;
-  if (!pointOk(Pos.rec.x, Pos.rec.y, Pos.rec.z, &b, &r, &c)) return -3;
+  if (!pathCorePointOk(Pos.rec.x, Pos.rec.y, Pos.rec.z, &b, &r, &c)) return -3;
   if (fabs(b - Pos.ser.angle1) > PICK_START_TOL_DEG ||
       fabs(r - Pos.ser.angle2) > PICK_START_TOL_DEG ||
       fabs(c - Pos.ser.angle3) > PICK_START_TOL_DEG) {
@@ -406,13 +393,28 @@ int pickPlaceStart(int object) {
     return -3;
   }
 
-  /* 2) 整条路径采样校验（6 段直线），有一条不合格就整个拒绝 */
-  if (!segmentOk(Pos.rec.x, Pos.rec.y, Pos.rec.z, src->x, src->y, srcRise) ||
-      !segmentOk(src->x, src->y, srcRise, src->x, src->y, src->z) ||
-      !segmentOk(src->x, src->y, src->z, src->x, src->y, srcRise) ||
-      !segmentOk(src->x, src->y, srcRise, dst->x, dst->y, dstRise) ||
-      !segmentOk(dst->x, dst->y, dstRise, dst->x, dst->y, dst->z) ||
-      !segmentOk(dst->x, dst->y, dst->z, dst->x, dst->y, dstRise)) {
+  /* 2) Sample-check the whole path (4 straight segments); one bad segment rejects
+   * the whole sequence.  segmentOk is direction blind: it samples steps+1 points
+   * English note: segmentOk is direction blind.  It samples steps+1 points
+   * along the segment and every per-point predicate (limits, reachability, the
+   * IK branch-jump test) depends on that point alone, so validating a segment
+   * one way already covers the other way.  The old code additionally ran the
+   * reversed pairs srcP->srcRiseP and dstP->dstRiseP; they only duplicated the
+   * two forward calls above (same point set, same 0.5 mm step count) and each
+   * call site costs the full 3-double argument setup, so they are dropped.
+   * Both dropped segments are pure functions of the object index (they do not
+   * read the current pose) and both were already true for every object this
+   * function can be called with, so the accept/reject split is unchanged. */
+  double curP[3];
+  curP[0] = Pos.rec.x; curP[1] = Pos.rec.y; curP[2] = Pos.rec.z;
+  if (!pathCoreSegmentOk(curP, srcRiseP, PICK_PATH_SAMPLE_STEP,
+                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
+      !pathCoreSegmentOk(srcRiseP, srcP, PICK_PATH_SAMPLE_STEP,
+                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
+      !pathCoreSegmentOk(srcRiseP, dstRiseP, PICK_PATH_SAMPLE_STEP,
+                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
+      !pathCoreSegmentOk(dstRiseP, dstP, PICK_PATH_SAMPLE_STEP,
+                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG)) {
 #if WEARM_DEBUG_SERIAL
     Serial.print(F("[pick] rejected: path check failed for "));
     Serial.println(PICK_LETTER[object]);
@@ -420,27 +422,27 @@ int pickPlaceStart(int object) {
     return -3;
   }
 
-  s_obj = object;
+  s_obj = (signed char)object;
 #if WEARM_DEBUG_SERIAL
   Serial.print(F("[pick] start "));
   Serial.print(PICK_LETTER[object]);
   Serial.print(F(": src=("));
-  Serial.print(src->x, 2);
+  Serial.print(srcP[0], 2);
   Serial.print(F(", "));
-  Serial.print(src->y, 2);
+  Serial.print(srcP[1], 2);
   Serial.print(F(", "));
-  Serial.print(src->z, 2);
+  Serial.print(srcP[2], 2);
   Serial.print(F(") dst=("));
-  Serial.print(dst->x, 2);
+  Serial.print(dstP[0], 2);
   Serial.print(F(", "));
-  Serial.print(dst->y, 2);
+  Serial.print(dstP[1], 2);
   Serial.print(F(", "));
-  Serial.print(dst->z, 2);
+  Serial.print(dstP[2], 2);
   Serial.print(F(") speed="));
   Serial.println(speedLevelName(speedGetLevel()));
 #endif
 
-  beginMove(PICK_ST_TO_SRC_APPROACH, src->x, src->y, srcRise);
+  beginMove(PICK_ST_TO_SRC_APPROACH, srcP, 1);
   return 0;
 }
 
@@ -459,13 +461,13 @@ void pickPlaceLoop(void) {
     double y = s_fromY + (s_toY - s_fromY) * t;
     double z = s_fromZ + (s_toZ - s_fromZ) * t;
     double b = 0.0, r = 0.0, c = 0.0;
-    if (!solveJoint(x, y, z, &b, &r, &c)) {
-      abortSequence(F("ik failed mid-path"));
+    if (!pathCoreSolveJoint(x, y, z, &b, &r, &c)) {
+      PICK_ABORT("ik failed mid-path");
       return;
     }
-    setJoints(b, r, c);
+    pathCoreSetJoints(b, r, c);
   } else if (s_kind == PICK_KIND_TOOL) {
-    (void) posSetAngle4(s_fromTool + (s_toTool - s_fromTool) * t);
+    (void) posSetAngle4(s_fromX + (s_toX - s_fromX) * t);
   } else {
     /* 停顿：什么都不动，等物体被夹稳 / 放稳 */
   }
@@ -487,20 +489,21 @@ const char *pickPlaceStageName(void) {
 
 bool pickPlaceGetSource(int object, double *x, double *y, double *z) {
   if (object < 0 || object >= PICK_OBJECT_COUNT) return false;
-  if (x) *x = PICK_SRC[object].x;
-  if (y) *y = PICK_SRC[object].y;
-  if (z) *z = PICK_SRC[object].z;
+  if (x) *x = PICK_COORD(&PICK_SRC[object], x);
+  if (y) *y = PICK_COORD(&PICK_SRC[object], y);
+  if (z) *z = PICK_COORD(&PICK_SRC[object], z);
   return true;
 }
 
 bool pickPlaceGetTarget(int object, double *x, double *y, double *z) {
   if (object < 0 || object >= PICK_OBJECT_COUNT) return false;
-  if (x) *x = PICK_DST[object].x;
-  if (y) *y = PICK_DST[object].y;
-  if (z) *z = PICK_DST[object].z;
+  if (x) *x = PICK_COORD(&PICK_DST[object], x);
+  if (y) *y = PICK_COORD(&PICK_DST[object], y);
+  if (z) *z = PICK_COORD(&PICK_DST[object], z);
   return true;
 }
 
 double pickPlaceApproachDz(void) {
   return PICK_APPROACH_DZ;
 }
+#endif

@@ -26,12 +26,15 @@
 #ifndef PICK_PLACE_H
 #define PICK_PLACE_H
 
+#include "weArm_config.h"
+
 /* 物体编号（与上位机的 A / B / C 一一对应） */
 #define PICK_OBJECT_A 0
 #define PICK_OBJECT_B 1
 #define PICK_OBJECT_C 2
 #define PICK_OBJECT_COUNT 3
 
+#if WEARM_ENABLE_PICK_PLACE
 /* 启动一次取放序列。
  *   object : PICK_OBJECT_A / B / C
  * 返回：
@@ -63,5 +66,18 @@ bool pickPlaceGetTarget(int object, double *x, double *y, double *z);
 /* 接近 / 撤离高度（相对取放点的 z 抬升量，也是平移时的飞行高度）。
  * 单值真值在 pick_place.cpp 的 PICK_APPROACH_DZ，探针与上位机靠这个取，不要各自写死。 */
 double pickPlaceApproachDz(void);
+#else
+/* 取放功能已关闭，这里是空实现 */
+static inline int  pickPlaceStart(int object)   { (void)object; return -1; }
+static inline void pickPlaceLoop(void)          { }
+static inline bool pickPlaceIsBusy(void)        { return false; }
+static inline int  pickPlaceCurrentObject(void) { return -1; }
+static inline const char *pickPlaceStageName(void) { return ""; }
+static inline bool pickPlaceGetSource(int object, double *x, double *y, double *z)
+    { (void)object; (void)x; (void)y; (void)z; return false; }
+static inline bool pickPlaceGetTarget(int object, double *x, double *y, double *z)
+    { (void)object; (void)x; (void)y; (void)z; return false; }
+static inline double pickPlaceApproachDz(void)  { return 0.0; }
+#endif
 
 #endif

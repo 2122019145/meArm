@@ -42,6 +42,7 @@
 #include "Arduino.h"
 #include "constant_and_positions.h"
 #include "serial_protocol.h"
+#include "weArm_config.h"
 
 /* 按键编号（顺序与物理按键 1~4 一致，也就是 buttonName() 的下标） */
 #define BTN_COUNT      4
@@ -50,6 +51,7 @@
 #define BTN_KEY_PLAY   2   /* 按键3：播放 */
 #define BTN_KEY_HOME   3   /* 按键4：回中 */
 
+#if WEARM_ENABLE_BUTTONS
 /* 初始化四个按键脚（在 setup() 里调用一次，放在 joystickSetup() 之后）。 */
 void buttonSetup(void);
 
@@ -99,5 +101,23 @@ bool buttonControlLocked(void);
 /* 按键名（"按键1 循环执行" 等）与当前状态名（"空闲"/"录制中"/"播放中"/"回中中"）。 */
 const char *buttonName(int key);
 const char *buttonStateName(void);
+#else
+/* 按键模块已禁用，提供空桩函数接口 */
+static inline void buttonSetup(void)                 {}
+static inline void buttonLoop(void)                  {}
+static inline int  buttonHandleCommand(char c)       { (void)c; return -1; }
+static inline bool buttonIsCommandChar(char c)       { (void)c; return false; }
+static inline int  buttonPickNext(void)              { return -1; }
+static inline bool buttonIsRecording(void)           { return false; }
+static inline bool buttonPlaybackActive(void)        { return false; }
+static inline int  buttonRecordingEntries(void)      { return 0; }
+static inline unsigned long buttonRecordingMs(void)  { return 0UL; }
+static inline double buttonRecordingTravel(void)     { return 0.0; }
+static inline bool buttonHasRecording(void)          { return false; }
+static inline bool buttonControlBusy(void)           { return false; }
+static inline bool buttonControlLocked(void)         { return false; }
+static inline const char *buttonName(int key)       { (void)key; return ""; }
+static inline const char *buttonStateName(void)     { return ""; }
+#endif
 
 #endif /* BUTTON_CONTROL_H */

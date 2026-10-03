@@ -34,7 +34,7 @@
 /* ---------- 编译开关 ---------- */
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 需与 constant_and_positions.cpp 中的同名开关保持一致。 */
-#define WEARM_DEBUG_SERIAL 1
+#include "weArm_config.h"
 #define WEARM_JOY_DEBUG    0   /* 置 1 时每次移动都打印各轴与角度，调试用 */
 #define WEARM_HAVE_BUTTONS 0   /* 置 1 时启用板载摇杆按键（本套件板上无按键） */
 
@@ -66,10 +66,47 @@
 /* 关节编号（用于 lastStepTime[] 与调试打印，顺序与 JOY_ACT_* 位图一致） */
 enum JointIdx { JIDX_BASE = 0, JIDX_SHOULDER, JIDX_ELBOW, JIDX_TOOL, JIDX_COUNT };
 
+/* "Angle decreases" direction code of each joint axis, indexed like JointIdx (the
+ * tool axis never looks this table up).  The "angle increases" code of an axis is
+ * exactly this value + 1, because move.h declares MoveDir / JointDir in adjacent
+ * pairs (JOINT_B_LEFT/RIGHT = 3/4, JOINT_R_FWD/BWD = 5/6, JOINT_C_UP/DOWN = 1/2).
+ * Storing only the "decreases" side halves the table; JOY_DIR_* codes in the
+ * header keep their published values.  PROGMEM because AVR RAM is precious. */
+static const unsigned char JOY_DIR_NEG[JIDX_COUNT] PROGMEM = {
+  (unsigned char)JOINT_B_LEFT,
+  (unsigned char)JOINT_R_FWD,
+  (unsigned char)JOINT_C_UP,
+  0
+};
+
+/* English note: on AVR the table above lives in flash, so it is fetched with
+ * pgm_read_byte().  The PC self-check harness defines PROGMEM as nothing and
+ * has no pgmspace helpers, so there it is an ordinary RAM array read directly.
+ * Both builds read the same four bytes. */
+#ifdef __AVR__
+#define JOY_DIRNEG(i) ((int)pgm_read_byte(&JOY_DIR_NEG[(i)]))
+#else
+#define JOY_DIRNEG(i) ((int)JOY_DIR_NEG[(i)])
+#endif
+
+/* joyState 里四路原始 ADC 值按 sx, sy, tx, ty 声明，而关节顺序是
+ * base, shoulder, elbow, tool —— 后两个正好对调。这张 4 字节的表把"关节下标"
+ * 换算成"原始值下标"，于是幅度与原始值两组字段都能跟着同一个 i 顺序走，
+ * 循环里不必再往栈上抄一份 raw[] 副本（每个轴一对 ldd/std，很不划算）。 */
+static const unsigned char JOY_RAW_SLOT[JIDX_COUNT] PROGMEM = { 0, 1, 3, 2 };
+
+#ifdef __AVR__
+#define JOY_RAWSLOT(i) ((int)pgm_read_byte(&JOY_RAW_SLOT[(i)]))
+#else
+#define JOY_RAWSLOT(i) ((int)JOY_RAW_SLOT[(i)])
+#endif
+
 /* ---------- 内部状态 ---------- */
 /* 每个关节各自记录上次步进时刻：一个关节被推住不放，不会拖慢其它关节。 */
 static unsigned long lastStepTime[JIDX_COUNT] = { 0, 0, 0, 0 };
+#if WEARM_DEBUG_SERIAL
 static unsigned long lastBlockLogTime = 0;  /* 上次打印被挡提示的时刻（限流） */
+#endif
 
 #if WEARM_HAVE_BUTTONS
 static bool sw1Prev = false;
@@ -207,10 +244,14 @@ static int speedIntervalMs(int mag) {
   int fullDelay = speed.fullDelayMs;
   if (fullDelay <= minDelay) return minDelay;
 
-  double ratio = (double)mag / (double)JOY_FULL_SCALE;
-  if (ratio < 0.0) ratio = 0.0;
-  if (ratio > 1.0) ratio = 1.0;
-  return minDelay + (int)(ratio * (fullDelay - minDelay));
+  /* 原来是把 ratio 夹到 [0,1]（两次浮点比较 + __cmpsf2/__gesf2 调用），
+   * 现在改成夹 mag 这个整数：ratio = mag / JOY_FULL_SCALE，
+   * ratio < 0 <=> mag < 0，ratio > 1 <=> mag > JOY_FULL_SCALE —— 逐条等价，
+   * 对整数 mag 来说浮点除法的舍入不会改变这两个判断的结果。 */
+  if (mag < 0) mag = 0;
+  else if (mag > JOY_FULL_SCALE) mag = JOY_FULL_SCALE;
+
+  return minDelay + (int)((double)mag / (double)JOY_FULL_SCALE * (double)(fullDelay - minDelay));
 }
 
 /* ---------- 末端舵机 (angle4 / f) ---------- */
@@ -221,10 +262,16 @@ static int speedIntervalMs(int mag) {
 static bool toolStep(int amp, int sign) {
   if (amp <= 0) return false;
 
-  double ratio = (double)amp / (double)JOY_FULL_SCALE;
-  if (ratio > 1.0) ratio = 1.0;
-  double step = speed.stepSize * ratio * (double)sign;
-  if (step == 0.0) return false;
+  /* 与上面同理：把 ratio 夹到 <= 1 换成"把 amp 夹到 <= JOY_FULL_SCALE"，
+     整数比较省掉一次 __gesf2 调用。 */
+  if (amp > JOY_FULL_SCALE) amp = JOY_FULL_SCALE;
+
+  double step = speed.stepSize * ((double)amp / (double)JOY_FULL_SCALE);
+  /* sign 只会是 +1 / -1：乘 ±1.0f 与"按符号取负"在 IEEE 下逐位等价
+     （x * -1 == -x，x * 1 == x），省掉一次 __floatsisf + __mulsf3。
+     step 为 0 时 posSetAngle4() 会因为"值没变"自己返回 false，
+     非有限值也由它挡掉，所以这里不再单独判 step == 0.0。 */
+  if (sign < 0) step = -step;
 
   return posSetAngle4(Pos.ser.angle4 + step);
 }
@@ -232,25 +279,31 @@ static bool toolStep(int amp, int sign) {
 /* ---------- 指示灯 ---------- */
 
 /* 板载 LED：任一关节在动就按快闪，全部静止则灭。
- * 旧版的 PLANE/VERT 模式指示已随模式切换一并去掉。 */
+ * 旧版的 PLANE/VERT 模式指示已随模式切换一并去掉。
+ *
+ * 这里直接写 PORTB5（D13）而不是 digitalWrite()：理由与 joystickSetup() 里相同，
+ * digitalWrite() 在 Uno 上是真实函数调用，sbi/cbi 两条指令与它语义一致。 */
 static void updateLed(bool moving) {
   if (!moving) {
-    digitalWrite(PIN_LED_MODE, LOW);
+    PORTB &= (unsigned char)~_BV(PB5);
     return;
   }
   bool on = ((millis() / (unsigned long)LED_FAST_MS) % 2UL) == 0UL;
-  digitalWrite(PIN_LED_MODE, on ? HIGH : LOW);
+  if (on) PORTB |= (unsigned char)_BV(PB5);
+  else    PORTB &= (unsigned char)~_BV(PB5);
 }
 
 /* ---------- 对外主循环 ---------- */
 
 void joystickSetup(void) {
-  pinMode(JOY_LX_PIN, INPUT);
-  pinMode(JOY_LY_PIN, INPUT);
-  pinMode(JOY_RX_PIN, INPUT);
-  pinMode(JOY_RY_PIN, INPUT);
-  pinMode(PIN_LED_MODE, OUTPUT);
-  digitalWrite(PIN_LED_MODE, LOW);
+  /* 四路 ADC 引脚设为输入（无上拉）、板载 LED 设为输出并灭灯。
+   * 这里直接写 AVR 寄存器：pinMode()/digitalWrite() 在 Uno 上都是非内联库函数，
+   * 五次调用光压参 + call 就要三十多字节，而下面三句寄存器操作是等价的
+   * （A0..A3 = PC0..PC3，D13 = PB5，这是 ATmega328P 上的固定映射）。
+   * PORTC 复位后为 0，pinMode(INPUT) 顺手清掉的上拉位本来就是 0，故不再重复清。 */
+  DDRC &= (unsigned char)~(_BV(PC0) | _BV(PC1) | _BV(PC2) | _BV(PC3));
+  DDRB |= (unsigned char)_BV(PB5);
+  PORTB &= (unsigned char)~_BV(PB5);
 
 #if WEARM_DEBUG_SERIAL
   JLOG("[joy] MeArm dual-stick JOINT control ready (A0-A3)");
@@ -258,8 +311,14 @@ void joystickSetup(void) {
   JLOG("[joy] A3 -> c angle3 elbow  A2 -> f angle4 tool");
 #endif
 
+  /* 四个关节的"上次步进时刻"清零到当前时刻。
+   * 注意：不要把 millis() 提到循环外只取一次 —— 实测那样做 GCC 会把这 4 次
+   * 迭代完全展开成 16 条直写（sts），从 58 字节涨到 100 字节。
+   * 原来的写法（循环体里调用）反而让编译器保留指针自增写法，更省。 */
   for (int i = 0; i < JIDX_COUNT; i++) lastStepTime[i] = millis();
+#if WEARM_DEBUG_SERIAL
   lastBlockLogTime = 0;
+#endif
 #if WEARM_HAVE_BUTTONS
   sw1Prev = false;
   sw2Prev = false;
@@ -272,71 +331,84 @@ void joystickLoop(void) {
   struct joyState st;
   joystickReadState(&st);
 
-  unsigned long now = millis();
+    /* 2) Evaluate the exclusivity test once: while a pick/place sequence, a button
+   *    playback/homing run or a draw task is active, the stick never steps any
+   *    axis (all three own b/r/c and the tool angle).  The old code repeated
+   *    this test inside the loop body (once per axis) and again in the closing
+   *    expression (three more times); now it is computed once.
+   *    buttonControlLocked() deliberately excludes "recording": recording is
+   *    meant to capture your stick motion, so the stick must stay live.
+   *    The five-point teach of a draw task does not come through here: while
+   *    teaching, drawControlLocked() is true as well, so this test blocks the
+   *    stick and draw_control.cpp reads it itself for cartesian jogging
+   *    (see drawLoop). */
+  /* 三个判据都是"只读一个静态标志"的纯函数，没有副作用，所以用按位或
+   * 把三个结果一次算完，省掉 || 的短路分支（结果完全相同）。 */
+  bool locked = pickPlaceIsBusy() | buttonControlLocked() | drawControlLocked();
   bool moved = false;
 
-  /* 2) 按"关节 | 偏转量 | 原始轴值 | 该关节的计时槽"逐轴步进。
-   *    每个关节自己一套时间门控：一个关节推到头或在慢速档，
-   *    不会把另一个关节也拖慢。偏转越大步越慢（安全）。 */
-  /* 【方向约定】上臂 r 与下臂 c 这两路推杆方向是上机实测后调转过的：
-   *   上臂 A1 前推 = r 减小、后拉 = r 增大；
-   *   下臂 A3 前推 = c 减小、后拉 = c 增大。
-   *   改动方式是把这两路的 dirPos/dirNeg 对调；JOY_DIR_FWD/UP 等方向码
-   *   本身的含义（"该关节角度增大"）没变，只是哪一侧推杆对应哪个码换了。
-   *   基座 A0 与末端 A2 两路的方向没有改动。 */
-  const struct {
-    int amp;        /* 该轴扣死区后的偏转量，0 = 没推 */
-    int raw;        /* 该轴原始 ADC 值，用来判方向 */
-    int dirPos;     /* 角度增大方向编码 */
-    int dirNeg;     /* 角度减小方向编码 */
-    int idx;        /* lastStepTime 下标 */
-  } axes[JIDX_COUNT] = {
-    { st.base,     st.sx, JOINT_B_RIGHT, JOINT_B_LEFT,  JIDX_BASE     },
-    { st.shoulder, st.sy, JOINT_R_BWD,   JOINT_R_FWD,   JIDX_SHOULDER },
-    { st.elbow,    st.ty, JOINT_C_DOWN,  JOINT_C_UP,    JIDX_ELBOW    },
-    { st.tool,     st.tx, 0,             0,             JIDX_TOOL     }
-  };
+  /* English note: the four joint axes are visited in JointIdx order (base,
+   * shoulder, elbow, tool).  joyState keeps the four amplitudes at consecutive
+   * offsets in exactly that order, so a single pointer walks them with no stack
+   * copy; the four raw ADC values (declared sx, sy, tx, ty) are reached through
+   * the same index via JOY_RAW_SLOT, which fixes up the last two.  Each axis
+   * keeps its own time gate, so one axis held against a limit or running in the
+   * slow band never slows the others down.  The order itself is load bearing:
+   * when two axes pass their gate in the same round, the first move shifts the
+   * pose the second one is checked against, so it must not be reordered. */
+  const int *amp  = &st.base;
+  const int *rawp = &st.sx;
 
-  for (int i = 0; i < JIDX_COUNT; i++) {
-    /* 让位：取放序列执行期间、按键模块正在播放/回中期间、绘图任务执行期间，
-     * 摇杆一律不步进（三者都独占 b/r/c 与末端角）。
-     * 注意 buttonControlLocked() 不包含"录制中"——录制就是要录你推摇杆的动作，
-     * 那时候摇杆必须照常可用。
-     * 绘图任务里的"五点示教"不走这里：示教时 drawControlLocked() 也是真，摇杆被
-     * 这一条挡住，由 draw_control.cpp 自己读摇杆做笛卡尔点动（见 drawLoop）。 */
-    if (pickPlaceIsBusy() || buttonControlLocked() || drawControlLocked()) break;
+  if (!locked) {
+    unsigned long now = millis();
 
-    if (axes[i].amp <= 0) continue;
+    for (int i = 0; i < JIDX_COUNT; i++) {
+      if (amp[i] <= 0) continue;
 
-    int interval = speedIntervalMs(axes[i].amp);
-    if (now - lastStepTime[axes[i].idx] < (unsigned long)interval) continue;
+      int interval = speedIntervalMs(amp[i]);
+      if (now - lastStepTime[i] < (unsigned long)interval) continue;
 
-    if (i == JIDX_TOOL) {
-      /* 末端夹具：角度增大 = 张开，减小 = 收回。
-       * 方向约定与备份里的旧手柄版一致（D:\wearm-backup-cartesian-20261002-205737\
-       * joystick_control.cpp 里写作 tx > JOY_CENTER ? -1 : 1，注释为"右推关闭、左推张开"）：
-       * 右推 = 收回（角度减小），左推 = 张开（角度增大）。
-       * 上机若觉得反了，把这里的三元式对调即可。 */
-      int sign = (axes[i].raw > JOY_CENTER) ? -1 : 1;
-      if (toolStep(axes[i].amp, sign)) {
-        moved = true;
+      int raw = rawp[JOY_RAWSLOT(i)];
+
+            /* Direction convention: the two stick channels of the upper arm r and the
+       * lower arm c were swapped after testing on the real machine:
+       *   upper arm A1 pushed forward = r decreases, pulled back = r increases;
+       *   lower arm A3 pushed forward = c decreases, pulled back = c increases.
+       * So the base/shoulder/elbow slots of JOY_DIR_NEG[] hold
+       * JOINT_B_LEFT / JOINT_R_FWD / JOINT_C_UP, and the "angle increases" side
+       * is that value + 1.  The meaning of the JOY_DIR_FWD/UP codes themselves
+       * ("this joint angle increases") is unchanged; only which side of the
+       * stick maps to which code.  Base A0 and tool A2 are untouched. */
+      if (i == JIDX_TOOL) {
+                /* Tool gripper: a larger angle opens it, a smaller one closes it.  The
+         * convention matches the old handset version in the backup
+         * (D:\wearm-backup-cartesian-20261002-205737\joystick_control.cpp writes
+         * tx > JOY_CENTER ? -1 : 1, commented "push right closes, push left
+         * opens"): push right = close (angle decreases), push left = open
+         * (angle increases).  If it feels inverted on the machine, swap the two
+         * branches of this ternary. */
+        int sign = (raw > JOY_CENTER) ? -1 : 1;
+        if (toolStep(amp[i], sign)) {
+          moved = true;
+        } else {
+          logBlocked(F("[joy] blocked: tool at servo limit"));
+        }
       } else {
-        logBlocked(F("[joy] blocked: tool at servo limit"));
+                /* Joint step: moveJointStep clamps to servoLimit and refreshes Pos.rec */
+        int dirNeg = JOY_DIRNEG(i);
+        int dir = (raw > JOY_CENTER) ? (dirNeg + 1) : dirNeg;
+        int res = moveJointStep(dir, speed.stepSize);
+        if (res == MOVE_OK) {
+          moved = true;
+        } else if (res == MOVE_AT_LIMIT) {
+          logBlocked(F("[joy] blocked: joint at travel limit"));
+        } else if (res == MOVE_UNREACHABLE) {
+          logBlocked(F("[joy] blocked: position out of workspace"));
+        }
       }
-    } else {
-      /* 关节角步进：moveJointStep 自带 servoLimit 夹取与正解坐标刷新 */
-      int dir = (axes[i].raw > JOY_CENTER) ? axes[i].dirPos : axes[i].dirNeg;
-      int res = moveJointStep(dir, speed.stepSize);
-      if (res == MOVE_OK) {
-        moved = true;
-      } else if (res == MOVE_AT_LIMIT) {
-        logBlocked(F("[joy] blocked: joint at travel limit"));
-      } else if (res == MOVE_UNREACHABLE) {
-        logBlocked(F("[joy] blocked: position out of workspace"));
-      }
+            /* Reset the time gate either way, so holding a stick still never floods. */
+      lastStepTime[i] = now;
     }
-    /* 无论成功还是被限位都重置计时，避免顶住不放时刷串口 */
-    lastStepTime[axes[i].idx] = now;
   }
 
 #if WEARM_JOY_DEBUG
@@ -356,9 +428,12 @@ void joystickLoop(void) {
   }
 #endif
 
-  /* 3) 指示灯：本轮有任何关节在动 -> 快闪；否则灭。
-   *    取放序列执行期间、按键模块播放/回中期间、绘图任务执行期间摇杆被独占
-   *    （moved 恒为 false），但关节确实一直在走，所以把这些"别人在驱动机械臂"的
-   *    状态也算作在动，否则那十几秒/几分钟灯是灭的，看着像死机。 */
-  updateLed(moved || pickPlaceIsBusy() || buttonControlLocked() || drawControlLocked());
+    /* 3) Indicator LED: fast blink while any joint moves this round, off when all
+   *    are still.  While a pick/place sequence, a button playback/homing run or a
+   *    draw task owns the arm the stick is locked (moved stays false) but the
+   *    joints really do move, so those "someone else drives the arm" states count
+   *    as moving too; otherwise the LED would be dark for those tens of seconds
+   *    and look like a hang.  locked is the result computed above, reused here
+   *    instead of calling the three predicates again. */
+  updateLed(moved || locked);
 }

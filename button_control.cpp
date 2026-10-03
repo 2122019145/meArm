@@ -1,46 +1,45 @@
 /*
- * button_control.cpp -- 四个按键功能的全部实现（这是本版唯一新增的"按键"实现文件）
+ * button_control.cpp -- implementation of the four on-board buttons.
  *
- * 接口与使用说明见 button_control.h。这里只补充实现层面的约定：
+ * The public interface is documented in button_control.h.  Implementation notes:
  *
- *   1) 硬件：按键 1~4 分别接 D2~D5，一律 INPUT_PULLUP，按下读到 LOW。
- *      软件消抖 BTN_DEBOUNCE_MS，并且只认"按下沿"，松手不触发。
+ *   1) Hardware: buttons 1~4 are wired to D2~D5, INPUT_PULLUP, a press reads LOW.
+ *      Software debounce is BTN_DEBOUNCE_MS and only the press edge acts.
  *
- *   2) 录制格式（1024 字节的定长缓冲，不动态分配）：
- *        struct btnRecEntry { uint8_t code; int8_t arg; };
- *        code  0x00~0x03 -> 对应关节(基座/上臂/下臂/末端)，arg 是"相对上一条事件的
- *                          角度增量"，单位 0.5 度（BTN_ANGLE_UNIT = 2.0 单位/度）
- *        code  0xFF      -> 等待，arg 是"等待多少个 tick"（1~127），这段时间没动
- *        code  bit 0x80  -> 本条是"新一个采样周期"的第一条条目：回放时先把时间轴
- *                          推进 1 个 tick 再应用它。
- *      "新周期标志"是为了省缓冲：一个周期内有动作时，时间推进被塞进该周期第一条
- *      增量条目里，而不是每个周期都写一条 WAIT(1)。于是每个周期最多只花
- *      "动了几个关节"条，而不是"1 + 动了几个关节"条。
- *      容量（BTN_TICK_MS = 100ms，512 条缓冲）：
- *        单关节连续推   -> 1 条/周期 -> 512 周期 -> 51.2 秒
- *        双关节连续推   -> 2 条/周期 -> 256 周期 -> 25.6 秒
- *        三关节连续推   -> 3 条/周期 -> 170 周期 -> 17.0 秒
- *        四关节连续推   -> 4 条/周期 -> 128 周期 -> 12.8 秒（最坏情况，仍 > 10 秒）
- *        几乎不动       -> 每条 WAIT 最多 127 周期 = 12.7 秒，最省
- *      （历史教训：早先每周期都写一条 WAIT(1)，四关节连续推只能录 4.1 秒，
- *        达不到"大于 10 秒"的要求就必然被判废。）
+ *   2) Recording format (fixed 384-byte buffer, no dynamic allocation):
+ *      one packed record per BTN_TICK_MS (100 ms) sampling tick holds the angle
+ *      delta of all four joints, 6 signed bits each (unit = 0.5 deg):
+ *         bits  0.. 5  joint 0 (base)      delta in recording units
+ *         bits  6..11  joint 1 (upper arm)
+ *         bits 12..17  joint 2 (forearm)
+ *         bits 18..23  joint 3 (end effector)
+ *      BTN_REC_ENTRIES = 128 records x 3 bytes = 384 bytes = 128 ticks = 12.8 s,
+ *      which is still more than BTN_REC_MIN_MS (10 s).  Every tick gets exactly
+ *      one record, moving or not, so the playback time axis is the exact
+ *      recording timeline; an all-zero record simply means "no motion".
+ *      A joint delta wider than the 6-bit field (+-32 units = +-16 deg per tick)
+ *      is clamped, but s_snap[] follows the *emitted* position rather than the
+ *      real one, so the remainder is carried into the next ticks: the recorded
+ *      total displacement stays exact and only a very fast move arrives a tick
+ *      or two later during playback.
  *
- *   3) 保存校验（两条缺一不可，都不满足就丢弃并串口报明原因）：
- *        时长 > BTN_REC_MIN_MS（10 秒，严格大于）
- *        末端在 x/y/z 上的最大位移 >= BTN_REC_MIN_TRAVEL（10.0）
- *      注意：新录制一开始就复用了同一块缓冲，所以"录了一半觉得不好、又结束了
- *      一次不达标的录制"会把上一次的录制数据一起冲掉。这是为了在 Uno 的 2KB
- *      SRAM 里做出尽可能长的录制时间而做的取舍，串口在开始录制时会明确提示。
+ *   3) Save validation (both must hold, otherwise the recording is dropped):
+ *         duration > BTN_REC_MIN_MS (10 s, strictly greater)
+ *         end-effector travel on x/y/z >= BTN_REC_MIN_TRAVEL (10.0)
+ *      A new recording reuses the same buffer from its first tick on, so a
+ *      rejected recording also invalidates the previous one.  This keeps the
+ *      longest possible recording inside the 2 KB SRAM of the Uno; the serial
+ *      port says so when a recording starts.
  *
- *   4) 播放/回中前都先做一次线性插值（BTN_RAMP_MS）把机械臂平滑摆到目标位姿，
- *      避免从当前姿态"跳"过去。插值在关节空间做，只改角度、不做反解，
- *      因此不会出现中途不可达的问题。
+ *   4) Both playback and homing first ramp (BTN_RAMP_MS) smoothly to the target
+ *      pose, in joint space (no inverse kinematics, so it can never be
+ *      unreachable on the way).
  *
- *   5) 想让位关系（详见 button_control.h 末尾）：
- *      录制期间摇杆必须可用；播放/回中期间摇杆必须让位；
- *      串口动作指令在"录制/播放/回中"期间一律被 buttonHandleCommand() 拒掉，
- *      但 N/R/P/M 这四个字符本身要在 serial_protocol.cpp 的忙守卫里豁免，
- *      否则录制中想发 R 结束录制都不会被受理。
+ *   5) Arbitration (see the end of button_control.h):
+ *      the joystick must stay live while recording; playback and homing take it
+ *      over; serial motion commands are rejected by buttonHandleCommand() while
+ *      recording / playing / homing, but N/R/P/M themselves stay exempt in the
+ *      busy guard of serial_protocol.cpp so that R can still end a recording.
  */
 #include "Arduino.h"
 #include "constant_and_positions.h"
@@ -49,105 +48,85 @@
 #include "button_control.h"
 #include "draw_control.h"
 
-/* 与 constant_and_positions.cpp / serial_protocol.cpp 保持一致：1 = 打调试日志 */
-#define WEARM_DEBUG_SERIAL 1
+#if WEARM_ENABLE_BUTTONS
 
-/* ---------------- 可自定义的参数（改这里就行，不用动下面的逻辑） ---------------- */
+/* ---------------- tunables ---------------- */
 
-/* 按键引脚：D2/D3/D4/D5 是这块板子上唯一空闲好接的四个数字脚
- * （D0/D1 串口、D6~D9 舵机、D13 指示灯、A0~A3 摇杆）。 */
+/* Button pins: D2/D3/D4/D5 are the only four spare easy-to-wire digital pins
+ * on this board (D0/D1 serial, D6~D9 servos, D13 led, A0~A3 joystick). */
 #define BTN_PIN_CYCLE   2
 #define BTN_PIN_RECORD  3
 #define BTN_PIN_PLAY    4
 #define BTN_PIN_HOME    5
 
-#define BTN_DEBOUNCE_MS     25UL      /* 按键消抖时间 */
-#define BTN_TICK_MS         100UL     /* 录制采样周期：100ms 是"最坏情况仍能录满 10 秒"的取值
-                                       * （512 条 / 最多 4 条每周期 = 128 周期 = 12.8 秒） */
-#define BTN_RAMP_MS         1500UL    /* 播放/回中前的平滑插值时长 */
-#define BTN_REC_MIN_MS      10000UL   /* 录制时长下限（要求"大于"10 秒） */
-#define BTN_REC_MIN_TRAVEL  10.0      /* 末端最小位移，小于它算"没有明显位移" */
-#define BTN_REC_ENTRIES     512       /* 录制条目上限（512 * 2 = 1024 字节 SRAM） */
-#define BTN_ANGLE_UNIT      2.0       /* 1 度 = 2 个记录单位（即单位 = 0.5 度） */
-#define BTN_WAIT_CODE       0xFF      /* 条目 type：等待（这段时间没有动作） */
-#define BTN_WAIT_MAX        127       /* 单条等待最多表达 127 个 tick */
-#define BTN_TICK_FLAG       0x80      /* 条目 code 的 bit7：本周期的时间推进放在这条里 */
+#define BTN_DEBOUNCE_MS     25UL      /* button debounce time */
+#define BTN_TICK_MS         100UL     /* recording sampling period */
+#define BTN_RAMP_MS         1500UL    /* smooth ramp before playback / homing */
+#define BTN_REC_MIN_MS      10000UL   /* minimum recording time (must be > 10 s) */
+#define BTN_REC_MIN_TRAVEL  10.0      /* minimum end-effector travel */
+#define BTN_REC_ENTRIES     128       /* record limit (128 * 3 = 384 bytes SRAM) */
+#define BTN_REC_BYTES       3         /* packed size of one 100 ms record */
+#define BTN_REC_LIMIT       32        /* 6-bit signed field range: -32..+31 units */
+#define BTN_ANGLE_UNIT      2.0       /* 1 deg = 2 recording units (unit = 0.5 deg) */
 
 static const uint8_t BTN_PIN[BTN_COUNT] = {
   BTN_PIN_CYCLE, BTN_PIN_RECORD, BTN_PIN_PLAY, BTN_PIN_HOME
 };
 
-/* ---------------- 录制缓冲 ---------------- */
+/* ---------------- recording buffer ---------------- */
 
-struct btnRecEntry {
-  uint8_t code;   /* 0~3 = 关节下标，0xFF = 等待 */
-  int8_t  arg;    /* 关节：角度增量（0.5 度为单位）；等待：tick 数 */
-};
+/* One packed record per 100 ms tick: four 6-bit signed joint deltas. */
+static uint8_t s_buf[BTN_REC_ENTRIES * BTN_REC_BYTES];
 
-static struct btnRecEntry s_buf[BTN_REC_ENTRIES];
-
-/* ---------------- 运行状态 ---------------- */
+/* ---------------- runtime state ---------------- */
 
 enum { BS_IDLE = 0, BS_RAMP, BS_PLAY };
 
-static int  s_state        = BS_IDLE;   /* 播放/回中的状态机 */
-static int  s_cycleIdx     = 0;         /* 按键1 下一次夹哪个物体 */
-static bool s_recording    = false;     /* 是否正在录制 */
-static bool s_rampThenPlay = false;     /* 插值结束后是进入播放(true)还是结束(false=回中) */
+static uint8_t s_state       = BS_IDLE;  /* playback / homing state machine */
+static uint8_t s_cycleIdx    = 0;        /* next object picked by button 1 */
+static bool    s_recording   = false;    /* recording in progress */
+static bool    s_rampThenPlay = false;   /* after the ramp: play (true) or stop (false) */
 
-/* 录制相关 */
-static int           s_recCount     = 0;   /* 本次录制已写入的条目数 */
-static int           s_recLen       = 0;   /* 已保存的条目数 */
-static bool          s_hasRec       = false; /* 是否有一份可播放的录制 */
-static bool          s_recOverflow  = false; /* 缓冲区是否被写满过 */
-static unsigned long s_recStartMs   = 0;
+/* recording */
+static uint8_t       s_recCount     = 0;     /* records written by the current recording */
+static uint8_t       s_recLen       = 0;     /* records of the saved recording */
+static bool          s_hasRec       = false; /* a playable recording exists */
+static bool          s_recOverflow  = false; /* the buffer ran full */
+static unsigned long s_recStartMs    = 0;
 static unsigned long s_recDurationMs = 0;
-static unsigned long s_tickNow      = 0;   /* 当前采样到的 tick 序号 */
-static unsigned long s_lastEventTick = 0;  /* 上一次写出条目的 tick 序号 */
-static double        s_snap[4]      = {0.0, 0.0, 0.0, 0.0};  /* 上一条事件时的真实角度 */
-static double        s_recStart[4]  = {0.0, 0.0, 0.0, 0.0};  /* 录制起点的四个角度 */
-static double        s_recTravel    = 0.0;                   /* 末端最大位移 */
-static double        s_minX = 0.0, s_maxX = 0.0;
-static double        s_minY = 0.0, s_maxY = 0.0;
-static double        s_minZ = 0.0, s_maxZ = 0.0;
+static unsigned long s_tickNow       = 0;    /* last tick index written */
+static double        s_snap[4]      = {0.0, 0.0, 0.0, 0.0}; /* last *emitted* joint angles (deg) */
+static double        s_recStart[4]  = {0.0, 0.0, 0.0, 0.0}; /* joint angles when recording began */
+static double        s_recTravel    = 0.0;                  /* end-effector travel */
+static double        s_bbMin[3]     = {0.0, 0.0, 0.0};      /* x/y/z box of the recording */
+static double        s_bbMax[3]     = {0.0, 0.0, 0.0};
 
-/* 插值相关 */
+/* ramping */
 static double        s_rampFrom[4] = {0.0, 0.0, 0.0, 0.0};
 static double        s_rampTo[4]   = {0.0, 0.0, 0.0, 0.0};
 static unsigned long s_rampStartMs = 0;
 
-/* 播放相关 */
-static int           s_playIdx   = 0;
+/* playback */
+static uint8_t       s_playIdx   = 0;
 static unsigned long s_playDueMs = 0;
 
-/* 按键消抖 */
+/* button debounce */
 static bool          s_btnStable[BTN_COUNT] = {false, false, false, false};
 static bool          s_btnArmed[BTN_COUNT]  = {false, false, false, false};
 static unsigned long s_btnChangeAt[BTN_COUNT] = {0UL, 0UL, 0UL, 0UL};
 
-/* ---------------- 小工具 ---------------- */
+/* ---------------- small helpers ---------------- */
 
-static double btnGetAngle(int joint) {
-  switch (joint) {
-    case 0:  return Pos.ser.angle1;
-    case 1:  return Pos.ser.angle2;
-    case 2:  return Pos.ser.angle3;
-    default: return Pos.ser.angle4;
-  }
+/* SER keeps angle1..angle4 as four consecutive doubles, so one pointer does the
+ * job of the two four-way switches this used to need. */
+static double *btnAngle(int joint) {
+  return &Pos.ser.angle1 + joint;
 }
 
-static void btnSetAngle(int joint, double deg) {
-  switch (joint) {
-    case 0:  Pos.ser.angle1 = deg; break;
-    case 1:  Pos.ser.angle2 = deg; break;
-    case 2:  Pos.ser.angle3 = deg; break;
-    default: Pos.ser.angle4 = deg; break;
-  }
-}
-
-/* 改完角度统一做一次限位 + 正解，保证 Pos.ser 与 Pos.rec 始终自洽。
- * 录制本来就是在本工程行程内动的，正常情况下 clampServoAngles() 不会改动任何值；
- * 这里只是防守，避免越界角度残留在 Pos 里。 */
+/* Apply the joint angles, then re-clamp and re-solve once so that Pos.ser and
+ * Pos.rec always stay consistent.  Recording only moves inside the configured
+ * travel, so clampServoAngles() normally changes nothing; this is just a guard
+ * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
   (void) clampServoAngles(&tmp);
@@ -155,27 +134,27 @@ static void btnCommitAngles(void) {
   (void) recFromServo(&Pos.rec, &Pos.ser);
 }
 
-/* 角度增量 -> 记录单位（0.5 度，四舍五入），并夹在 int8 能表达的范围里 */
+/* Angle delta -> recording units (0.5 deg, rounded to nearest).  No clamping:
+ * whatever does not fit into one record is carried into the following ones. */
 static int btnToUnits(double deltaDeg) {
   double u = deltaDeg * BTN_ANGLE_UNIT;
-  u = (u >= 0.0) ? (u + 0.5) : (u - 0.5);
-  if (u >  127.0) u =  127.0;
-  if (u < -127.0) u = -127.0;
-  return (int) u;
+  return (int) ((u >= 0.0) ? (u + 0.5) : (u - 0.5));
 }
 
 static double btnFromUnits(int units) {
   return (double) units / BTN_ANGLE_UNIT;
 }
 
-/* 录制的位移统计：只看末端在 x/y/z 上的最大变化量 */
+/* Recorded travel statistics: only the end-effector range on x/y/z matters.
+ * REC keeps x/y/z as three consecutive doubles.  Indices are read from the
+ * object, so the loop body stays a single shared copy. */
 static void btnUpdateTravel(const REC *rec) {
-  if (rec->x < s_minX) s_minX = rec->x;
-  if (rec->x > s_maxX) s_maxX = rec->x;
-  if (rec->y < s_minY) s_minY = rec->y;
-  if (rec->y > s_maxY) s_maxY = rec->y;
-  if (rec->z < s_minZ) s_minZ = rec->z;
-  if (rec->z > s_maxZ) s_maxZ = rec->z;
+  const double *v = &rec->x;
+  for (int a = 0; a < 3; a++) {
+    double x = v[a];
+    if (x < s_bbMin[a]) s_bbMin[a] = x;
+    if (x > s_bbMax[a]) s_bbMax[a] = x;
+  }
 }
 
 static const char *btnObjectName(int object) {
@@ -184,36 +163,78 @@ static const char *btnObjectName(int object) {
   return name[object];
 }
 
-/* ---------------- 录制 ---------------- */
+/* The end-effector travel of the recording: the widest of the three x/y/z
+ * min/max spans.  A local temp keeps s_recTravel out of the loop body. */
+static double btnTravelSpan(void) {
+  double t = s_bbMax[0] - s_bbMin[0];
+  for (int a = 1; a < 3; a++) {
+    double d = s_bbMax[a] - s_bbMin[a];
+    if (d > t) t = d;
+  }
+  return t;
+}
 
-static void btnEmit(uint8_t code, int8_t arg) {
+/* ---------------- recording ---------------- */
+
+/* Pack one record: four 6-bit signed joint deltas into BTN_REC_BYTES bytes. */
+static void btnRecPut(const int *u) {
   if (s_recCount >= BTN_REC_ENTRIES) {
     s_recOverflow = true;
     return;
   }
-  s_buf[s_recCount].code = code;
-  s_buf[s_recCount].arg  = arg;
+  uint8_t *p = &s_buf[s_recCount * BTN_REC_BYTES];
+  uint32_t v = 0;
+  for (int j = 0; j < 4; j++) {
+    v |= ((uint32_t) (u[j] & 0x3F)) << (6 * j);
+  }
+  p[0] = (uint8_t) v;
+  p[1] = (uint8_t) (v >> 8);
+  p[2] = (uint8_t) (v >> 16);
   s_recCount++;
 }
 
-static int  btnStopRecording(void);   /* 前向声明：缓冲写满时要自动收尾 */
+/* Collect what moved during one tick: the delta of every joint since the angle
+ * the recording emitted last, clamped to the 6-bit field range (-32..+31, so the
+ * positive limit is BTN_REC_LIMIT - 1: +32 would alias to -32).  s_snap[] is
+ * advanced by the clamped amount (not by the real angle), so anything that does
+ * not fit into this record is carried into the next one.  Returns true if
+ * anything moved. */
+static bool btnRecCollect(int *u) {
+  bool moved = false;
+  for (int j = 0; j < 4; j++) {
+    int d = btnToUnits(*btnAngle(j) - s_snap[j]);
+    if (d >  BTN_REC_LIMIT - 1) d =  BTN_REC_LIMIT - 1;
+    if (d < -BTN_REC_LIMIT)     d = -BTN_REC_LIMIT;
+    u[j] = d;
+    if (d != 0) {
+      moved = true;
+      s_snap[j] += btnFromUnits(d);
+    }
+  }
+  return moved;
+}
+
+static int  btnStopRecording(void);   /* forward declaration: the buffer may run full */
+
+/* noinline: the body is reached from two places (按键2 的 btnAction 入口 和
+ * btnRecTick 的缓冲写满自动收尾)，内联会把这一整段复制两份。 */
+static void btnStartRecording(void) __attribute__((noinline));
 
 static void btnStartRecording(void) {
-  s_recCount    = 0;
-  s_recOverflow = false;
-  s_recording   = true;
-  s_recStartMs  = millis();
-  s_tickNow     = 0;
-  s_lastEventTick = 0;
+  s_recCount      = 0;
+  s_recOverflow   = false;
+  s_recording     = true;
+  s_recStartMs    = millis();
+  s_tickNow       = 0;
   s_recDurationMs = 0;
-  s_recTravel   = 0.0;
+  s_recTravel     = 0.0;
   for (int j = 0; j < 4; j++) {
-    s_snap[j]     = btnGetAngle(j);
+    s_snap[j]     = *btnAngle(j);
     s_recStart[j] = s_snap[j];
   }
-  s_minX = s_maxX = Pos.rec.x;
-  s_minY = s_maxY = Pos.rec.y;
-  s_minZ = s_maxZ = Pos.rec.z;
+  s_bbMin[0] = s_bbMax[0] = Pos.rec.x;
+  s_bbMin[1] = s_bbMax[1] = Pos.rec.y;
+  s_bbMin[2] = s_bbMax[2] = Pos.rec.z;
 
 #if WEARM_DEBUG_SERIAL
   Serial.println(F("[btn] 开始录制：请用摇杆操控机械臂（时长需 >10 秒，且要有明显位移）"));
@@ -221,118 +242,50 @@ static void btnStartRecording(void) {
 #endif
 }
 
-/* 每个采样周期跑一次：把这一小段时间内的摇杆动作合并成条目写进缓冲 */
+/* Runs once per loop() while recording: every sampling tick that has elapsed gets
+ * exactly one record, so the time axis is the real recording timeline even when
+ * one loop iteration spans several ticks. */
 static void btnRecTick(unsigned long now) {
   unsigned long tick = (now - s_recStartMs) / BTN_TICK_MS;
-  if (tick <= s_tickNow) return;
-  s_tickNow = tick;
 
-  btnUpdateTravel(&Pos.rec);
-
-  int  d[4];
-  bool moved = false;
-  for (int j = 0; j < 4; j++) {
-    d[j] = btnToUnits(btnGetAngle(j) - s_snap[j]);
-    if (d[j] != 0) moved = true;
+  while (s_tickNow < tick && !s_recOverflow) {
+    int u[4];
+    s_tickNow++;
+    (void) btnRecCollect(u);
+    btnUpdateTravel(&Pos.rec);
+    btnRecPut(u);
   }
-  if (!moved) return;
-
-  /* 距离上一条事件的周期数 gap：
-   *   gap >= 2 -> 用 WAIT 条目把时间轴推过去（一条最多 127 个周期，可能拆几条）
-   *   gap == 1 -> 不写 WAIT，改为把"推进 1 个周期"塞进本周期第一条增量条目的 bit7
-   *   gap == 0 -> 同一个周期里的动作，时间不用再推进
-   * 于是"每个周期都在动"时只花"动了几个关节"条，不会再多花一条 WAIT。 */
-  unsigned long gap = s_tickNow - s_lastEventTick;
-  while (gap >= 2UL && !s_recOverflow) {
-    unsigned long chunk = (gap > (unsigned long) BTN_WAIT_MAX) ? (unsigned long) BTN_WAIT_MAX : gap;
-    btnEmit(BTN_WAIT_CODE, (int8_t) chunk);
-    gap -= chunk;
-  }
-  bool markTick = (gap == 1UL);
-
-  for (int j = 0; j < 4; j++) {
-    int u = d[j];
-    while (u != 0 && !s_recOverflow) {
-      int8_t step;
-      if (u > 127)       step = 127;
-      else if (u < -127) step = -127;
-      else               step = (int8_t) u;
-      uint8_t code = (uint8_t) j;
-      if (markTick) {          /* 本周期的时间推进只挂在第一条增量上 */
-        code |= (uint8_t) BTN_TICK_FLAG;
-        markTick = false;
-      }
-      btnEmit(code, step);
-      u -= (int) step;
-    }
-    s_snap[j] = btnGetAngle(j);
-  }
-  s_lastEventTick = s_tickNow;
 
   if (s_recOverflow) {
 #if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 录制缓冲已满（512 条），自动结束录制"));
+    Serial.println(F("[btn] 录制缓冲已满（128 条），自动结束录制"));
 #endif
     (void) btnStopRecording();
   }
 }
 
-/* 收尾：把"最后一个整周期 → 按下结束键"之间那不到一个周期的动作补成条目。
- * 不做这一步的话，回放终点会停在最后一个整周期上：快速档下每个周期能走 10 度，
- * 差距肉眼可见（实测四关节同时动时末态差正好一个周期的位移）。 */
-static void btnRecFlushTail(unsigned long now) {
-  if (s_recOverflow) return;
-
-  int  d[4];
-  bool moved = false;
-  for (int j = 0; j < 4; j++) {
-    d[j] = btnToUnits(btnGetAngle(j) - s_snap[j]);
-    if (d[j] != 0) moved = true;
-  }
-  if (!moved) return;                 /* 松手前本来就没动，时间轴不必再推进 */
-
-  btnUpdateTravel(&Pos.rec);
-
-  /* 已经跨进新的周期 -> 收尾动作挂在下一个周期上（回放时同样多等一个周期）；
-   * 还在同一个周期内 -> 不挂标记，与本周期的条目同时落下。 */
-  unsigned long tick = (now - s_recStartMs) / BTN_TICK_MS;
-  bool markTick = (tick > s_lastEventTick);
-
-  for (int j = 0; j < 4; j++) {
-    int u = d[j];
-    while (u != 0 && !s_recOverflow) {
-      int8_t step;
-      if (u > 127)       step = 127;
-      else if (u < -127) step = -127;
-      else               step = (int8_t) u;
-      uint8_t code = (uint8_t) j;
-      if (markTick) {
-        code |= (uint8_t) BTN_TICK_FLAG;
-        markTick = false;
-      }
-      btnEmit(code, step);
-      u -= (int) step;
-    }
-    s_snap[j] = btnGetAngle(j);
-  }
-  s_lastEventTick = tick;
-}
-
-/* 结束录制并判断是否保存；返回值是给串口回话用的 PROTO_RES_*。
- * 不达标（太短 / 没位移 / 缓冲写满）时，本次数据丢弃，且上一次的录制也已经
- * 被这次录制覆盖掉了，所以一并失效。 */
+/* End the recording and decide whether it is worth keeping; the return value is
+ * the PROTO_RES_* reply of the serial protocol.  A recording that fails the
+ * checks is dropped, and since it shares the buffer with the previous one, that
+ * one is gone as well. */
 static int btnStopRecording(void) {
   unsigned long now = millis();
-  btnRecFlushTail(now);               /* 先把最后不到一个周期的动作补上 */
-  s_recording = false;
+
+  if (!s_recOverflow) {
+    /* Flush the motion of the unfinished tick as one last record.  Without it the
+     * playback would stop one tick early, which is clearly visible in the fast
+     * speed preset (a whole tick of travel at the end). */
+    int u[4];
+    if (btnRecCollect(u)) {
+      btnUpdateTravel(&Pos.rec);
+      btnRecPut(u);
+    }
+  }
+
+  s_recording     = false;
   s_recDurationMs = now - s_recStartMs;
 
-  double dx = s_maxX - s_minX;
-  double dy = s_maxY - s_minY;
-  double dz = s_maxZ - s_minZ;
-  s_recTravel = dx;
-  if (dy > s_recTravel) s_recTravel = dy;
-  if (dz > s_recTravel) s_recTravel = dz;
+  s_recTravel = btnTravelSpan();
 
 #if WEARM_DEBUG_SERIAL
   Serial.print(F("[btn] 结束录制：时长 "));
@@ -348,7 +301,7 @@ static int btnStopRecording(void) {
   if (s_recOverflow) {
     ok = false;
 #if WEARM_DEBUG_SERIAL
-    Serial.println(F("[btn] 不合格：动作太长把 512 条缓冲写满了，尾部动作丢失"));
+    Serial.println(F("[btn] 不合格：动作太长把 128 条缓冲写满了，尾部动作丢失"));
 #endif
   } else if (s_recCount <= 0) {
     ok = false;
@@ -387,11 +340,11 @@ static int btnStopRecording(void) {
   return PROTO_RES_REC_SAVED;
 }
 
-/* ---------------- 平滑插值（播放前定位 / 回中） ---------------- */
+/* ---------------- smooth ramp (pose before playback / homing) ---------------- */
 
 static void btnStartRamp(const double *target, bool thenPlay) {
   for (int j = 0; j < 4; j++) {
-    s_rampFrom[j] = btnGetAngle(j);
+    s_rampFrom[j] = *btnAngle(j);
     s_rampTo[j]   = target[j];
   }
   s_rampStartMs  = millis();
@@ -404,15 +357,16 @@ static void btnRampTick(unsigned long now) {
   if (t > 1.0) t = 1.0;
 
   for (int j = 0; j < 4; j++) {
-    btnSetAngle(j, s_rampFrom[j] + (s_rampTo[j] - s_rampFrom[j]) * t);
+    *btnAngle(j) = s_rampFrom[j] + (s_rampTo[j] - s_rampFrom[j]) * t;
   }
   btnCommitAngles();
 
   if (t < 1.0) return;
 
-  /* 收尾精确落位，避免插值公式留下 1e-12 级别的残差 */
+  /* Land exactly on the target so that the interpolation cannot leave a 1e-12
+   * sized residue behind. */
   for (int j = 0; j < 4; j++) {
-    btnSetAngle(j, s_rampTo[j]);
+    *btnAngle(j) = s_rampTo[j];
   }
   btnCommitAngles();
 
@@ -432,34 +386,29 @@ static void btnRampTick(unsigned long now) {
   }
 }
 
-/* ---------------- 播放 ---------------- */
+/* ---------------- playback ---------------- */
 
-static void btnApplyDelta(int joint, int units) {
-  btnSetAngle(joint, btnGetAngle(joint) + btnFromUnits(units));
+/* Apply one whole 100 ms record: all four joint deltas belong to the same tick,
+ * so they land together and the pose is re-clamped / re-solved once. */
+static void btnPlayRecord(void) {
+  const uint8_t *p = &s_buf[s_playIdx * BTN_REC_BYTES];
+  uint32_t v = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16);
+  for (int j = 0; j < 4; j++) {
+    /* Sign-extend the 6-bit field, then move that joint. */
+    int u = (int) ((v >> (6 * j)) & 0x3F);
+    u = (u ^ BTN_REC_LIMIT) - BTN_REC_LIMIT;
+    if (u != 0) *btnAngle(j) += btnFromUnits(u);
+  }
   btnCommitAngles();
 }
 
 static void btnPlayTick(unsigned long now) {
-  int guard = 0;
   while (s_playIdx < s_recLen) {
-    struct btnRecEntry e = s_buf[s_playIdx];
-
-    if (e.code == BTN_WAIT_CODE) {
-      /* 等待条目：先把时间轴推过去；还没到点就原地不动，且不消费这条 */
-      unsigned long span = (unsigned long) ((uint8_t) e.arg) * BTN_TICK_MS;
-      if ((long) (now - (s_playDueMs + span)) < 0L) break;
-      s_playDueMs += span;
-    } else {
-      /* 增量条目：带 0x80 的那条先把时间轴推进 1 个采样周期（这是一个周期的时间成本） */
-      unsigned long due = (e.code & BTN_TICK_FLAG) ? (s_playDueMs + BTN_TICK_MS) : s_playDueMs;
-      if ((long) (now - due) < 0L) break;   /* 没到点：不消费、也不改 s_playDueMs */
-      s_playDueMs = due;
-      btnApplyDelta((int) (e.code & 0x03), (int) e.arg);
-    }
-
+    unsigned long due = s_playDueMs + BTN_TICK_MS;   /* record 0 is due one tick in */
+    if ((long) (now - due) < 0L) break;              /* not yet: keep it for later */
+    s_playDueMs = due;
+    btnPlayRecord();
     s_playIdx++;
-    guard++;
-    if (guard > BTN_REC_ENTRIES) break;   /* 极端情况下也不让 loop 卡死 */
   }
 
   if (s_playIdx >= s_recLen) {
@@ -470,7 +419,7 @@ static void btnPlayTick(unsigned long now) {
   }
 }
 
-/* ---------------- 四个按键的动作 ---------------- */
+/* ---------------- the four button actions ---------------- */
 
 static int btnActionCycle(void) {
   if (s_recording) {
@@ -502,7 +451,7 @@ static int btnActionCycle(void) {
   Serial.print(F("，下一次是 "));
   Serial.println(btnObjectName((object + 1) % PICK_OBJECT_COUNT));
 #endif
-  s_cycleIdx = (object + 1) % PICK_OBJECT_COUNT;
+  s_cycleIdx = (uint8_t)((object + 1) % PICK_OBJECT_COUNT);
   return PROTO_RES_PICK_STARTED;
 }
 
@@ -533,7 +482,7 @@ static int btnActionPlay(void) {
 #endif
     return PROTO_RES_BUSY;
   }
-  if (!s_hasRec || s_recLen <= 0) {
+  if (!s_hasRec) {
 #if WEARM_DEBUG_SERIAL
     Serial.println(F("[btn] 还没有录制数据，先按按键2 录一段"));
 #endif
@@ -563,10 +512,8 @@ static int btnActionHome(void) {
     return PROTO_RES_BUSY;
   }
 
+  /* angle4 先读出来：posGetHomeAngles() 只写 angle1..3，读回来的还是调用前的值。 */
   SER home;
-  home.angle1 = Pos.ser.angle1;
-  home.angle2 = Pos.ser.angle2;
-  home.angle3 = Pos.ser.angle3;
   home.angle4 = Pos.ser.angle4;
   if (!posGetHomeAngles(&home)) {
 #if WEARM_DEBUG_SERIAL
@@ -575,12 +522,9 @@ static int btnActionHome(void) {
     return PROTO_RES_BUSY;
   }
 
-  double target[4];
-  target[0] = home.angle1;
-  target[1] = home.angle2;
-  target[2] = home.angle3;
-  target[3] = Pos.ser.angle4;   /* 末端开合保持现状（posGetHomeAngles 不动 angle4） */
-  btnStartRamp(target, false);
+  /* SER 的 angle1..angle4 是连续的四个 double，&home.angle1 就是那四个目标角，
+   * 直接交给 btnStartRamp()，省掉一次目标数组拷贝。 */
+  btnStartRamp(&home.angle1, false);
 
 #if WEARM_DEBUG_SERIAL
   Serial.println(F("[btn] 按键4 回中：平滑回到开机初始位姿"));
@@ -589,9 +533,10 @@ static int btnActionHome(void) {
 }
 
 static int btnAction(int key) {
-  /* 绘图任务在跑（或正在示教）时，四个按键交给 draw_control.cpp 解释：
-   * 示教中 1=记录 2=撤销 3=取消 4=开始；绘制中 1=暂停 2=继续 3=取消 4=无动作。
-   * 空闲时 drawAcceptButton() 返回 false，按键仍然是原来的循环取放/录制/播放/回中。 */
+  /* While a drawing job runs (or is being taught) the four keys belong to
+   * draw_control.cpp: 1=record 2=undo 3=cancel 4=start while teaching and
+   * 1=pause 2=resume 3=cancel 4=nothing while drawing.  When idle
+   * drawAcceptButton() returns false and the keys keep their own meaning. */
   if (drawAcceptButton(key)) {
     return drawHandleButton(key);
   }
@@ -605,9 +550,9 @@ static int btnAction(int key) {
   }
 }
 
-/* ---------------- 按键扫描 ---------------- */
+/* ---------------- key scanning ---------------- */
 
-/* 返回 true 表示"这一次扫描确认了一次按下沿"（松手不返回 true） */
+/* Returns true when this scan confirmed one press edge (release never does). */
 static bool btnEdge(int key) {
   bool raw = (digitalRead(BTN_PIN[key]) == LOW);
   unsigned long now = millis();
@@ -628,7 +573,7 @@ static bool btnEdge(int key) {
   return raw;
 }
 
-/* ---------------- 对外接口 ---------------- */
+/* ---------------- public interface ---------------- */
 
 void buttonSetup(void) {
   for (int k = 0; k < BTN_COUNT; k++) {
@@ -665,11 +610,15 @@ void buttonLoop(void) {
 
   for (int k = 0; k < BTN_COUNT; k++) {
     if (!btnEdge(k)) continue;
-    (void) btnAction(k);   /* 动作本身负责打日志与串口回话 */
+    (void) btnAction(k);   /* the action itself reports and answers the serial port */
   }
 }
 
 int buttonHandleCommand(char c) {
+  /* 【v1.1.0 容量压缩】这一处**不要**再改成"位折叠 + u <= 3"之类的紧凑写法。
+   * 命令字符的实际差值是 M/N/P/R = 0/1/3/5（不是 0/1/2/3），折叠会把 'R' 整个丢掉、
+   * 并把 'N'/'P'/'M' 各自错位到别的按键上（probe_button 会挂 32 项）。
+   * 这 20 字节的收益不值得，保持显式 switch。 */
   switch (c) {
     case PROTO_CMD_BTN_CYCLE:    return btnAction(BTN_KEY_CYCLE);
     case PROTO_CMD_BTN_RECORD:   return btnAction(BTN_KEY_RECORD);
@@ -741,3 +690,5 @@ const char *buttonStateName(void) {
   if (s_state == BS_RAMP)   return s_rampThenPlay ? "预摆中" : "回中中";
   return "空闲";
 }
+
+#endif /* WEARM_ENABLE_BUTTONS */

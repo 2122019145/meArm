@@ -38,12 +38,15 @@
 #include <math.h>
 #include <Arduino.h>
 #include "constant_and_positions.h"
+#include "path_core.h"
 #include "joystick_control.h"
 #include "pick_place.h"
 #include "button_control.h"
 #include "draw_control.h"
 
-#define DRAW_DEBUG_SERIAL 1   /* 置 1: 打开绘图模块的串口日志 */
+#define DRAW_DEBUG_SERIAL WEARM_DEBUG_SERIAL   /* 置 1: 打开绘图模块的串口日志 */
+
+#if WEARM_ENABLE_DRAW
 
 /* ==================== 可自定义的参数 ==================== */
 
@@ -97,23 +100,26 @@ struct drawVertex {
   double v;
 };
 
-static const struct drawVertex SHAPE_LINE[2] = {
+/* The tables live in flash (PROGMEM): they are read-only lookups, so keeping a
+ * RAM copy would waste data space for nothing. Read them with pgm_read_float.
+ * Sizes stay 16/32/32/32/24 bytes, values and order are unchanged. */
+static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
   { -1.0,  0.0 }, {  1.0,  0.0 }
 };
 /* 字母 N：左竖（下->上）-> 斜线（左上->右下）-> 右竖（下->上） */
-static const struct drawVertex SHAPE_N[4] = {
+static const struct drawVertex SHAPE_N[4] PROGMEM = {
   { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
 };
 /* 三角形：底边 -> 右边 -> 左边回到起点（闭合） */
-static const struct drawVertex SHAPE_TRIANGLE[4] = {
+static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
   { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
 };
 /* 字母 Z：上横（左->右）-> 斜线（右上->左下）-> 下横（左->右） */
-static const struct drawVertex SHAPE_Z[4] = {
+static const struct drawVertex SHAPE_Z[4] PROGMEM = {
   { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
 };
 /* 字母 V：左上 -> 底尖 -> 右上 */
-static const struct drawVertex SHAPE_V[3] = {
+static const struct drawVertex SHAPE_V[3] PROGMEM = {
   { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
 };
 
@@ -128,8 +134,10 @@ static const char *const DRAW_PHASE_NAME[] = {
 };
 
 /* --- 任务与状态 --- */
-static int  s_task     = DRAW_TASK_TRIANGLE;  /* 当前选中的任务（默认三角形） */
-static int  s_phase    = DRAW_PHASE_IDLE;
+/* Small-range state is stored in 1-byte types: ranges are (task 0..6), (phase 0..8),
+ * (counts 0..5), (afterHome 0..2), so nothing observable changes. */
+static int8_t s_task     = DRAW_TASK_TRIANGLE;  /* 当前选中的任务（默认三角形） */
+static int8_t s_phase    = DRAW_PHASE_IDLE;
 static bool s_paused   = false;
 static int  s_lastRes  = PROTO_RES_NONE;
 static unsigned long s_lastMs = 0UL;          /* drawLoop 上一次推进的时刻 */
@@ -144,30 +152,29 @@ static double s_half    = DRAW_HALF_DEFAULT;
 
 /* --- 轨迹（顶点表 / 控制点表） --- */
 static double s_pts[DRAW_TEACH_MAX_POINTS][3];
-static int    s_ptCount  = 0;      /* 顶点个数（示教任务 = 已记录的点数） */
+static int8_t s_ptCount  = 0;      /* 顶点个数（示教任务 = 已记录的点数） */
 static bool   s_curved   = false;  /* true = 样条曲线，false = 折线 */
 static bool   s_isTeach  = false;  /* 当前任务是不是示教任务 */
-static double s_segLen[DRAW_TEACH_MAX_POINTS];   /* 折线逐段长度 */
 static double s_totalLen = 0.0;                  /* 轨迹总弧长 */
 static double s_ptArc[DRAW_TEACH_MAX_POINTS];    /* 各顶点在轨迹上的弧长位置 */
 
 /* --- 轨迹跟随 --- */
 static double s_done = 0.0;   /* 已走弧长 */
 static double s_v    = 0.0;   /* 当前线速度（单位/秒） */
-static int    s_span = 0;     /* 曲线：当前样条段号 */
+static int8_t s_span = 0;     /* 曲线：当前样条段号 */
 static double s_u    = 0.0;   /* 曲线：段内参数 [0,1] */
 
 /* --- 直线移动阶段（TRAVEL / PLUNGE / LIFT） --- */
 static double s_mFrom[3], s_mTo[3];
 static double s_mLen = 0.0, s_mDone = 0.0, s_mV = 0.0;
-static int    s_nextAfterMove = DRAW_PHASE_IDLE;
+static int8_t s_nextAfterMove = DRAW_PHASE_IDLE;
 
 /* 回待机结束之后进入哪里 */
 enum { AFTER_HOME_IDLE = 0, AFTER_HOME_TRAVEL, AFTER_HOME_TEACH };
 
 /* --- 回待机（关节空间插值） --- */
-static double s_homeTarget[4] = { 0.0, 0.0, 0.0, 0.0 };  /* 只用到前三个 */
-static int    s_afterHome = AFTER_HOME_IDLE;
+static double s_homeTarget[3] = { 0.0, 0.0, 0.0 };  /* 只用前三个 */
+static int8_t s_afterHome = AFTER_HOME_IDLE;
 
 /* --- 卡死保护 --- */
 #define DRAW_STALL_LIMIT 500        /* 连续多少轮"原地不动又没到位"就放弃任务 */
@@ -176,9 +183,10 @@ static int    s_stallCount = 0;
 /* --- 绘制结果统计 --- */
 static unsigned long s_pathStartMs = 0UL;
 static unsigned long s_lastRunMs   = 0UL;
-static int    s_hitCount  = 0;
-static int    s_hitTotal  = 0;
-static bool   s_ptHit[DRAW_TEACH_MAX_POINTS];
+static int8_t s_hitCount  = 0;
+static int8_t s_hitTotal  = 0;
+/* 5 个顶点是否已经过点：用 1 字节位图代替 bool[5]，判定逻辑逐字等价 */
+static uint8_t s_ptHit = 0;
 
 /* --- 示教 --- */
 static unsigned long s_teachWaitMs = 0UL;
@@ -186,82 +194,30 @@ static unsigned long s_jogLastMs[4] = { 0UL, 0UL, 0UL, 0UL };  /* x/y/z/f 各自
 
 /* ==================== 小工具 ==================== */
 
-/* 反解一个工作区点，成功时给出 b/r/c。
- * 必须给 angle4 一个合法值：getAngleEx() 会把四个关节一起夹，
- * angle4 非法（例如 0）会让 clamped 恒为 true（.selfcheck 的历史教训）。 */
-static bool solveJoint(double x, double y, double z, double *b, double *r, double *c)
-{
-  pos p;
-  p.rec.x = x;
-  p.rec.y = y;
-  p.rec.z = z;
-  p.ser   = Pos.ser;                 /* 顺带带上传一个合法的 angle4 */
-  bool clamped = false;
-  if (!getAngleEx(&p, &clamped)) return false;
-  if (clamped) return false;         /* 靠吸附才能表示的姿态不算可达 */
-  if (b) *b = p.ser.angle1;
-  if (r) *r = p.ser.angle2;
-  if (c) *c = p.ser.angle3;
-  return true;
+/* 反解 / 点校验 / 直线段校验三件套原先在本文件有一份逐字实现，pick_place.cpp 里
+ * 还有一份完全一样的。现在实现搬到 path_core.h 由两个模块共用（链接器只保留一份），
+ * 这里保留同名同签名的转发函数，本文件所有调用点一行都不用改；采样步长与分支
+ * 跳变门限仍用本文件的 DRAW_* 常量。转发函数是 static inline，会被就地展开，
+ * 不会另外留下一份代码。 */
+static inline bool solveJoint(double x, double y, double z,
+                              double *b, double *r, double *c) {
+  return pathCoreSolveJoint(x, y, z, b, r, c);
 }
 
 /* 这个工作区点能不能用：在 limit 内 + isReachable() + 反解成功且没被吸附。 */
-static bool pointOk(double x, double y, double z, double *b, double *r, double *c)
-{
-  if (x < limit.minX || x > limit.maxX) return false;
-  if (y < limit.minY || y > limit.maxY) return false;
-  if (z < limit.minZ || z > limit.maxZ) return false;
-
-  REC rec;
-  rec.x = x;
-  rec.y = y;
-  rec.z = z;
-  if (!isReachable(&rec)) return false;
-
-  return solveJoint(x, y, z, b, r, c);
+static inline bool pointOk(double x, double y, double z,
+                           double *b, double *r, double *c) {
+  return pathCorePointOk(x, y, z, b, r, c);
 }
 
-/* 校验一条直线段：逐点检查能不能用，并且相邻采样点的反解分支不跳变。 */
-static bool segmentOk(double x0, double y0, double z0,
-                      double x1, double y1, double z1)
-{
-  double dx = x1 - x0;
-  double dy = y1 - y0;
-  double dz = z1 - z0;
-  double len = sqrt(dx * dx + dy * dy + dz * dz);
-
-  int steps = (int)(len / DRAW_PATH_SAMPLE_STEP) + 1;
-  if (steps < 2) steps = 2;
-  if (steps > DRAW_PATH_SAMPLE_MAX) steps = DRAW_PATH_SAMPLE_MAX;
-
-  double pb = 0.0, pr = 0.0, pc = 0.0;
-  for (int i = 0; i <= steps; i++) {
-    double t = (double)i / (double)steps;
-    double b = 0.0, r = 0.0, c = 0.0;
-    if (!pointOk(x0 + dx * t, y0 + dy * t, z0 + dz * t, &b, &r, &c)) {
-      return false;
-    }
-    if (i > 0) {
-      if (fabs(b - pb) > DRAW_BRANCH_JUMP_DEG ||
-          fabs(r - pr) > DRAW_BRANCH_JUMP_DEG ||
-          fabs(c - pc) > DRAW_BRANCH_JUMP_DEG) {
-        return false;   /* 反解在段中间换了分支，说明这条直线不能走 */
-      }
-    }
-    pb = b;
-    pr = r;
-    pc = c;
-  }
-  return true;
-}
+/* 校验一条直线段：逐点检查能不能用，并且相邻采样点的反解分支不跳变。
+ * 本文件原先用六个 double 传两个端点，现在统一改成传两个点数组
+ * （s_pts[] 的行本身就是连续三个 double，直接传地址即可），
+ * 调用点少了一次压栈，采样与判据一个字没改。 */
 
 /* 三个轴一次写完，只做一次正解刷新（与串口角度指令同一约定） */
-static void setJoints(double b, double r, double c)
-{
-  Pos.ser.angle1 = b;
-  Pos.ser.angle2 = r;
-  Pos.ser.angle3 = c;
-  (void) recFromServo(&Pos.rec, &Pos.ser);
+static inline void setJoints(double b, double r, double c) {
+  pathCoreSetJoints(b, r, c);
 }
 
 /* 把某个角度限制在 [lo,hi] */
@@ -303,12 +259,13 @@ static void buildShapePath(int task)
   int n = shapeTable(task, &tbl);
   if (n > DRAW_TEACH_MAX_POINTS) n = DRAW_TEACH_MAX_POINTS;   /* 表不会超，纯保险 */
 
-  s_ptCount = n;
+  s_ptCount = (int8_t)n;
   s_curved  = false;
   s_isTeach = false;
   for (int i = 0; i < n; i++) {
-    s_pts[i][0] = s_centerX + tbl[i].u * s_half;
-    s_pts[i][1] = s_centerY + tbl[i].v * s_half;
+    /* pgm_read_float reads the identical IEEE value that used to sit in RAM */
+    s_pts[i][0] = s_centerX + pgm_read_float(&tbl[i].u) * s_half;
+    s_pts[i][1] = s_centerY + pgm_read_float(&tbl[i].v) * s_half;
     s_pts[i][2] = s_penZ;
   }
 }
@@ -323,77 +280,75 @@ static double knotDelta(int a, int b)
   return sqrt(d);
 }
 
-/* 第 span 段（P[span] -> P[span+1]）在参数 u∈[0,1] 处的点与切线。
+/* 第 span 段（P[span] -> P[span+1]）在参数 u∈[0,1] 处的点 p[3] 与切线 d[3]。
  * 切线用"相邻点差 / 节点间距"的向心 Catmull-Rom 形式，
- * 端点用弦方向（不外推），保证曲线不会冲出五个目标点之外。 */
-static void curveSpan(int span, double u,
-                      double *px, double *py, double *pz,
-                      double *dx, double *dy, double *dz)
+ * 端点用弦方向（不外推），保证曲线不会冲出五个目标点之外。
+ * 三个坐标共用一个循环：每一项的算式与运算次序和逐坐标展开时逐字相同，
+ * 所以结果与展开版 bit 级一致，只是省掉了 3 份重复代码。
+ *
+ * （实测记录：把"切线计算"抽成单独函数、让算点与算导数各走一条路
+ *   Program 反而 +170 字节——切线块 1634B、curvePoint 1396B，
+ *   拆开后光切线就比原来整个 curveSpan(1518B) 还大，故保持合并的写法。） */
+static void curveSpan(int span, double u, double *p, double *d)
 {
   int n = s_ptCount;
   int i = span;
   double dt = knotDelta(i, i + 1);
 
-  double m1x, m1y, m1z, m2x, m2y, m2z;
+  /* t1/t2 = 两个端点的切线 × dt（先除后乘，次序不变，值不变） */
+  double t1[3], t2[3];
   if (i == 0) {
-    m1x = (s_pts[1][0] - s_pts[0][0]) / dt;
-    m1y = (s_pts[1][1] - s_pts[0][1]) / dt;
-    m1z = (s_pts[1][2] - s_pts[0][2]) / dt;
+    for (int k = 0; k < 3; k++) t1[k] = (s_pts[1][k] - s_pts[0][k]) / dt * dt;
   } else {
     double sum = knotDelta(i - 1, i) + dt;
-    m1x = (s_pts[i + 1][0] - s_pts[i - 1][0]) / sum;
-    m1y = (s_pts[i + 1][1] - s_pts[i - 1][1]) / sum;
-    m1z = (s_pts[i + 1][2] - s_pts[i - 1][2]) / sum;
+    for (int k = 0; k < 3; k++) t1[k] = (s_pts[i + 1][k] - s_pts[i - 1][k]) / sum * dt;
   }
   if (i + 1 == n - 1) {
-    m2x = (s_pts[n - 1][0] - s_pts[n - 2][0]) / dt;
-    m2y = (s_pts[n - 1][1] - s_pts[n - 2][1]) / dt;
-    m2z = (s_pts[n - 1][2] - s_pts[n - 2][2]) / dt;
+    for (int k = 0; k < 3; k++) t2[k] = (s_pts[n - 1][k] - s_pts[n - 2][k]) / dt * dt;
   } else {
     double sum = dt + knotDelta(i + 1, i + 2);
-    m2x = (s_pts[i + 2][0] - s_pts[i][0]) / sum;
-    m2y = (s_pts[i + 2][1] - s_pts[i][1]) / sum;
-    m2z = (s_pts[i + 2][2] - s_pts[i][2]) / sum;
+    for (int k = 0; k < 3; k++) t2[k] = (s_pts[i + 2][k] - s_pts[i][k]) / sum * dt;
   }
 
   double u2 = u * u;
   double u3 = u2 * u;
-  double h00 =  2.0 * u3 - 3.0 * u2 + 1.0;
-  double h10 =         u3 - 2.0 * u2 + u;
+  /* 两个恒等式，IEEE 下逐位成立，各少几次软浮点调用：
+   *   h01 = fl(-2u³+3u²) = -fl(2u³-3u²)   （舍入对符号左右对称，乘 2 精确）
+   *   而 h00 = fl(fl(2u³-3u²)+1) = fl(1-h01)（x+1 与 1+x 同一次舍入）
+   *   e1  = fl(-6u²+6u) = -fl(6u²-6u) = -e0
+   * 所以 h00 可以写成 1.0 - h01、e1 可以写成 -e0，数值逐位不变。 */
   double h01 = -2.0 * u3 + 3.0 * u2;
+  double h00 =  1.0 - h01;
+  double h10 =         u3 - 2.0 * u2 + u;
   double h11 =         u3 -       u2;
   double g10 =  3.0 * u2 - 4.0 * u + 1.0;
   double g11 =  3.0 * u2 - 2.0 * u;
+  double e0  =  6.0 * u2 - 6.0 * u;
+  double e1  = -e0;
 
-  double a0x = s_pts[i][0],     a1x = s_pts[i + 1][0];
-  double a0y = s_pts[i][1],     a1y = s_pts[i + 1][1];
-  double a0z = s_pts[i][2],     a1z = s_pts[i + 1][2];
-
-  *px = h00 * a0x + h10 * (m1x * dt) + h01 * a1x + h11 * (m2x * dt);
-  *py = h00 * a0y + h10 * (m1y * dt) + h01 * a1y + h11 * (m2y * dt);
-  *pz = h00 * a0z + h10 * (m1z * dt) + h01 * a1z + h11 * (m2z * dt);
-
-  *dx = (6.0 * u2 - 6.0 * u) * a0x + g10 * (m1x * dt)
-      + (-6.0 * u2 + 6.0 * u) * a1x + g11 * (m2x * dt);
-  *dy = (6.0 * u2 - 6.0 * u) * a0y + g10 * (m1y * dt)
-      + (-6.0 * u2 + 6.0 * u) * a1y + g11 * (m2y * dt);
-  *dz = (6.0 * u2 - 6.0 * u) * a0z + g10 * (m1z * dt)
-      + (-6.0 * u2 + 6.0 * u) * a1z + g11 * (m2z * dt);
+  /* p[k] 与 d[k] 共用一个 k 循环（实测：拆成两个循环各自少一点寄存器压力，
+   * 但 Program 反而 +84 字节，所以保持合并——共用 a0/a1 与一次循环控制更划算）。 */
+  for (int k = 0; k < 3; k++) {
+    double a0 = s_pts[i][k];
+    double a1 = s_pts[i + 1][k];
+    p[k] = h00 * a0 + h10 * t1[k] + h01 * a1 + h11 * t2[k];
+    d[k] = e0 * a0 + g10 * t1[k] + e1 * a1 + g11 * t2[k];
+  }
 }
 
 /* 曲线在参数 (span,u) 处的点 */
-static void curvePoint(int span, double u, double *x, double *y, double *z)
+static void curvePoint(int span, double u, double *p)
 {
-  double dx = 0.0, dy = 0.0, dz = 0.0;
-  curveSpan(span, u, x, y, z, &dx, &dy, &dz);
+  double d[3];
+  curveSpan(span, u, p, d);
 }
 
 /* 曲线在参数 (span,u) 处的 dP/du 模（推进时用来换算成"匀速"） */
 static double curveSpeed(int span, double u)
 {
-  double x = 0.0, y = 0.0, z = 0.0, dx = 0.0, dy = 0.0, dz = 0.0;
-  curveSpan(span, u, &x, &y, &z, &dx, &dy, &dz);
-  return sqrt(dx * dx + dy * dy + dz * dz);
+  double p[3], d[3];
+  curveSpan(span, u, p, d);
+  return sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 }
 
 /* 曲线总弧长与"各控制点在曲线上的弧长位置"（都是采样求和，够用且简单） */
@@ -402,7 +357,7 @@ static void curveMeasure(void)
   const int SAMPLE_PER_SPAN = 64;
   double len = 0.0;
   double prev[3];
-  curvePoint(0, 0.0, &prev[0], &prev[1], &prev[2]);
+  curvePoint(0, 0.0, prev);
 
   /* 第 0 个控制点就在曲线起点 */
   s_ptArc[0] = 0.0;
@@ -410,7 +365,7 @@ static void curveMeasure(void)
     for (int k = 1; k <= SAMPLE_PER_SPAN; k++) {
       double u = (double)k / (double)SAMPLE_PER_SPAN;
       double cur[3];
-      curvePoint(span, u, &cur[0], &cur[1], &cur[2]);
+      curvePoint(span, u, cur);
       len += dist3(prev, cur);
       prev[0] = cur[0]; prev[1] = cur[1]; prev[2] = cur[2];
     }
@@ -426,8 +381,9 @@ static void polyMeasure(void)
   double acc = 0.0;
   s_ptArc[0] = 0.0;
   for (int i = 0; i < s_ptCount - 1; i++) {
-    s_segLen[i] = dist3(s_pts[i], s_pts[i + 1]);
-    acc += s_segLen[i];
+    /* s_segLen[] was dropped from RAM; dist3() is deterministic on the same
+     * two points, so recomputing it yields bit-identical values. */
+    acc += dist3(s_pts[i], s_pts[i + 1]);
     s_ptArc[i + 1] = acc;
   }
   s_totalLen = acc;
@@ -468,10 +424,16 @@ static bool validatePath(void)
   if (!recFromServo(&hrec, &home)) return false;
 
   double lz = liftZFor(s_pts[0]);
-  if (!segmentOk(hrec.x, hrec.y, hrec.z, s_pts[0][0], s_pts[0][1], lz)) return false;
+  double hp[3];                       /* 待机位 */
+  hp[0] = hrec.x; hp[1] = hrec.y; hp[2] = hrec.z;
+  double ap[3];                       /* 起点正上方 */
+  ap[0] = s_pts[0][0]; ap[1] = s_pts[0][1]; ap[2] = lz;
+  if (!pathCoreSegmentOk(hp, ap, DRAW_PATH_SAMPLE_STEP,
+                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) return false;
 
   /* 2) 垂直落笔 */
-  if (!segmentOk(s_pts[0][0], s_pts[0][1], lz, s_pts[0][0], s_pts[0][1], s_pts[0][2])) {
+  if (!pathCoreSegmentOk(ap, s_pts[0], DRAW_PATH_SAMPLE_STEP,
+                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
     return false;
   }
 
@@ -484,10 +446,10 @@ static bool validatePath(void)
     for (int span = 0; span < s_ptCount - 1; span++) {
       for (int k = 0; k <= SAMPLE_PER_SPAN; k++) {
         double u = (double)k / (double)SAMPLE_PER_SPAN;
-        double x = 0.0, y = 0.0, z = 0.0;
-        curvePoint(span, u, &x, &y, &z);
+        double p[3];
+        curvePoint(span, u, p);
         double b = 0.0, r = 0.0, c = 0.0;
-        if (!pointOk(x, y, z, &b, &r, &c)) return false;
+        if (!pointOk(p[0], p[1], p[2], &b, &r, &c)) return false;
         if (!first) {
           if (fabs(b - prevB) > DRAW_BRANCH_JUMP_DEG ||
               fabs(r - prevR) > DRAW_BRANCH_JUMP_DEG ||
@@ -501,17 +463,20 @@ static bool validatePath(void)
     }
   } else {
     for (int i = 0; i < s_ptCount - 1; i++) {
-      if (!segmentOk(s_pts[i][0], s_pts[i][1], s_pts[i][2],
-                     s_pts[i + 1][0], s_pts[i + 1][1], s_pts[i + 1][2])) {
+      if (!pathCoreSegmentOk(s_pts[i], s_pts[i + 1], DRAW_PATH_SAMPLE_STEP,
+                             DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
         return false;
       }
     }
   }
 
   /* 4) 终点抬笔 */
-  double ez = liftZFor(s_pts[s_ptCount - 1]);
-  if (!segmentOk(s_pts[s_ptCount - 1][0], s_pts[s_ptCount - 1][1], s_pts[s_ptCount - 1][2],
-                 s_pts[s_ptCount - 1][0], s_pts[s_ptCount - 1][1], ez)) {
+  const double *last = s_pts[s_ptCount - 1];
+  double ez = liftZFor(last);
+  double ep[3];
+  ep[0] = last[0]; ep[1] = last[1]; ep[2] = ez;
+  if (!pathCoreSegmentOk(last, ep, DRAW_PATH_SAMPLE_STEP,
+                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
     return false;
   }
   return true;
@@ -534,21 +499,31 @@ static double applyDtSec(void)
   return dt;
 }
 
+/* 反解 (x,y,z) 并同时给出关节角 abc[3] 与本步允许的最大变化 maxStep。
+ * tryApplyPoint / applyPointClamped 共用这段前缀，避免各展开一份。 */
+static bool solveStep(double x, double y, double z, double maxDps, double dtSec,
+                      double *abc, double *maxStep)
+{
+  if (!solveJoint(x, y, z, &abc[0], &abc[1], &abc[2])) return false;
+  double ms = maxDps * dtSec;
+  if (ms < 0.2) ms = 0.2;          /* 极短的一轮也给个最小步长 */
+  *maxStep = ms;
+  return true;
+}
+
 /* 反解 (x,y,z) 并检查每个关节相对当前角度的变化不超过 maxDps×dtSec。
  * 通过则写入 Pos 并返回 true；不通过则什么都不改、返回 false（调用方可缩小步长重试）。 */
 static bool tryApplyPoint(double x, double y, double z, double maxDps, double dtSec)
 {
-  double b = 0.0, r = 0.0, c = 0.0;
-  if (!solveJoint(x, y, z, &b, &r, &c)) return false;
+  double abc[3] = { 0.0, 0.0, 0.0 };
+  double maxStep = 0.0;
+  if (!solveStep(x, y, z, maxDps, dtSec, abc, &maxStep)) return false;
 
-  double maxStep = maxDps * dtSec;
-  if (maxStep < 0.2) maxStep = 0.2;          /* 极短的一轮也给个最小步长 */
+  if (fabs(abc[0] - Pos.ser.angle1) > maxStep) return false;
+  if (fabs(abc[1] - Pos.ser.angle2) > maxStep) return false;
+  if (fabs(abc[2] - Pos.ser.angle3) > maxStep) return false;
 
-  if (fabs(b - Pos.ser.angle1) > maxStep) return false;
-  if (fabs(r - Pos.ser.angle2) > maxStep) return false;
-  if (fabs(c - Pos.ser.angle3) > maxStep) return false;
-
-  setJoints(b, r, c);
+  setJoints(abc[0], abc[1], abc[2]);
   s_applyMs = millis();
   return true;
 }
@@ -557,15 +532,17 @@ static bool tryApplyPoint(double x, double y, double z, double maxDps, double dt
  * 供示教点动用：手动点动宁可按不到请求的那点，也绝不能原地卡住。 */
 static bool applyPointClamped(double x, double y, double z, double maxDps, double dtSec)
 {
-  double b = 0.0, r = 0.0, c = 0.0;
-  if (!solveJoint(x, y, z, &b, &r, &c)) return false;
+  double abc[3] = { 0.0, 0.0, 0.0 };
+  double maxStep = 0.0;
+  if (!solveStep(x, y, z, maxDps, dtSec, abc, &maxStep)) return false;
 
-  double maxStep = maxDps * dtSec;
-  if (maxStep < 0.2) maxStep = 0.2;
+  /* setJoints 之前先把当前角度读出来（与原版三个实参都在调用前求值一致） */
+  double cur[3];
+  cur[0] = Pos.ser.angle1; cur[1] = Pos.ser.angle2; cur[2] = Pos.ser.angle3;
 
-  double db = b - Pos.ser.angle1;
-  double dr = r - Pos.ser.angle2;
-  double dc = c - Pos.ser.angle3;
+  double db = abc[0] - cur[0];
+  double dr = abc[1] - cur[1];
+  double dc = abc[2] - cur[2];
   if (db >  maxStep) db =  maxStep;
   if (db < -maxStep) db = -maxStep;
   if (dr >  maxStep) dr =  maxStep;
@@ -573,7 +550,7 @@ static bool applyPointClamped(double x, double y, double z, double maxDps, doubl
   if (dc >  maxStep) dc =  maxStep;
   if (dc < -maxStep) dc = -maxStep;
 
-  setJoints(Pos.ser.angle1 + db, Pos.ser.angle2 + dr, Pos.ser.angle3 + dc);
+  setJoints(cur[0] + db, cur[1] + dr, cur[2] + dc);
   s_applyMs = millis();
   return true;
 }
@@ -624,35 +601,22 @@ static bool stallGuard(double movedNow)
 static void loadHomeTarget(void)
 {
   SER ser = Pos.ser;
-  if (posGetHomeAngles(&ser)) {
-    s_homeTarget[0] = ser.angle1;
-    s_homeTarget[1] = ser.angle2;
-    s_homeTarget[2] = ser.angle3;
-  } else {
-    s_homeTarget[0] = Pos.ser.angle1;
-    s_homeTarget[1] = Pos.ser.angle2;
-    s_homeTarget[2] = Pos.ser.angle3;
-  }
+  if (!posGetHomeAngles(&ser)) ser = Pos.ser;   /* 失败时同样回到当前角度 */
+  s_homeTarget[0] = ser.angle1;
+  s_homeTarget[1] = ser.angle2;
+  s_homeTarget[2] = ser.angle3;
 }
 
-/* 进入"回待机"阶段；after 为回完之后进入的阶段 */
-static void beginHome(int after)
+/* 进入"回待机"阶段；after 为回完之后进入的阶段，phase 为对外显示的阶段号
+ * （正常回待机 DRAW_PHASE_HOME；绘制结束/取消时用 DRAW_PHASE_RETURN，便于串口观察。
+ *  两个变体只差一个常量，合并成一个函数以免各展开一份代码。） */
+static void beginHome(int after, int phase)
 {
   loadHomeTarget();
-  s_afterHome  = after;
+  s_afterHome  = (int8_t)after;
   s_stallCount = 0;
   s_applyMs    = millis();     /* 速率上限的计时基准重新起算，避免长时间空闲后一次大跳变 */
-  s_phase = DRAW_PHASE_HOME;
-}
-
-/* 绘制完成/取消后回待机（阶段名单独用"结束回待机"，便于串口观察） */
-static void beginReturn(void)
-{
-  loadHomeTarget();
-  s_afterHome  = AFTER_HOME_IDLE;
-  s_stallCount = 0;
-  s_applyMs    = millis();
-  s_phase = DRAW_PHASE_RETURN;
+  s_phase = (int8_t)phase;
 }
 
 /* 进入一段直线移动（抬笔平移 / 落笔 / 抬笔） */
@@ -668,7 +632,7 @@ static void beginMove(int next, double x, double y, double z)
   s_mDone = 0.0;
   s_mV    = 0.0;
   s_applyMs = millis();        /* 同上：每段移动都从"这一刻"重新起算速率基准 */
-  s_nextAfterMove = next;
+  s_nextAfterMove = (int8_t)next;
 }
 
 /* 开始绘制序列：回待机 -> 抬笔到起点上方 -> 落笔 -> 绘制 */
@@ -681,10 +645,10 @@ static void beginSequence(void)
   s_u       = 0.0;
   s_hitCount = 0;
   s_hitTotal = s_isTeach ? s_ptCount : 0;
-  for (int i = 0; i < DRAW_TEACH_MAX_POINTS; i++) s_ptHit[i] = false;
+  s_ptHit = 0;
 
   /* 先回待机；回完由 drawLoop 转入"抬笔去起点上方" */
-  beginHome(AFTER_HOME_TRAVEL);
+  beginHome(AFTER_HOME_TRAVEL, DRAW_PHASE_HOME);
 }
 
 /* ==================== 各阶段推进 ==================== */
@@ -695,20 +659,27 @@ static bool homeTick(void)
   double maxStep = DRAW_HOME_DPS * s_dtSec;
   if (maxStep < 0.2) maxStep = 0.2;
 
-  double d0 = s_homeTarget[0] - Pos.ser.angle1;
-  double d1 = s_homeTarget[1] - Pos.ser.angle2;
-  double d2 = s_homeTarget[2] - Pos.ser.angle3;
+  /* 三个关节走同一个循环；算式与逐关节展开时一模一样。
+   * （实测：展开成 db/dr/dc 三个标量后 Program 反而 +204 字节，
+   *   编译器对数组版能复用寄存器，标量版会各留一份活跃值，故保留循环。） */
+  double tgt[3], cur[3], d[3];
+  tgt[0] = s_homeTarget[0]; tgt[1] = s_homeTarget[1]; tgt[2] = s_homeTarget[2];
+  cur[0] = Pos.ser.angle1;  cur[1] = Pos.ser.angle2;  cur[2] = Pos.ser.angle3;
 
-  if (fabs(d0) <= DRAW_HOME_TOL_DEG &&
-      fabs(d1) <= DRAW_HOME_TOL_DEG &&
-      fabs(d2) <= DRAW_HOME_TOL_DEG) {
-    setJoints(s_homeTarget[0], s_homeTarget[1], s_homeTarget[2]);
+  bool atHome = true;
+  for (int i = 0; i < 3; i++) {
+    d[i] = tgt[i] - cur[i];
+    if (fabs(d[i]) > DRAW_HOME_TOL_DEG) atHome = false;
+  }
+
+  if (atHome) {
+    setJoints(tgt[0], tgt[1], tgt[2]);
     return true;
   }
 
-  setJoints(Pos.ser.angle1 + clampDouble(d0, -maxStep, maxStep),
-            Pos.ser.angle2 + clampDouble(d1, -maxStep, maxStep),
-            Pos.ser.angle3 + clampDouble(d2, -maxStep, maxStep));
+  setJoints(cur[0] + clampDouble(d[0], -maxStep, maxStep),
+            cur[1] + clampDouble(d[1], -maxStep, maxStep),
+            cur[2] + clampDouble(d[2], -maxStep, maxStep));
   return false;
 }
 
@@ -746,15 +717,16 @@ static void polyPointAt(double s, double *px, double *py, double *pz)
   double acc = 0.0;
   for (int i = 0; i < s_ptCount - 1; i++) {
     bool last = (i == s_ptCount - 2);
-    if (s <= acc + s_segLen[i] || last) {
-      double t = (s_segLen[i] > 1e-9) ? (s - acc) / s_segLen[i] : 1.0;
+    double seg = dist3(s_pts[i], s_pts[i + 1]);   /* same value s_segLen[] held */
+    if (s <= acc + seg || last) {
+      double t = (seg > 1e-9) ? (s - acc) / seg : 1.0;
       t = clampDouble(t, 0.0, 1.0);
       *px = s_pts[i][0] + (s_pts[i + 1][0] - s_pts[i][0]) * t;
       *py = s_pts[i][1] + (s_pts[i + 1][1] - s_pts[i][1]) * t;
       *pz = s_pts[i][2] + (s_pts[i + 1][2] - s_pts[i][2]) * t;
       return;
     }
-    acc += s_segLen[i];
+    acc += seg;
   }
 }
 
@@ -767,7 +739,7 @@ static bool pathAdvance(double step)
 
   double tryStep = step;
   for (int attempt = 0; attempt < 4; attempt++) {
-    double x = 0.0, y = 0.0, z = 0.0;
+    double p[3] = { 0.0, 0.0, 0.0 };
     int    nspan = s_span;
     double nu    = s_u;
 
@@ -777,14 +749,14 @@ static bool pathAdvance(double step)
       nu = s_u + du;
       while (nu >= 1.0 && nspan < s_ptCount - 2) { nu -= 1.0; nspan++; }
       if (nu > 1.0) nu = 1.0;
-      curvePoint(nspan, nu, &x, &y, &z);
+      curvePoint(nspan, nu, p);
     } else {
-      polyPointAt(s_done + tryStep, &x, &y, &z);
+      polyPointAt(s_done + tryStep, &p[0], &p[1], &p[2]);
     }
 
-    if (tryApplyPoint(x, y, z, DRAW_MAX_DPS, applyDtSec())) {
+    if (tryApplyPoint(p[0], p[1], p[2], DRAW_MAX_DPS, applyDtSec())) {
       s_done += tryStep;
-      s_span  = nspan;
+      s_span  = (int8_t)nspan;
       s_u     = nu;
       s_v     = (s_dtSec > 1e-6) ? (tryStep / s_dtSec) : 0.0;
       return true;
@@ -806,13 +778,14 @@ static void pathTick(void)
 
   /* 过点统计：走过了第 i 个目标点的弧长位置就量一下笔尖离它多远 */
   for (int i = 0; i < s_ptCount; i++) {
-    if (s_ptHit[i]) continue;
+    uint8_t bit = (uint8_t)(1u << i);
+    if (s_ptHit & bit) continue;
     if (s_done + 1e-6 < s_ptArc[i]) continue;
     double dx = Pos.rec.x - s_pts[i][0];
     double dy = Pos.rec.y - s_pts[i][1];
     double dz = Pos.rec.z - s_pts[i][2];
     if (sqrt(dx * dx + dy * dy + dz * dz) <= DRAW_POINT_TOL) {
-      s_ptHit[i] = true;
+      s_ptHit |= bit;
       s_hitCount++;
     }
   }
@@ -822,6 +795,20 @@ static void pathTick(void)
 static void beginLift(double z)
 {
   beginMove(DRAW_PHASE_LIFT, Pos.rec.x, Pos.rec.y, z);
+}
+
+/* 绘制完成 / 中途取消共用：先垂直抬笔（不然笔尖会拖着纸走出一道多余的线），
+ * 抬笔到位后再回待机。
+ * ★ 必须显式把阶段切到"抬笔"：beginLift 只装移动参数，不改阶段。
+ *   漏了这一行，取消后阶段还停在原来的 TRAVEL/PLUNGE/PATH，
+ *   状态机会接着把这一笔按原轨迹画下去 —— 取消等于没取消。 */
+static void beginLiftToReturn(void)
+{
+  double lz = Pos.rec.z + DRAW_LIFT_DZ;
+  if (!pointOk(Pos.rec.x, Pos.rec.y, lz, NULL, NULL, NULL)) lz = Pos.rec.z;
+  beginLift(lz);
+  s_nextAfterMove = DRAW_PHASE_RETURN;
+  s_phase = DRAW_PHASE_LIFT;
 }
 
 /* ==================== 示教 ==================== */
@@ -903,7 +890,7 @@ static int teachRecord(void)
 
 #if DRAW_DEBUG_SERIAL
   Serial.print(F("[draw] 记录示教点 "));
-  Serial.print(s_ptCount);
+  Serial.print((int)s_ptCount);
   Serial.print(F("/"));
   Serial.print(DRAW_TEACH_MAX_POINTS);
   Serial.print(F("  x="));
@@ -974,14 +961,14 @@ int drawSelectTask(int task)
 {
   if (task < 0 || task >= DRAW_TASK_COUNT) return -1;
   if (s_phase != DRAW_PHASE_IDLE) return -1;      /* 忙的时候不许换任务 */
-  s_task = task;
+  s_task = (int8_t)task;
   return s_task;
 }
 
 int drawTaskCycle(void)
 {
   if (s_phase != DRAW_PHASE_IDLE) return -1;
-  s_task = (s_task + 1) % DRAW_TASK_COUNT;
+  s_task = (int8_t)((s_task + 1) % DRAW_TASK_COUNT);
   return s_task;
 }
 
@@ -1016,7 +1003,7 @@ int drawStartTask(void)
   if (s_isTeach) {
     s_ptCount = 0;
     s_curved  = (s_task == DRAW_TASK_CURVE);
-    beginHome(AFTER_HOME_TEACH);      /* 先回待机，回完进入示教 */
+    beginHome(AFTER_HOME_TEACH, DRAW_PHASE_HOME);      /* 先回待机，回完进入示教 */
 #if DRAW_DEBUG_SERIAL
     Serial.print(F("[draw] 进入示教（"));
     Serial.print(DRAW_TASK_NAME[s_task]);
@@ -1068,7 +1055,7 @@ int drawTeachUndo(void)
   s_ptCount--;
 #if DRAW_DEBUG_SERIAL
   Serial.print(F("[draw] 撤销一个示教点，剩 "));
-  Serial.println(s_ptCount);
+  Serial.println((int)s_ptCount);
 #endif
   s_lastRes = PROTO_RES_DRAW_TEACH_UNDO;
   return PROTO_RES_DRAW_TEACH_UNDO;
@@ -1127,16 +1114,10 @@ int drawCancel(void)
 
   if (s_phase == DRAW_PHASE_TEACH || s_phase == DRAW_PHASE_TEACH_WAIT) {
     s_ptCount = 0;
-    beginHome(AFTER_HOME_IDLE);       /* 示教取消：直接回待机 */
+    beginHome(AFTER_HOME_IDLE, DRAW_PHASE_HOME);       /* 示教取消：直接回待机 */
   } else {
     /* 绘制中取消：先垂直抬笔（不然笔尖会拖着纸走出一道多余的线），再回待机 */
-    double lz = Pos.rec.z + DRAW_LIFT_DZ;
-    if (!pointOk(Pos.rec.x, Pos.rec.y, lz, NULL, NULL, NULL)) lz = Pos.rec.z;
-    beginLift(lz);
-    s_nextAfterMove = DRAW_PHASE_RETURN;
-    s_phase = DRAW_PHASE_LIFT;   /* ★ 必须显式切到"抬笔"：beginLift 只装移动参数，不改阶段。
-                                  *   漏了这一行，取消后阶段还停在原来的 TRAVEL/PLUNGE/PATH，
-                                  *   状态机会接着把这一笔按原轨迹画下去 —— 取消等于没取消。 */
+    beginLiftToReturn();
   }
 #if DRAW_DEBUG_SERIAL
   Serial.println(F("[draw] 已取消：抬笔后回待机"));
@@ -1348,7 +1329,7 @@ void drawLoop(void)
       } else {
         /* 抬笔结束：要么回待机（绘制完成/取消），要么继续走 s_nextAfterMove */
         if (s_nextAfterMove == DRAW_PHASE_RETURN) {
-          beginReturn();
+          beginHome(AFTER_HOME_IDLE, DRAW_PHASE_RETURN);
         } else {
           s_phase = s_nextAfterMove;
         }
@@ -1373,17 +1354,13 @@ void drawLoop(void)
         Serial.println(Pos.rec.z, 2);
         if (s_isTeach) {
           Serial.print(F("[draw] 过点 "));
-          Serial.print(s_hitCount);
+          Serial.print((int)s_hitCount);
           Serial.print(F("/"));
-          Serial.println(s_hitTotal);
+          Serial.println((int)s_hitTotal);
         }
 #endif
         /* 画完抬笔再回待机 */
-        double lz = Pos.rec.z + DRAW_LIFT_DZ;
-        if (!pointOk(Pos.rec.x, Pos.rec.y, lz, NULL, NULL, NULL)) lz = Pos.rec.z;
-        beginLift(lz);
-        s_nextAfterMove = DRAW_PHASE_RETURN;
-        s_phase = DRAW_PHASE_LIFT;
+        beginLiftToReturn();
       }
       break;
     }
@@ -1403,3 +1380,5 @@ void drawLoop(void)
       break;
   }
 }
+
+#endif

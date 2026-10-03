@@ -1,10 +1,12 @@
 /*
 // serial_protocol.cpp
-// 串口命令协议实现：固定指令通信 + 多舵机协同（x/y/z 三舵机同步角度）
-// 另含 A/B/C 自动取放序列的启动入口（序列执行期间本层挡下其它动作指令）
-// 以及四个物理按键的串口等价命令 N/R/P/M（实现委托给 button_control.cpp）
-// 以及绘图命令 F/D/G/E/Q/U/W 与纸面标定命令 p/n/o（实现委托给 draw_control.cpp）
-// 实现串口字符读取、行缓冲、命令解析和舵机控制
+// Serial command protocol: fixed commands + multi-servo sync angles (x/y/z).
+// Also hosts the start entry of the A/B/C pick-and-place sequences (while a
+// sequence runs this layer holds back every other motion command), the serial
+// twins N/R/P/M of the four physical buttons (implementation lives in
+// button_control.cpp) and the drawing commands F/D/G/E/Q/U/W plus the paper
+// calibration commands p/n/o (implementation lives in draw_control.cpp).
+// Handles character input, line buffering, command parsing and servo writes.
 */
 
 #include "Arduino.h"
@@ -14,87 +16,202 @@
 #include "serial_protocol.h"
 #include "button_control.h"
 #include "draw_control.h"
-#define WEARM_DEBUG_SERIAL 1
+#include "weArm_config.h"
 
-/* ---------- 行缓冲与状态 ---------- */
+/* Verbose per-step traces (off by default). Leaving them off is what keeps the
+ * whole Arduino print/float formatting layer out of the image. */
+#ifndef WEARM_DEBUG_SERIAL
+#define WEARM_DEBUG_SERIAL 0
+#endif
+
+#if !WEARM_DEBUG_SERIAL
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINTLN(x)
+#define DEBUG_PRINTF(x, y)
+#else
+#define DEBUG_PRINT(x) Serial.print(x)
+#define DEBUG_PRINTLN(x) Serial.println(x)
+#define DEBUG_PRINTF(x, y) Serial.print(x, y)
+#endif
+
+/* ---------- line buffer and state ---------- */
 static char s_line[PROTO_LINE_BUF_SIZE];
 static int  s_len = 0;
-static bool s_pending = false;          /* 缓冲区里有还没派发的字符 */
-static bool s_dropUntilEol = false;     /* 本行超长，丢弃到行尾为止 */
+static bool s_pending = false;          /* characters buffered but not dispatched yet */
+static bool s_dropUntilEol = false;     /* this line is too long, drop up to the EOL */
 static unsigned long s_lastCharMs = 0;
 
-/* ---------- 辅助函数声明 ---------- */
+/* ---------- helper declarations ---------- */
+/* No noinline here on purpose: measured on the real AVR build, the attribute is
+ * a no-op. serialProtocolLoop() reaches this from three places, but gcc keeps a
+ * single out-of-line copy anyway, and the whole dispatcher only exists once
+ * because protoHandleLine() has no caller outside this file. */
 static void protoFlushLine(void);
-static bool protoParseAxisLine(const char *s, double angles[3], bool seen[3]);
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
-static int protoApplyAngles(const double angles[3], const bool seen[3]);
+static void protoApplyAngles(const double angles[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
 
-/* ========== 主循环接口 ========== */
-/* 每轮 loop() 调用一次：把串口收到的字符攒成一行并执行 */
+/* Skip blanks (space / tab) and return the first significant character.
+ * Out of line on purpose: a dozen call sites share this one copy. Measured:
+ * forcing always_inline here costs +40 bytes, the call is cheaper than the
+ * expanded loop. */
+static const char *protoSkipBlanks(const char *p)
+{
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  return p;
+}
+
+/* Skip blanks in place */
+#define PROTO_SKIP_BLANKS(p) do { (p) = protoSkipBlanks(p); } while (0)
+
+/* The PC self-check mock has no pgmspace.h; the AVR core defines both of these. */
+#ifndef PSTR
+#define PSTR(s) (s)
+#endif
+#ifndef pgm_read_byte
+#define pgm_read_byte(addr) (*(const unsigned char *)(addr))
+#endif
+#ifndef PROGMEM
+#define PROGMEM
+#endif
+
+/* ========== response layer (WEARM_SERIAL_RESPONSES) ========== */
+#if WEARM_SERIAL_RESPONSES
+/* One byte out. Print::print(char) forwards straight to
+ * HardwareSerial::write(uint8_t), so none of the Arduino number formatting
+ * code is reachable from here - that is what keeps this layer at a few hundred
+ * bytes instead of the ~9.5 KB that Serial.print(double) would drag in. */
+static void protoPut(char c)
+{
+  Serial.print(c);
+}
+
+/* Gripper echo: angle4 is clamped into servoLimit f, i.e. 0..999, so a plain
+ * three digit printer is enough. */
+static void protoWriteInt(int v)
+{
+  if (v >= 100) {
+    protoPut((char)('0' + v / 100));
+  }
+  if (v >= 10) {
+    protoPut((char)('0' + (v / 10) % 10));
+  }
+  protoPut((char)('0' + v % 10));
+}
+
+/* Walk <text> straight out of flash and send it; every reply ends with a
+ * newline and a '#' becomes the clamped gripper angle in decimal. Kept out of
+ * line on purpose: with -flto gcc otherwise clones this loop into every reply
+ * site, where the per site argument setup costs more than the call. */
+__attribute__((noinline, noclone))
+static void protoReply(const char *text)
+{
+  char c;
+
+  while ((c = (char)pgm_read_byte(text++)) != '\0') {
+    if (c == '#') {
+      protoWriteInt((int)Pos.ser.angle4);
+    } else {
+      protoPut(c);
+    }
+  }
+  protoPut('\n');
+}
+
+/* One flash copy per reply text. Naming the arrays keeps gcc from emitting a
+ * separate copy (plus alignment padding) for every call site. */
+static const char s_rOk[] PROGMEM = "OK";
+static const char s_rErr[] PROGMEM = "ERR";
+static const char s_rRej[] PROGMEM = "REJECTED";
+static const char s_rOkN[] PROGMEM = "OK #";
+static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z";
+
+#define R_OK()   protoReply(s_rOk)
+#define R_ERR()  protoReply(s_rErr)
+#define R_REJ()  protoReply(s_rRej)
+#define R_OKN()  protoReply(s_rOkN)
+#define R_BOOT() protoReply(s_rBoot)
+#else
+#define R_OK()   do { } while (0)
+#define R_ERR()  do { } while (0)
+#define R_REJ()  do { } while (0)
+#define R_OKN()  do { } while (0)
+#define R_BOOT() do { } while (0)
+#endif
+
+/* ========== command class bitmaps ========== */
+/* Index i = cmd - '0' spans '0'(0x30) .. 'p'(0x70), which covers every command
+ * character; anything else falls off the end and is rejected.
+ * s_liveBits: the command is still accepted while a module is busy.
+ * s_fastBits: the command runs as soon as its single character arrives, i.e.
+ * without waiting for the end of the line. */
+static const uint8_t s_liveBits[9] PROGMEM = { 0x0F, 0x00, 0xF0, 0x71, 0xA7, 0x00, 0x00, 0xC0, 0x01 };
+static const uint8_t s_fastBits[9] PROGMEM = { 0x0E, 0x00, 0x0E, 0x99, 0x08, 0x00, 0x00, 0x08, 0x00 };
+
+__attribute__((noinline)) static bool protoCmdBit(const uint8_t *bits, char cmd)
+{
+  uint8_t i = (uint8_t)cmd - (uint8_t)'0';
+
+  if (i > 64u) {
+    return false;
+  }
+  return (pgm_read_byte(bits + (i >> 3)) & (uint8_t)(1u << (i & 7u))) != 0;
+}
+
+/* ========== main loop interface ========== */
+/* Called once per loop(): collect the characters that arrived into one line and run it */
 void serialProtocolLoop(void)
 {
   while (Serial.available() > 0) {
     int c = Serial.read();
     if (c < 0) break;
 
-    /* 记录最后收到字符的时间 */
+    /* remember when the last character arrived */
     s_lastCharMs = millis();
 
-    /* 处理超长行的丢弃状态 */
-    if (s_dropUntilEol) {
-      if (c == '\n' || c == '\r') {
+    /* over-long line: stay in the dropping state until the EOL */
+    if (c == '\n' || c == '\r') {
+      if (s_dropUntilEol) {
         s_dropUntilEol = false;
-        s_line[0] = '\0';
         s_len = 0;
         s_pending = false;
+      } else {
+        protoFlushLine();
       }
-      continue;  /* 丢弃字符直到行尾 */
-    }
-
-    /* 处理换行符 - 派发当前行 */
-    if (c == '\n' || c == '\r') {
-      protoFlushLine();
       continue;
     }
+    if (s_dropUntilEol) {
+      continue;  /* drop characters up to the EOL */
+    }
 
-    /* 检查行缓冲区溢出 */
+    /* line buffer overflow */
     if (s_len >= PROTO_LINE_BUF_SIZE - 1) {
       s_dropUntilEol = true;
       s_len = 0;
       s_pending = false;
-#if WEARM_DEBUG_SERIAL
-      Serial.println(F("[proto] line too long, dropped"));
-#endif
       continue;
     }
 
-    /* 存储字符到行缓冲区 */
+    /* store the character */
     s_line[s_len++] = (char)c;
-    s_line[s_len] = '\0';
     s_pending = true;
 
-    /* 单字符固定命令立即执行 */
-    if (s_len == 1) {
-      char cmd = s_line[0];
-      if (cmd == PROTO_CMD_GRIPPER_OPEN || cmd == PROTO_CMD_GRIPPER_CLOSE ||
-          cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN ||
-          cmd == PROTO_CMD_SPEED_SLOW || cmd == PROTO_CMD_SPEED_NORMAL ||
-          cmd == PROTO_CMD_SPEED_FAST ||
-          cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP ||
-          cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B || cmd == PROTO_CMD_PICK_C) {
-        protoFlushLine();  /* 立即派发单字符命令 */
-      }
+    /* single character fixed commands run immediately */
+    if (s_len == 1 && protoCmdBit(s_fastBits, s_line[0])) {
+      protoFlushLine();  /* dispatch single character commands right away */
     }
   }
 
-  /* 处理行超时：如果缓冲区有数据且超时，则派发 */
+  /* line timeout: buffered data that went quiet is treated as a complete line */
   if (s_pending && (millis() - s_lastCharMs) >= PROTO_LINE_TIMEOUT_MS) {
     protoFlushLine();
   }
 
-  /* 处理超长行丢弃超时 */
+  /* over-long line drop timeout */
   if (s_dropUntilEol && (millis() - s_lastCharMs) >= PROTO_LINE_TIMEOUT_MS) {
     s_dropUntilEol = false;
     s_line[0] = '\0';
@@ -103,8 +220,8 @@ void serialProtocolLoop(void)
   }
 }
 
-/* ========== 派发函数 ========== */
-/* 派发当前行到命令处理器 */
+/* ========== dispatch ========== */
+/* Dispatch the buffered line to the command handler */
 static void protoFlushLine(void)
 {
   s_line[s_len] = '\0';
@@ -115,220 +232,169 @@ static void protoFlushLine(void)
   s_pending = false;
 }
 
-/* ========== 命令处理 ========== */
-/* 直接处理一整行命令（不含换行符） */
+/* ========== command handling ========== */
+/* Handle one complete line (newline already removed) */
 int protoHandleLine(const char *line)
 {
   if (line == NULL) {
     return PROTO_RES_NONE;
   }
 
-  /* 创建局部副本并裁剪空白 */
-  char buf[PROTO_LINE_BUF_SIZE];
-  int i = 0, j = 0;
-  bool in_space = true;
+  /* Work directly on the caller's string. Every parser below skips blanks on
+   * its own, so the old "collapse blanks into a local copy" pass - and the
+   * 40 byte stack frame it needed - is gone. */
+  const char *p = line;
+  PROTO_SKIP_BLANKS(p);
 
-  /* 复制并跳过前导空白 */
-  while (line[i] != '\0' && (line[i] == ' ' || line[i] == '\t')) {
-    i++;
-  }
-
-  /* 复制非空白字符，记录最后一个非空白位置 */
-  while (line[i] != '\0' && j < PROTO_LINE_BUF_SIZE - 1) {
-    if (line[i] == ' ' || line[i] == '\t') {
-      if (!in_space) {
-        buf[j++] = ' ';  /* 保留单个空格分隔符 */
-        in_space = true;
-      }
-    } else {
-      buf[j++] = line[i];
-      in_space = false;
-    }
-    i++;
-  }
-
-  /* 裁剪尾部空白 */
-  while (j > 0 && (buf[j-1] == ' ' || buf[j-1] == '\t')) {
-    j--;
-  }
-  buf[j] = '\0';
-
-  /* 空行处理 */
-  if (j == 0) {
+  const char cmd = *p;
+  if (cmd == '\0') {
     return PROTO_RES_NONE;
   }
 
-  /* 忙判定：取放序列执行期间，或按键模块正在录制/播放/回中，或绘图任务正在跑时，
-   * 其它串口动作指令与摇杆都让位。
+  /* "single" is the old "normalized length == 1": blanks only after the command
+   * character. buf[0] of the old copy was exactly this cmd. */
+  const char *tail = p + 1;
+  PROTO_SKIP_BLANKS(tail);
+  const bool single = (*tail == '\0');
+
+  /* Busy decision: while a pick/place sequence runs, or the button module is
+   * recording/playing/homing, or a drawing task is running, every other serial
+   * motion command gives way.
    *
-   * 两个例外必须放行（由被调用的模块自己再判一次，不合格就回 PROTO_RES_BUSY）：
-   *   1) 调速指令（H、L、1、2、3）—— 取放序列与录制的过程中都可能想调速度；
-   *   2) 按键命令（N、R、P、M）—— 录制中想发 R 结束录制，若在这里就被拦掉就永远结束不了。
-   *   3) 绘图命令（F、D、G、E、Q、U、W 与 p、n、o）—— 暂停/继续/取消/记录/标定
-   *      正是"绘图进行中"才需要发的命令，拦掉就等于三项控制功能全废。 */
-  if (pickPlaceIsBusy() || buttonControlBusy() || drawControlBusy()) {
-    char cmd = buf[0];
-    bool speedCmd = (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN ||
-                     cmd == PROTO_CMD_SPEED_SLOW || cmd == PROTO_CMD_SPEED_NORMAL ||
-                     cmd == PROTO_CMD_SPEED_FAST);
-    if (!speedCmd && !buttonIsCommandChar(cmd) && !drawIsCommandChar(cmd)) {
-      /* 不打这句的话，上位机在序列执行的十几秒里发什么都不回话，
-       * 操作者会以为板子死机了（实际是故意不执行）。 */
-#if WEARM_DEBUG_SERIAL
-      Serial.println(F("[proto] busy: pick/place, button or draw running, command ignored"));
-#endif
+   * Two exceptions must pass (the callee decides again and answers
+   * PROTO_RES_BUSY when it disagrees):
+   *   1) speed commands (H, L, 1, 2, 3) - you may want to change speed in the
+   *      middle of a pick/place sequence or a recording;
+   *   2) button commands (N, R, P, M) - sending R to stop a recording must not
+   *      be blocked here, or the recording could never be stopped.
+   *   3) drawing commands (F, D, G, E, Q, U, W and p, n, o) - pause/resume/
+   *      cancel/teach/calibrate are exactly what you send while drawing, so
+   *      blocking them would disable all three control functions.
+   *
+   * The three predicates are pure queries, so || order cannot change the
+   * answer; it is written cheapest-first only to keep the code short.
+   * Measured: -8 bytes versus pickPlaceIsBusy() first. */
+  if (drawControlBusy() || buttonControlBusy() || pickPlaceIsBusy()) {
+    if (!protoCmdBit(s_liveBits, cmd)) {
       return PROTO_RES_BUSY;
     }
   }
 
-  /* 单字符命令处理 */
-  if (j == 1) {
-    char cmd = buf[0];
-    switch (cmd) {
-      case PROTO_CMD_GRIPPER_OPEN:
+  /* single character commands */
+  if (single) {
+    /* k/K are pulled out of the switch below: 'k' is the only case above 'W',
+     * so the emitted jump table stays 40 entries wide instead of 60. */
+    if (cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP) {
+      if (cmd == PROTO_CMD_TOOL_OPEN_STEP) {
+        posToolOpen(PROTO_TOOL_STEP_DEG);
+      } else {
+        posToolClose(PROTO_TOOL_STEP_DEG);
+      }
+      DEBUG_PRINT(F("[tool] angle4 -> "));
+      DEBUG_PRINTLN(Pos.ser.angle4);
+      return PROTO_RES_TOOL_STEP;
+    }
+
+    /* '0' (home) and '1'..'3' (speed presets) sit far below the high end of the
+     * switch, so they are handled here: the emitted jump table stays 23 entries
+     * wide instead of 40. */
+    if (cmd == PROTO_CMD_BTN_HOME_ALT) {
+      return buttonHandleCommand(cmd);
+    }
+    if (cmd >= PROTO_CMD_SPEED_SLOW && cmd <= PROTO_CMD_SPEED_FAST) {
+      /* '1','2','3' are SPEED_SLOW..SPEED_FAST in that order */
+      int level = cmd - PROTO_CMD_SPEED_SLOW;
+      adjustSpeed(level);
+      DEBUG_PRINT(F("[speed] serial cmd -> "));
+      DEBUG_PRINTLN(speedLevelName(level));
+      return PROTO_RES_SPEED_LEVEL;
+    }
+
+    /* An if chain instead of a switch on purpose: the case labels span 'O'..'W',
+     * but '0' and '1' keep the table's low bound, so switch emits a 64 entry
+     * jump table while the chain only pays for the comparisons it needs.
+     * Measured on the real AVR build: -78 bytes for this whole dispatcher. */
+    if (cmd == PROTO_CMD_GRIPPER_OPEN) {
         posSetAngle4(servoLimit.maxF);
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[tool] angle4 -> "));
-        Serial.println(Pos.ser.angle4);
-#endif
+        DEBUG_PRINT(F("[tool] angle4 -> "));
+        DEBUG_PRINTLN(Pos.ser.angle4);
+        R_OKN();
         return PROTO_RES_GRIPPER_OPEN;
 
-      case PROTO_CMD_GRIPPER_CLOSE:
+    } else if (cmd == PROTO_CMD_GRIPPER_CLOSE) {
         posSetAngle4(servoLimit.minF);
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[tool] angle4 -> "));
-        Serial.println(Pos.ser.angle4);
-#endif
+        DEBUG_PRINT(F("[tool] angle4 -> "));
+        DEBUG_PRINTLN(Pos.ser.angle4);
+        R_OKN();
         return PROTO_RES_GRIPPER_CLOSE;
 
-      case PROTO_CMD_SPEED_UP:
-        protoSpeedStep(+1);
-        return PROTO_RES_SPEED_UP;
+    } else if (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN) {
+        protoSpeedStep((cmd == PROTO_CMD_SPEED_UP) ? +1 : -1);
+        return (cmd == PROTO_CMD_SPEED_UP) ? PROTO_RES_SPEED_UP : PROTO_RES_SPEED_DOWN;
 
-      case PROTO_CMD_SPEED_DOWN:
-        protoSpeedStep(-1);
-        return PROTO_RES_SPEED_DOWN;
-
-      case PROTO_CMD_SPEED_SLOW:
-      case PROTO_CMD_SPEED_NORMAL:
-      case PROTO_CMD_SPEED_FAST:
-      {
-        int level = (cmd == PROTO_CMD_SPEED_SLOW) ? SPEED_SLOW :
-                    (cmd == PROTO_CMD_SPEED_NORMAL) ? SPEED_NORMAL : SPEED_FAST;
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[speed] serial cmd -> "));
-        Serial.println(speedLevelName(level));
-#endif
-        adjustSpeed(level);
-        return PROTO_RES_SPEED_LEVEL;
-      }
-
-      case PROTO_CMD_TOOL_OPEN_STEP:
-      {
-        bool result = posToolOpen(PROTO_TOOL_STEP_DEG);
-#if WEARM_DEBUG_SERIAL
-        if (result) {
-          Serial.print(F("[tool] angle4 -> "));
-          Serial.println(Pos.ser.angle4);
-        } else {
-          Serial.print(F("[tool] at limit, angle4 = "));
-          Serial.println(Pos.ser.angle4);
+    } else if (cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B ||
+               cmd == PROTO_CMD_PICK_C) {
+        int object = PICK_OBJECT_A + (cmd - PROTO_CMD_PICK_A);
+        int rc = pickPlaceStart(object);
+        DEBUG_PRINT(F("[pick] "));
+        DEBUG_PRINT(cmd);
+        DEBUG_PRINT(F(" start -> "));
+        DEBUG_PRINTLN(rc == 0 ? F("OK") : F("REJECTED"));
+        /* 0 = started; -2 = busy; -1/-3 = could not start this time (bad number /
+         * path validation failed). Both are reported as BUSY so the host knows
+         * the command was understood but the sequence did not run; the reason is
+         * on the debug serial. */
+        if (rc == 0) {
+          R_OK();
+          return PROTO_RES_PICK_STARTED;
         }
-#endif
-        return PROTO_RES_TOOL_STEP;
-      }
+        R_REJ();
+        return PROTO_RES_BUSY;
 
-      case PROTO_CMD_TOOL_CLOSE_STEP:
-      {
-        bool result = posToolClose(PROTO_TOOL_STEP_DEG);
-#if WEARM_DEBUG_SERIAL
-        if (result) {
-          Serial.print(F("[tool] angle4 -> "));
-          Serial.println(Pos.ser.angle4);
-        } else {
-          Serial.print(F("[tool] at limit, angle4 = "));
-          Serial.println(Pos.ser.angle4);
-        }
-#endif
-        return PROTO_RES_TOOL_STEP;
-      }
-
-      case PROTO_CMD_PICK_A:
-      {
-        int rc = pickPlaceStart(PICK_OBJECT_A);
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[pick] A start -> "));
-        Serial.println(rc == 0 ? "OK" : "REJECTED");
-#endif
-        /* 0 = 已启动；-2 = 正忙；-1/-3 = 本次没能启动（编号非法 / 路径校验失败），
-         * 都归到 BUSY，让上位机知道"指令认了但序列没跑"，具体原因看调试串口 */
-        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
-      }
-
-      case PROTO_CMD_PICK_B:
-      {
-        int rc = pickPlaceStart(PICK_OBJECT_B);
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[pick] B start -> "));
-        Serial.println(rc == 0 ? "OK" : "REJECTED");
-#endif
-        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
-      }
-
-      case PROTO_CMD_PICK_C:
-      {
-        int rc = pickPlaceStart(PICK_OBJECT_C);
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[pick] C start -> "));
-        Serial.println(rc == 0 ? "OK" : "REJECTED");
-#endif
-        return (rc == 0) ? PROTO_RES_PICK_STARTED : PROTO_RES_BUSY;
-      }
-
-      /* N/R/P/M 与 '0'：四个物理按键的串口等价命令。
-       * 具体能不能执行（是否正在录制/播放/取放）由 button_control.cpp 自己判断，
-       * 不合格时它返回 PROTO_RES_BUSY —— 上面的忙守卫特意放行了这几个字符，
-       * 否则录制中发 R 想结束录制会被守卫拦掉。 */
-      case PROTO_CMD_BTN_CYCLE:
-      case PROTO_CMD_BTN_RECORD:
-      case PROTO_CMD_BTN_PLAY:
-      case PROTO_CMD_BTN_HOME:
-      case PROTO_CMD_BTN_HOME_ALT:
+    /* N/R/P/M and '0': serial twins of the four physical buttons. Whether they
+     * can run right now (recording/playing/pick-place) is decided inside
+     * button_control.cpp, which answers PROTO_RES_BUSY when it cannot - the
+     * busy guard above deliberately lets these characters through, otherwise
+     * sending R to stop a recording would be blocked. */
+    } else if (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
+               cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME) {
         return buttonHandleCommand(cmd);
 
-      /* F/D/G/E/Q/U/W：绘图命令（切换任务 / 开始 / 记录示教点 / 撤销 / 暂停 / 继续 / 取消）。
-       * 具体能不能执行（是否正在绘制、示教点够不够、轨迹校验过不过）由
-       * draw_control.cpp 自己判断，不合格时它返回 PROTO_RES_BUSY 或 PROTO_RES_DRAW_REJECTED
-       * —— 上面的忙守卫特意放行了这几个字符，否则"绘图进行中"想暂停/取消会被拦掉。 */
-      case PROTO_CMD_DRAW_TASK:
-      case PROTO_CMD_DRAW_START:
-      case PROTO_CMD_DRAW_RECORD:
-      case PROTO_CMD_DRAW_UNDO:
-      case PROTO_CMD_DRAW_PAUSE:
-      case PROTO_CMD_DRAW_RESUME:
-      case PROTO_CMD_DRAW_CANCEL:
+    /* F/D/G/E/Q/U/W: drawing commands (pick task / start / teach point / undo /
+     * pause / resume / cancel). Whether they can run (already drawing, not
+     * enough teach points, path validation) is decided inside draw_control.cpp,
+     * which answers PROTO_RES_BUSY or PROTO_RES_DRAW_REJECTED - the busy guard
+     * above deliberately lets these characters through, otherwise pause/cancel
+     * while drawing would be blocked. */
+    } else if (cmd == PROTO_CMD_DRAW_TASK || cmd == PROTO_CMD_DRAW_START ||
+               cmd == PROTO_CMD_DRAW_RECORD || cmd == PROTO_CMD_DRAW_UNDO ||
+               cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
+               cmd == PROTO_CMD_DRAW_CANCEL) {
         return drawHandleCommand(cmd);
     }
-    /* 单字符命令不识别，继续往下走角度解析 */
+    /* unknown single character command: fall through to angle parsing */
   }
 
-  /* 纸面标定命令 p/n/o：多字符（p12.5 / n6 / o20,0），落在角度解析之前处理，
-   * 因为 'o' 那行含逗号，不先截下来会被当成"像角度指令却写错了"。 */
-  if (buf[0] == PROTO_CMD_DRAW_PAPER_Z ||
-      buf[0] == PROTO_CMD_DRAW_HALF ||
-      buf[0] == PROTO_CMD_DRAW_CENTER) {
-    return protoHandleDrawCalib(buf, buf[0]);
+  /* Paper calibration p/n/o: multi character (p12.5 / n6 / o20,0). Handled
+   * before angle parsing because the 'o' line contains a comma and would
+   * otherwise be taken for "an angle command with a syntax error". */
+  if (cmd == PROTO_CMD_DRAW_PAPER_Z ||
+      cmd == PROTO_CMD_DRAW_HALF ||
+      cmd == PROTO_CMD_DRAW_CENTER) {
+    return protoHandleDrawCalib(p, cmd);
   }
 
-  /* 角度指令解析 */
-  if (protoAxisIndexFromChar(buf[0]) >= 0) {
+  int rc = PROTO_RES_UNKNOWN;
 
-    double angles[3] = {0};
-    bool seen[3] = {false};
+  if (protoAxisIndexFromChar(cmd) >= 0) {
+    /* angle command */
+    double angles[3];
+    uint8_t seen = 0;
 
-    if (protoParseAxisLine(buf, angles, seen)) {
-      int written = protoApplyAngles(angles, seen);
-      if (written > 0) {
+    rc = PROTO_RES_BAD_SYNTAX;
+    if (protoParseAxisLine(p, angles, &seen)) {
+      protoApplyAngles(angles, seen);
+      {
 #if WEARM_DEBUG_SERIAL
         Serial.print(F("[proto] sync angles b="));
         Serial.print(Pos.ser.angle1);
@@ -337,297 +403,270 @@ int protoHandleLine(const char *line)
         Serial.print(F(" c="));
         Serial.println(Pos.ser.angle3);
 #endif
-        return PROTO_RES_ANGLES_SET;
+        rc = PROTO_RES_ANGLES_SET;
       }
     }
-#if WEARM_DEBUG_SERIAL
-    Serial.println(F("[proto] bad syntax, ignored"));
-#endif
-    return PROTO_RES_BAD_SYNTAX;
+    DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
+  } else {
+    /* Not an axis letter, but it contains a comma or starts with '=': it looks
+     * like an angle command that was mistyped. Everything else is unknown. */
+    const char *scan = p;
+    while (*scan != '\0' && *scan != ',') {
+      scan++;
+    }
+    if (*scan == ',' || cmd == '=') {
+      rc = PROTO_RES_BAD_SYNTAX;
+    }
   }
 
-  /* 不是轴字母开头，但含逗号或以等号开头：像角度指令却写错了，归 BAD_SYNTAX；其余归 UNKNOWN */
-  if (strchr(buf, ',') != NULL || buf[0] == '=') {
-    return PROTO_RES_BAD_SYNTAX;
+  if (rc == PROTO_RES_ANGLES_SET) {
+    R_OK();
+  } else {
+    R_ERR();
   }
-
-  /* 未知命令 */
-#if WEARM_DEBUG_SERIAL
-  Serial.println(F("[proto] unknown cmd"));
-#endif
-  return PROTO_RES_UNKNOWN;
+  return rc;
 }
 
-/* ========== 角度解析 ========== */
-/* 解析角度指令：组 (逗号分隔的组)*，组 = [空白] 轴字母[空白] [可选的等号] [空白] 角度值。
- * 整行必须正好解析完；同一个轴出现两次以最后一次为准。
- * 任何不符合语法的输入都返回 false，且不改动 angles/seen 以外的任何东西。 */
-static bool protoParseAxisLine(const char *s, double angles[3], bool seen[3])
+/* ========== angle parsing ========== */
+/* Parse an angle command: group (',' group)*, group = [blank] axis letter [blank]
+ * [optional '='] [blank] value. The whole line must parse; an axis given twice
+ * keeps its last value. Anything that does not match the grammar returns false
+ * and touches nothing but angles/seen. */
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
 {
   const char *p = s;
   int groups = 0;
 
   for (;;) {
-    /* 1) 组前空白 */
-    while (*p == ' ' || *p == '\t') p++;
+    /* 1) blanks before the group */
+    PROTO_SKIP_BLANKS(p);
 
-    /* 2) 轴字母（大小写都认） */
+    /* 2) axis letter (either case) */
     int axis = protoAxisIndexFromChar(*p);
     if (axis < 0) return false;
     p++;
 
-    /* 3) 字母与等号之间的空白 */
-    while (*p == ' ' || *p == '\t') p++;
+    /* 3) blanks between the letter and the '=' */
+    PROTO_SKIP_BLANKS(p);
 
-    /* 4) 可选等号 */
+    /* 4) optional '=' */
     if (*p == '=') {
       p++;
-      while (*p == ' ' || *p == '\t') p++;
+      PROTO_SKIP_BLANKS(p);
     }
 
-    /* 5) 角度值（必须真的有数字） */
-    double value = 0.0;
-    if (!protoParseNumber(&p, &value)) return false;
+    /* 5) the value (must really start with a digit) */
+    if (!protoParseNumber(&p, &angles[axis])) return false;
 
-    /* 6) 记录（同轴重复以最后一次为准） */
-    angles[axis] = value;
-    seen[axis] = true;
+    /* 6) record it (an axis given twice keeps the last value) */
+    *seen |= (uint8_t)(1u << axis);
     groups++;
 
-    /* 7) 后面必须是行尾或逗号 */
-    while (*p == ' ' || *p == '\t') p++;
+    /* 7) only the end of line or a comma may follow */
+    PROTO_SKIP_BLANKS(p);
     if (*p == '\0') break;
     if (*p != ',') return false;
-    p++;   /* 吃掉逗号，进入下一组 */
+    p++;   /* eat the comma and go to the next group */
   }
 
   return (groups > 0);
 }
 
-/* 手写数字解析：避免使用 strtod/atof */
+/* Hand written number parser: avoids strtod/atof */
 static bool protoParseNumber(const char **pp, double *out)
 {
   const char *p = *pp;
-  double result = 0.0;
-  int sign = 1;
-  bool has_digits = false;
-  double decimal_place = 0.1;
+  bool neg = false;
+  unsigned int ip = 0;
+  double value;
 
-  /* 可选正负号 */
+  /* optional sign */
   if (*p == '+') {
     p++;
   } else if (*p == '-') {
-    sign = -1;
+    neg = true;
     p++;
   }
 
-  /* 整数部分：至少一位数字 */
-  while (*p >= '0' && *p <= '9') {
-    result = result * 10 + (*p - '0');
-    has_digits = true;
-    p++;
-  }
-
-  /* 小数部分：必须有数字 */
-  if (*p == '.') {
-    p++;
-    bool decimal_has_digits = false;
-
-    while (*p >= '0' && *p <= '9') {
-      result += (*p - '0') * decimal_place;
-      decimal_place *= 0.1;
-      decimal_has_digits = true;
-      p++;
-    }
-
-    if (!decimal_has_digits) {
-      return false;  /* "12." 不合法 */
-    }
-
-  }
-
-  /* 必须有数字 */
-  if (!has_digits) {
+  /* integer part: at least one digit */
+  if (*p < '0' || *p > '9') {
     return false;
   }
+  /* Digits are collected in an integer and converted once. Saturating at
+   * 1000000 leaves the clamped result identical to the old per digit double
+   * accumulation: every value this firmware accepts as an angle is far below
+   * the clamp ceiling, so both forms end up at the same limit. */
+  do {
+    if (ip < 9999u) {
+      ip = ip * 10u + (unsigned int)(*p - '0');
+    }
+    p++;
+  } while (*p >= '0' && *p <= '9');
 
-  result *= sign;
-  *out = result;
+  value = (double)ip;
+
+  /* fraction: a '.' must be followed by digits, and the digits are still added
+   * one decimal place at a time so the rounding is unchanged */
+  if (*p == '.') {
+    double decimal_place = 0.1;
+    p++;
+    if (*p < '0' || *p > '9') {
+      return false;  /* "12." is not valid */
+    }
+    do {
+      value += (*p - '0') * decimal_place;
+      decimal_place *= 0.1;
+      p++;
+    } while (*p >= '0' && *p <= '9');
+  }
+
+  *out = neg ? -value : value;
   *pp = p;
   return true;
 }
 
-/* ========== 绘图参数标定 ========== */
-/* p<纸面高度> / n<半宽> / o<中心x>,<中心y>
- * 语法错或取值超出允许范围都返回 PROTO_RES_DRAW_REJECTED，且不改动任何参数。 */
+/* ========== drawing parameter calibration ========== */
+/* p<paper z> / n<half width> / o<center x>,<center y>
+ * A syntax error or an out-of-range value answers PROTO_RES_DRAW_REJECTED and
+ * changes no parameter. */
 static int protoHandleDrawCalib(const char *line, char cmd)
 {
-  const char *p = line + 1;   /* 跳过命令字母 */
-  double v1 = 0.0;
-  double v2 = 0.0;
+  const char *p = line + 1;   /* skip the command letter */
+  double v1;
+  double v2;
 
-  while (*p == ' ' || *p == '\t') p++;
-  if (!protoParseNumber(&p, &v1)) return PROTO_RES_DRAW_REJECTED;
-  while (*p == ' ' || *p == '\t') p++;
+  PROTO_SKIP_BLANKS(p);
+  if (!protoParseNumber(&p, &v1)) {
+    R_ERR();
+    return PROTO_RES_DRAW_REJECTED;
+  }
+  PROTO_SKIP_BLANKS(p);
 
   bool ok = false;
   if (cmd == PROTO_CMD_DRAW_PAPER_Z) {
     if (*p == '\0') ok = drawSetPaperZ(v1);
   } else if (cmd == PROTO_CMD_DRAW_HALF) {
     if (*p == '\0') ok = drawSetHalfSize(v1);
-  } else {
-    if (*p == ',') {
-      p++;
-      while (*p == ' ' || *p == '\t') p++;
-      if (protoParseNumber(&p, &v2)) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0') ok = drawSetCenter(v1, v2);
-      }
+  } else if (*p == ',') {
+    p++;
+    PROTO_SKIP_BLANKS(p);
+    if (protoParseNumber(&p, &v2) && *p == '\0') {
+      ok = drawSetCenter(v1, v2);
     }
   }
 
-#if WEARM_DEBUG_SERIAL
   if (ok) {
-    Serial.print(F("[draw] 标定 -> 纸面 z="));
-    Serial.print(drawGetPaperZ(), 2);
-    Serial.print(F(" 半宽="));
-    Serial.print(drawGetHalfSize(), 2);
-    Serial.print(F(" 中心=("));
-    Serial.print(drawGetCenterX(), 2);
-    Serial.print(F(","));
-    Serial.print(drawGetCenterY(), 2);
-    Serial.println(F(")"));
-  } else {
-    Serial.println(F("[draw] 标定命令语法错或取值非法，参数未改动"));
+    R_OK();
+    DEBUG_PRINT(F("[draw] calib -> paper z="));
+    DEBUG_PRINTF(drawGetPaperZ(), 2);
+    DEBUG_PRINT(F(" half="));
+    DEBUG_PRINTF(drawGetHalfSize(), 2);
+    DEBUG_PRINT(F(" center=("));
+    DEBUG_PRINTF(drawGetCenterX(), 2);
+    DEBUG_PRINT(F(","));
+    DEBUG_PRINTF(drawGetCenterY(), 2);
+    DEBUG_PRINTLN(F(")"));
+    return PROTO_RES_DRAW_CALIBRATED;
   }
-#endif
 
-  return ok ? PROTO_RES_DRAW_CALIBRATED : PROTO_RES_DRAW_REJECTED;
+  R_ERR();
+  DEBUG_PRINTLN(F("[draw] calib syntax error or bad value, parameters unchanged"));
+  return PROTO_RES_DRAW_REJECTED;
 }
 
-/* ========== 落地写入 ========== */
-/* 将解析的角度应用到舵机 */
-static int protoApplyAngles(const double angles[3], const bool seen[3])
+/* ========== landing the parsed angles ========== */
+/* Write the parsed angles to the servos */
+static void protoApplyAngles(const double angles[3], uint8_t seen)
 {
-  int written_count = 0;
-
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
-    if (!seen[a]) continue;
+    if (!(seen & (uint8_t)(1u << a))) continue;
 
-    /* 获取该轴的行程限制 */
-    double min_angle, max_angle;
-    if (!protoAxisGetLimit(a, &min_angle, &max_angle)) {
-      continue;  /* 理论上不会发生 */
-    }
-
-    /* 夹角到行程范围内 */
-    double angle = angles[a];
-    if (angle < min_angle) angle = min_angle;
-    if (angle > max_angle) angle = max_angle;
-
-    /* 写入对应的舵机角度 */
-    switch (protoAxisServoIndex[a]) {
-      case 1:  /* angle1 = b 基座回转 */
-        Pos.ser.angle1 = angle;
-        break;
-      case 2:  /* angle2 = r 上臂俯仰 */
-        Pos.ser.angle2 = angle;
-        break;
-      case 3:  /* angle3 = c 下臂俯仰 */
-        Pos.ser.angle3 = angle;
-        break;
-    }
-
-    written_count++;
+    /* angle1 = b, angle2 = r, angle3 = c, so the servo index of axis a is a
+     * itself; protoAxisServoIndex[] only spells that same mapping out. */
+    (&Pos.ser.angle1)[a] = angles[a];
   }
 
-  /* 同步语义：所有轴写完后，只调用一次正运动学 */
-  if (written_count > 0) {
-    bool success = recFromServo(&Pos.rec, &Pos.ser);
-    if (!success) {
-#if WEARM_DEBUG_SERIAL
-      Serial.println(F("[proto] warning: recFromServo failed"));
-#endif
-    }
+  /* sync semantics: clamp every joint into its travel range (the same check the
+   * rest of the firmware shares, which keeps six double comparisons out of this
+   * file) and run the forward kinematics once. The caller only reaches this
+   * point with at least one axis seen, so the old guard was always true. */
+  clampServoAngles(&Pos.ser);
+  if (!recFromServo(&Pos.rec, &Pos.ser)) {
+    DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
   }
-
-  return written_count;
 }
 
-/* ========== 速度控制 ========== */
-/* 速度档位步进 */
+/* ========== speed control ========== */
+/* Step the speed level */
 static int protoSpeedStep(int delta)
 {
   int current_level = speedGetLevel();
 
-  /* 如果当前是自定义档位，则使用默认档位 */
+  /* a custom level falls back to the default one */
   if (current_level < PROTO_SPEED_LEVEL_MIN || current_level > PROTO_SPEED_LEVEL_MAX) {
     current_level = PROTO_SPEED_LEVEL_DEF;
   }
 
   int want_level = current_level + delta;
 
-  /* 夹到档位边界 */
+  /* clamp to the level range */
   if (want_level < PROTO_SPEED_LEVEL_MIN) {
     want_level = PROTO_SPEED_LEVEL_MIN;
   } else if (want_level > PROTO_SPEED_LEVEL_MAX) {
     want_level = PROTO_SPEED_LEVEL_MAX;
   }
 
-  /* 如果已经在端点，不调用 adjustSpeed */
+  /* already at the end: do not call adjustSpeed */
   if (want_level == current_level) {
-#if WEARM_DEBUG_SERIAL
-    Serial.print(F("[speed] already at "));
-    Serial.println(speedLevelName(current_level));
-#endif
+    DEBUG_PRINT(F("[speed] already at "));
+    DEBUG_PRINTLN(speedLevelName(current_level));
     return current_level;
   }
 
-  /* 调整速度档位 */
+  /* change the speed level */
   want_level = adjustSpeed(want_level);
-#if WEARM_DEBUG_SERIAL
-  Serial.print(F("[speed] "));
-  if (delta > 0) Serial.print(F("H"));
-  else Serial.print(F("L"));
-  Serial.print(F(" -> "));
-  Serial.println(speedLevelName(want_level));
-#endif
+  DEBUG_PRINT(F("[speed] "));
+  DEBUG_PRINT(delta > 0 ? F("H") : F("L"));
+  DEBUG_PRINT(F(" -> "));
+  DEBUG_PRINTLN(speedLevelName(want_level));
   return want_level;
 }
 
-/* ========== 初始化 ========== */
-/* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表 */
+/* ========== initialization ========== */
+/* Serial.begin(PROTO_BAUD) plus the command table */
 void serialProtocolBegin(void)
 {
   Serial.begin(PROTO_BAUD);
 
-#if WEARM_DEBUG_SERIAL
-  /* 打印命令表 */
-  Serial.println(F("[proto] ===== serial command table ====="));
-  Serial.println(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
-  Serial.println(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
-  Serial.println(F("[proto] H / L        speed up / down one level"));
-  Serial.println(F("[proto] x角度,y角度,z角度   sync 3 servos, e.g. x10,y30,z20"));
+  /* command table: kept under WEARM_SERIAL_RESPONSES so the host still gets the
+   * command list with WEARM_DEBUG_SERIAL=0. Deliberately terse: every character
+   * here is flash, so the command list and the angle syntax share one line. */
+  R_BOOT();
+
+  /* verbose table */
+  DEBUG_PRINTLN(F("[proto] ===== serial command table ====="));
+  DEBUG_PRINTLN(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
+  DEBUG_PRINTLN(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
+  DEBUG_PRINTLN(F("[proto] H / L        speed up / down one level"));
+  DEBUG_PRINTLN(F("[proto] x deg,y deg,z deg  sync 3 servos, e.g. x10,y30,z20"));
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
-    double lo = 0.0, hi = 0.0;
+    double lo, hi;
     if (!protoAxisGetLimit(a, &lo, &hi)) continue;
-    /* 轴字母与关节字母用单字符 C 串打印，避免被当成码值输出 */
-    char axis_ch[2] = { protoAxisChar[a], '\0' };
-    char joint_ch[2] = { protoAxisJoint[a], '\0' };
-    Serial.print(F("[proto] "));
-    Serial.print(axis_ch);
-    Serial.print(F(" -> angle"));
-    Serial.print(protoAxisServoIndex[a]);
-    Serial.print(F(" ("));
-    Serial.print(joint_ch);
-    Serial.print(F(") "));
-    Serial.print(lo, 1);
-    Serial.print(F(".."));
-    Serial.print(hi, 1);
-    Serial.println();
+    /* the axis letter and the joint letter are printed as one character C
+     * strings so they are not taken for code values */
+    DEBUG_PRINT(F("[proto] "));
+    DEBUG_PRINT(protoAxisChar[a]);
+    DEBUG_PRINT(F(" -> angle"));
+    DEBUG_PRINT(protoAxisServoIndex[a]);
+    DEBUG_PRINT(F(" ("));
+    DEBUG_PRINT(protoAxisJoint[a]);
+    DEBUG_PRINT(F(") "));
+    DEBUG_PRINTF(lo, 1);
+    DEBUG_PRINT(F(".."));
+    DEBUG_PRINTF(hi, 1);
+    DEBUG_PRINTLN();
   }
-  Serial.println(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
-  Serial.println(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
-  Serial.println(F("[proto] ================================"));
-#endif
+  DEBUG_PRINTLN(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
+  DEBUG_PRINTLN(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
+  DEBUG_PRINTLN(F("[proto] ================================"));
 }

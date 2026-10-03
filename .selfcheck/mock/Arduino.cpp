@@ -7,6 +7,9 @@
 
 MockSerial Serial;
 
+/* AVR IO 寄存器的宿主替身（说明见 Arduino.h）：初值与复位后一致，全 0 */
+volatile uint8_t DDRB = 0, PORTB = 0, DDRC = 0, PORTC = 0;
+
 /* 可由测试脚本改写的仿真时钟与引脚状态 */
 unsigned long g_mockMillis = 0;
 int g_mockAnalog[8] = { 512, 512, 512, 512, 512, 512, 512, 512 };
