@@ -1,11 +1,14 @@
-#
+﻿#
 # avr_build.ps1 -- build the weArm sketch exactly the way the Arduino IDE does,
 # with the locally installed AVR toolchain, and report flash/SRAM usage.
 #
 # Toolchain (found on this machine):
 #   avr-gcc 7.3.0 : %LOCALAPPDATA%\Arduino15\packages\arduino\tools\avr-gcc\7.3.0-atmel3.6.1-arduino7\bin
 #   AVR core 1.8.8: %LOCALAPPDATA%\Arduino15\packages\arduino\hardware\avr\1.8.8
-#   Servo library : %LOCALAPPDATA%\Arduino15\libraries\Servo
+#
+# v1.3.0: the sketch no longer uses the Arduino Servo library (it has its own
+# 4-channel Timer1 driver in servo_drive.cpp), so the Servo library is neither
+# compiled nor linked here.
 #
 # Flags are copied from the core's platform.txt (LTO is enabled by that core!).
 #
@@ -13,7 +16,7 @@
 param(
   [string]$SketchDir  = 'D:\dsh1\wearm',
   [string]$BuildRoot  = 'D:\dsh1\wearm\.selfcheck\avrbuild',
-  [switch]$Full,       # also rebuild the core + Servo archives
+  [switch]$Full,       # also rebuild the core archive
   [switch]$Symbols,    # print the biggest symbols after linking
   [switch]$NoLto,      # disable LTO (per-object sizes become meaningful)
   [string[]]$ExtraDefs = @()   # extra -D... switches (used for size ablations)
@@ -25,8 +28,8 @@ $ard      = Join-Path $env:LOCALAPPDATA 'Arduino15\packages\arduino'
 $gccbin   = Join-Path $ard 'tools\avr-gcc\7.3.0-atmel3.6.1-arduino7\bin'
 $coreDir  = Join-Path $ard 'hardware\avr\1.8.8\cores\arduino'
 $varDir   = Join-Path $ard 'hardware\avr\1.8.8\variants\standard'
-$servoSrc = Join-Path $env:LOCALAPPDATA 'Arduino15\libraries\Servo\src'
-$servoAvr = Join-Path $servoSrc 'avr'
+# 【v1.3.0】不再需要 Arduino Servo 库：固件改用自研 servo_drive.cpp（4 路 Timer1）。
+#   去掉 -I 指向 Servo 与 servo.a 的编译，既省构建时间，也让尺寸对比与真机一致。
 
 $cc   = Join-Path $gccbin 'avr-gcc.exe'
 $cxx  = Join-Path $gccbin 'avr-g++.exe'
@@ -34,7 +37,7 @@ $ar   = Join-Path $gccbin 'avr-gcc-ar.exe'
 $size = Join-Path $gccbin 'avr-size.exe'
 $nm   = Join-Path $gccbin 'avr-nm.exe'
 
-foreach ($p in @($cc,$cxx,$ar,$size,$nm,$coreDir,$varDir,$servoSrc)) {
+foreach ($p in @($cc,$cxx,$ar,$size,$nm,$coreDir,$varDir)) {
   if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
 }
 
@@ -47,7 +50,7 @@ $cF    = @('-c','-g','-Os','-std=gnu11','-ffunction-sections','-fdata-sections',
 $cppF  = @('-c','-g','-Os','-std=gnu++11','-fpermissive','-fno-exceptions',
            '-ffunction-sections','-fdata-sections','-fno-threadsafe-statics',
            '-Wno-error=narrowing','-MMD','-flto')
-$inc   = @(('-I' + $coreDir), ('-I' + $varDir), ('-I' + $servoSrc))
+$inc   = @(('-I' + $coreDir), ('-I' + $varDir))
 $defs   = $defs + $ExtraDefs
 if ($NoLto) {
   $cF   = @($cF   | Where-Object { $_ -ne '-flto' -and $_ -ne '-fno-fat-lto-objects' })
@@ -55,14 +58,13 @@ if ($NoLto) {
 }
 
 $coreObjDir = Join-Path $BuildRoot 'core'
-$servoObjDir= Join-Path $BuildRoot 'servo'
 $sketchBld  = Join-Path $BuildRoot 'sketch'
 $sketchObj  = Join-Path $BuildRoot 'obj'
 $coreA      = Join-Path $BuildRoot 'core.a'
 $elf        = Join-Path $BuildRoot 'weArm.elf'
 
 if ($Full) { Remove-Item -LiteralPath $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue }
-foreach ($d in @($BuildRoot,$coreObjDir,$servoObjDir,$sketchBld,$sketchObj)) {
+foreach ($d in @($BuildRoot,$coreObjDir,$sketchBld,$sketchObj)) {
   if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
@@ -101,10 +103,9 @@ function Compile-Tree {
 if ($Full -or -not (Test-Path -LiteralPath $coreA)) {
   Write-Host '== compiling AVR core =='
   $coreObjs = Compile-Tree -Dir $coreDir -ObjDir $coreObjDir -ExtraInc @()
-  $servoObjs = Compile-Tree -Dir $servoAvr -ObjDir $servoObjDir -ExtraInc @(('-I' + $servoSrc))
   Remove-Item -LiteralPath $coreA -Force -ErrorAction SilentlyContinue
-  Invoke-Tool -Exe $ar -Arguments (@('rcs', $coreA) + $coreObjs + $servoObjs) -What 'archive core.a' | Out-Null
-  Write-Host ('   core.a: {0} objects' -f ($coreObjs.Count + $servoObjs.Count))
+  Invoke-Tool -Exe $ar -Arguments (@('rcs', $coreA) + $coreObjs) -What 'archive core.a' | Out-Null
+  Write-Host ('   core.a: {0} objects' -f $coreObjs.Count)
 }
 
 # ---- 2) sketch sources ----

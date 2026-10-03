@@ -117,6 +117,19 @@ extern int g_mockDigital[20];
  * 方便探针断言"按键脚确实被设置成 INPUT_PULLUP"。 */
 extern int g_mockPinMode[20];
 
+/* digitalWrite() 的仿真记录（v1.3.0）：g_mockPinLevel 是每个引脚的当前电平；
+ * g_mockWriteLogPin/Level 按调用顺序记录最近 MOCK_WRITE_LOG_MAX 次写引脚事件，
+ * g_mockWriteLogCount 是已记录条数（封顶于容量，用于下标遍历），
+ * g_mockWriteTotal 是累计调用次数（日志满了也继续涨，便于判断"还有脉冲没记下"）。
+ * probe_servo_drive 用它验证舵机脉冲的引脚顺序与极性。 */
+#define MOCK_WRITE_LOG_MAX 256
+extern int g_mockPinLevel[20];
+extern int g_mockWriteLogPin[MOCK_WRITE_LOG_MAX];
+extern int g_mockWriteLogLevel[MOCK_WRITE_LOG_MAX];
+extern int g_mockWriteLogCount;
+extern int g_mockWriteTotal;
+void mockDigitalWriteReset(void);
+
 /* 摇杆模块接入的引脚索引。
  * 注意: g_mockAnalog 用"A0 起算的下标"索引（0=A0, 1=A1, 2=A2, 3=A3），
  *       而 g_mockDigital 用"展开后的数字引脚号"索引（A0=14 ... A3=17）。 */

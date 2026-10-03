@@ -217,23 +217,27 @@ limit    : x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
 本轮新增了完整的串口协议处理模块，包含：
 
 - **协议常量**（`protocol_constants.h` 与 `.cpp`）：
-  - 命令字符：`O`（爪子张开）、`S`（爪子关闭）、`H`/`L`（速度档升/降）、`x/y/z`（轴指令）
+  - 命令字符：`O`（爪子张开）、`S`（爪子关闭）、`H`/`L`（速度档升/降）、`x/y/z`（末端空间直角坐标点）
   - 兼容保留字符：`1/2/3`、`k/K`
-  - 轴到舵机映射：`protoAxisServoIndex = {1,2,3}`（x→基座、y→上臂、z→下臂）
-  - 关节字母表：`protoAxisJoint = {b,r,c}`
+  - 坐标轴字母：`protoAxisChar = {x,y,z}` 对应末端点 `Pos.rec` 的三个分量
+    （**注意：`protoAxisServoIndex`/`protoAxisJoint` 已废弃不再使用**，坐标不再直接写关节角度）
   - 协议参数：`PROTO_LINE_BUF_SIZE=40`、`PROTO_BAUD=115200`、`PROTO_LINE_TIMEOUT_MS=300`、`PROTO_TOOL_STEP_DEG=5.0`
   - 速度档位：`PROTO_SPEED_LEVEL_MIN`/`MAX`/`DEF`
 
 - **串口协议处理**（`serial_protocol.h` 与 `.cpp`）：
   - 字符读取、行缓冲、命令解析与落地写入
   - `!` 查询当前功能状态（P=取放、B=按键、D=绘图）；`!P` / `!B` / `!D` 切换运行时启用状态。只能切换编译进固件的模块，无法开启编译裁掉的代码。
-  - 开启 `WEARM_SERIAL_RESPONSES` 后，每条识别命令都回 `OK`、`REJECTED` 或 `ERR`（O/S/k/K 会附带夹爪角度）；先确认串口助手设为 115200 baud，并且固件已烧录。
+  - 开启 `WEARM_SERIAL_RESPONSES` 后，每条识别命令都回一行短回复：
+    `OK`（O/S/k 带夹爪角度 `OK #`）、`BUSY`（懂了但现在忙）、`OFF`（模块被 `!P/!B/!D` 关掉）、
+    `DISCARD`（R 结束录制时数据不合格已丢弃）、`EMPTY`（P 没有录制数据）、
+    `ERR`（语法错）、`REJECTED`（固件没编进该模块 / 坐标不可达或在地面以下 / 轨迹校验不过）。
+    先确认串口助手设为 115200 baud，并且固件已烧录。
   - 对外接口：`serialProtocolBegin()`、`serialProtocolLoop()`、`protoHandleLine(const char*)`
-  - 命令语义：`O`=爪子开、`S`=爪子关、`H/L`=速度档升降、`x角度,y角度,z角度`格式指令
+  - 命令语义：`O`=爪子开、`S`=爪子关、`H/L`=速度档升降、`x20,y0,z40`=末端移到地面坐标系的 (20,0,40)
 
 - **探针更新**：
   - `probe_joystick` 中的旧串口用例已删除，移至 `probe_protocol` 专门测试
-  - 新增 `probe_protocol` 探针（约 582 行，12 段）专门测试串口协议功能
+  - `probe_protocol` 探针现有 13 段，专门测试串口协议功能
 
 ## 新增 A/B/C 自动取放模块
 
@@ -467,6 +471,9 @@ Program 1876 / Data 63，再加一句 `Serial.begin(115200); Serial.print("boot"
 自己管接收中断，属于**在硬件通信这个最不能出错的地方动刀**，
 不适合放在一个"修编译错误"的版本里，所以 v1.1.0 不做，如实记录在这里。
 
+**本轮把这条路走通了**（详见下一节）：省 852 B flash / 109 B SRAM，
+三功能全开 32842 → 31936 B，**默认配置就是全功能**。
+
 顺带发现但**没有采纳**的几个写法（实测不划算或不等价）：
 
 - `-Wl,--relax` 能再省 400 B 出头，但要用户在 `platform.local.txt` 里加链接参数，
@@ -487,6 +494,7 @@ Program 1876 / Data 63，再加一句 `Serial.begin(115200); Serial.print("boot"
 
 关掉的功能会被链接器整段丢掉（头文件里退化成空 inline 桩），
 命令行 `-D` 依然可以覆盖本文件的默认值。
+**v1.1.0 时默认是「取放 + 绘图」，四按键关着；本轮起三个默认都是 1**（见下一节）。
 
 **注意**：`mock/Arduino.h` 为配合 `draw_control.cpp` / `pick_place.cpp` 的
 `PROGMEM` 常量表，新增了 `pgm_read_byte/word/dword/float/ptr`；
@@ -502,15 +510,143 @@ Program 1876 / Data 63，再加一句 `Serial.begin(115200); Serial.print("boot"
    `-BuildRoot` 是 `.selfcheck/avrbuild`，`git add -A` 会把 `core.a`
    和几十个中间文件一起提交进去。
 
-## PowerShell 的两个坑
+## 本轮改动 —— 地面坐标系指令 / 全功能默认开启 / 裸 UART 后端 / 失败回复分级
+
+三个目标：把串口 `x,y,z` 从"直接写关节角"改成**地面坐标系下的末端点**；
+让串口 `R` 不再动辄回一行含混的 `REJECTED`；把三功能全开压进 Uno 并设为默认。
+
+### 1) `x,y,z` 改成地面坐标系（**破坏性变更**）
+
+坐标系按题目要求：**原点 = 过肩关节的地面垂线的垂足，x 轴 = 机械臂初始面朝
+方向，z 轴 = 垂直地面向上**（右手系，+y 在初始面朝方向的左手边）。
+
+内部坐标本来就已经是同一套：`constant_and_positions.cpp` 的 `recFromServo()`
+里 `theta = (90 - b)/RADtoDEG; x = xPlanar*cos(theta); y = xPlanar*sin(theta)`，
+b = 90° 时朝 +x、b < 90° 时转向 +y，所以两套坐标只差 **z 的原点**：
+
+    z_内部 = z_地面 − WEARM_SHOULDER_HEIGHT
+
+`WEARM_SHOULDER_HEIGHT` 新增在 `constant_and_positions.h`，默认 **20.0**。
+20 不是拍脑袋来的：内部 z 的下限原本就是 `limit.minZ = −20`，把地面定在 −20，
+可达范围正好变成 **z ∈ [0, 60]，且反解不会算到地面以下**。真机肩高不同就改这一个常量。
+
+语法没变（`x20,y0,z40`，也接受 `x=20` 和只给一部分轴），但含义彻底变了：
+
+- 旧：`x10` = 基座关节转到 10°
+- 新：`x10` = 末端水平位置 x = 10，再由 `getAngleEx()` **反解**成四个关节角
+
+因此**不可达的点会回 `REJECTED`**（旧实现是照写关节角，"写不进去"也不吭声）；
+只给 z 轴时另外两个轴沿用当前末端位置，等价于"竖直平移"。
+
+### 2) 串口回复分级（不再只有 OK / REJECTED）
+
+| 回复 | 含义 |
+|---|---|
+| `OK` / `OK #` | 已执行（`O`/`S`/`k`/`K` 会带上夹爪当前角度） |
+| `BUSY` | 命令认识，但取放/录制/播放/绘图正在跑，先让位 |
+| `OFF` | 该模块**编进了固件**，但被 `!P` / `!B` / `!D` 在运行时关掉了 |
+| `DISCARD` | `R` 结束录制，但这段录制不合格（太短/没有位移/溢出），已丢弃 |
+| `EMPTY` | `P` 想回放，但根本没有录制数据 |
+| `ERR` | 语法错（例如 `!` 后面跟了不认识的功能字母） |
+| `REJECTED` | 固件里**没有**这个模块，或坐标不可达/在地面以下/轨迹校验不过 |
+
+`R` 之前"一输入就 REJECTED"是两层原因叠出来的：v1.1.0 出厂配置把四按键
+（`WEARM_ENABLE_BUTTONS`）关掉了，按键命令在门控处直接回 `REJECTED`；
+而录制"太短/没位移"也回同一个 `REJECTED`。现在默认全功能，且原因分开报。
+记住 `R` 是**两段式**：第一次 R 开始录制（回 `OK`），第二次 R 结束并校验
+（回 `OK`，或 `DISCARD` 表示这段不要了）。`P` 没有数据时回 `EMPTY`。
+
+### 3) 运行时功能开关 `!`
+
+- `!` 查询当前状态，回一行 `P=1 B=1 D=1`（1 = 启用，0 = 已关闭）
+- `!P` / `!B` / `!D` 切换取放 / 按键 / 绘图；未编进固件的模块回 `REJECTED`
+
+语义边界（别误解）：
+
+- 只影响**串口分发**。关掉 `B` 之后实体按键照样能用，正在跑的任务也不会被中止
+- 只能关掉"已经编进固件"的模块；编译期裁掉的功能永远回 `REJECTED`
+- 上电时运行时状态 = 编译期状态（`serialProtocolBegin()` 里重置）
+
+### 4) 裸 UART 后端：省下 852 B flash / 109 B SRAM
+
+`serial_protocol.cpp` 新增 "serial backend" 一段，release 的 AVR 构建不再使用
+Arduino 的 `HardwareSerial`：
+
+- 发送：`while (!(UCSR0A & (1<<UDRE0))) {} UDR0 = c;`
+- 接收：`ISR(USART_RX_vect) { protoRxStore(UDR0); }` 填 64 字节 2 的幂环形缓冲，
+  主循环用 `protoRxTake()` 取字节（空返回 −1），`serialProtocolLoop()` 的读取循环
+  改成 `while ((c = protoRxTake()) >= 0)`
+- 初始化照抄 core 的算法：`UCSR0A = 1<<U2X0`、
+  `UBRR = (F_CPU/4/PROTO_BAUD − 1)/2`（16 MHz + 115200 → 16）、
+  `UCSR0C = 8N1`、`UCSR0B = RXEN0|TXEN0|RXCIE0`
+
+**为什么必须整层换而不是逐个函数裁**：只要链接了 `Serial` 对象，它的 vtable 就会
+把 `HardwareSerial::write/_tx_udr_empty_irq/flush/available/read/peek`、
+`Print::write`、`__vector_18/19`、`serialEventRun` 甚至 157 B 的 `Serial` 对象
+全部拖进镜像（实测清单见 git 历史里的 `avr-nm` 输出），逐函数裁剪做不到。
+
+退路：`-DWEARM_SERIAL_ARDUINO=1` 强制用回官方串口库；`WEARM_DEBUG_SERIAL=1`
+和 PC 端 mock 构建也自动走原来的 `Serial` 路径（调试日志与协议回复要共用一条
+有序输出流，探针语义因此完全不变）。
+
+**这一层是唯一没法在 PC 上验证的部分**（中断和寄存器只在 AVR 上存在）：
+环形缓冲的推入/取出、`USART_RX_vect`、寄存器初值都不在 mock 的覆盖范围里，
+PC 探针只能证明"改用 `protoRxTake()` 之后 mock 路径的行为没变"。
+所以上机第一件事就是确认 115200 baud 下收发正常（见文末"上机才能确认"）。
+
+### 5) 本轮容量矩阵（实测）
+
+| 配置 | Program | 占 32768 | Data | 占 2048 |
+|---|---|---|---|---|
+| 取放 + 按键 + 绘图（**本轮默认**） | 31936 | 97.5% | 1015 | 49.6% |
+| 取放 + 绘图（按键关） | 28534 | 87.1% | 490 | 23.9% |
+| 取放 + 按键（绘图关） | 19226 | 58.7% | 807 | 39.4% |
+| 绘图 + 按键（取放关） | 29184 | 89.1% | 981 | 47.9% |
+
+Uno 实际可用 flash 是 32256 B（avr-size 按 32768 算百分比，512 B 留给 bootloader），
+所以默认配置**还剩 320 B**。复现任意一行（注意 `-ExtraDefs` 收的是数组）：
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\avr_build.ps1 `
+        -ExtraDefs @('-DWEARM_ENABLE_BUTTONS=0')
+
+`avr_build.ps1` 已不再编译 Servo 库（换成自研 `servo_drive.cpp`），
+mock 侧的 `mock/Servo.cpp`、`mock/Servo.h` 也已删除。
+
+### 6) 新增/改动的探针
+
+`probe_protocol` 的"串口应答与运行时功能开关"一段（12 段）**移到了压力测试之前**：
+
+> 压力测试会随机发单字符 `'A'..'Z'`，其中 `A/B/C` 会启动取放序列，
+> 而 `pickPlaceIsBusy()` 是 `s_obj >= 0`，一旦启动就再也不会回到空闲 ——
+> 后面的 `R` 只能回 `BUSY`。所以应答测试必须先跑，并以"结束录制"收尾。
+
+新增断言：`!` 回 `P=1 B=1 D=1`；`!P`/`!B`/`!D` 往返切换；
+`!B` 关掉后 `N` 回 `OFF`（且输出里不能出现 `REJECTED`）；
+录制中发 `O` 回 `BUSY`；立刻结束录制回 `DISCARD`；没有数据时 `P` 回 `EMPTY`。
+
+**教训**：探针用 `-DWEARM_DEBUG_SERIAL=1` 编译，mock 的输出流里既有中文调试日志
+又有协议回复，断言只能查"回复这一行在不在"
+（`out.find("OK\n") != std::string::npos`），**不能整串相等**。
+
+## PowerShell / 脚本的几个坑
 
 1. **`& $gpp ... 2>&1` 赋给变量后 `$LASTEXITCODE` 仍是 0** —— g++ 的 warning 走
    stderr，只看退出码会漏掉警告（历史上就这样漏过两个 `-Wunused-*`）。
    判定失败要**同时看"输出行数 > 0"**。`run_all.ps1` 已经这么做了。
 2. **`.ps1` 必须存成 UTF-8 带 BOM**。Windows PowerShell 5.1 读无 BOM 的 `.ps1`
-   会按 ANSI(GBK) 解码，中文注释变乱码并破坏语法分析（报一堆
-   `Unexpected token`/`Missing closing '}'`）。`run_all.ps1` 已带 BOM——
-   **改完这个文件记得确认 BOM 还在**（用 `write` 工具覆盖会丢掉 BOM）。
+   会按 ANSI(GBK) 解码：中文注释变乱码只是表面现象，真正的坑是**一个汉字吃掉
+   后面的一个 ASCII 字节**——于是某个字符串的收尾引号被吞掉，报错却指在完全
+   无关的行上（实测报 `run_all.ps1:46` 的 `"$_" }` 是"意外的标记"，而问题
+   在第 36 行的中文行；还会把两行粘成一行，报的行号根本对不上）。
+   本仓库的 `.ps1` 都带 BOM，**改完一定要确认 BOM 还在**（很多工具覆盖写入
+   会丢掉它）。`.selfcheck\ensure_bom.ps1` 就是干这个的：
+   `& .\.selfcheck\ensure_bom.ps1` 补齐 BOM，`-Check` 只检查不改。
+3. **本机是 Windows PowerShell 5.1，没有 `pwsh` 7**。脚本里别用 7 才有的语法，
+   命令行也不要写 `pwsh -Command ...`（会报"无法将 pwsh 项识别为..."）。
+4. **执行策略**：直接 `& .\.selfcheck\avr_build.ps1` 可能报
+   `AuthorizationManager 检查失败...UnauthorizedAccess`。
+   在每个新 shell 里先跑
+   `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`。
 
 ## 已知的"上机才能确认"项
 
@@ -562,3 +698,19 @@ Program 1876 / Data 63，再加一句 `Serial.begin(115200); Serial.print("boot"
     所以上机试画时应记录 `drawLastRunMs()` 与 `drawLastPointsHit()`。
 11. **绘图与取放/录制的互斥**：绘图期间摇杆整段让位（示教例外，由绘图模块自己读），
     所以若发现"示教时推杆没反应"，先确认按键/串口是不是处于录制或播放状态。
+12. **裸 UART 后端（本轮新增，风险最高的一项）**：release 构建不再用
+    Arduino `Serial`，直接操作 `UDR0`/`UCSR0A`/`UBRR0`，接收走 `USART_RX_vect`
+    中断。上机第一步就要确认串口助手 115200-8N1 下能收发：发 `!` 应回
+    `P=1 B=1 D=1`，发 `O`/`S` 应回 `OK #`。若**完全没反应或全是乱码**，
+    依次排查：(a) 串口助手波特率/换行符；(b) 烧录是否真的成功；
+    (c) 用 `-DWEARM_SERIAL_ARDUINO=1` 重新编译烧录，退回官方串口库对照 ——
+    如果退回后就正常，说明是这段裸寄存器代码的问题，把现象贴回来。
+    另外长连发时环形缓冲只有 64 字节、行缓冲只有 40 字节，超了会丢字节。
+13. **地面坐标系的 `z` 与肩高**：本轮起 `x,y,z` 是地面系（z 向上、0 在地面），
+    固件里 `WEARM_SHOULDER_HEIGHT = 20.0` 是从内部 `limit.minZ = −20` 反推的
+    设计值。请实测肩关节离台面的真实高度，若与 20 差得多，就改
+    `constant_and_positions.h` 里这一个常量，否则"z=0"不等于"贴着台面"。
+14. **`R` / `P` 的新回复语义**：第一次 `R` 回 `OK` 表示开始录制（最长 12.8 s），
+    第二次 `R` 若回 `DISCARD` 表示"太短/没有位移/溢出，这段丢弃了"——不是故障。
+    `P` 回 `EMPTY` 同理表示没有可回放的数据。真机上先录一段有位姿变化的动作
+    （> `BTN_REC_MIN_MS` = 10 s）再验证 `OK`。

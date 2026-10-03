@@ -101,7 +101,7 @@
 //   或 setSpeed(stepSize, minDelayMs, fullDelayMs) 自定义（stepSize 单位现在是"度"）。
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
-#include "Servo.h"
+#include "servo_drive.h"
 #include "move.h"
 #include "joystick_control.h"
 #include "serial_protocol.h"
@@ -109,18 +109,17 @@
 #include "button_control.h"
 #include "draw_control.h"
 
-/* 4 个舵机: index 1~4 对应各关节。
+/* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
  * 字母记号（与 constant_and_positions.h 的 servoLimit 一致）:
- *   index1 = b 水平回转   index2 = r 上臂俯仰
- *   index3 = c 下臂俯仰   index4 = f 末端 */
-Servo servos[5];
+ *   通道0 = b 水平回转   通道1 = r 上臂俯仰
+ *   通道2 = c 下臂俯仰   通道3 = f 末端 */
 
-/* 把当前 4 个关节角写入物理舵机 (index 1..4) */
+/* 把当前 4 个关节角写入物理舵机（通道 0..3） */
 void writeServo(void){
-  servos[1].write((int) Pos.ser.angle1);
-  servos[2].write((int) Pos.ser.angle2);
-  servos[3].write((int) Pos.ser.angle3);
-  servos[4].write((int) Pos.ser.angle4);
+  servoDriveWrite(0, Pos.ser.angle1);
+  servoDriveWrite(1, Pos.ser.angle2);
+  servoDriveWrite(2, Pos.ser.angle3);
+  servoDriveWrite(3, Pos.ser.angle4);
 }
 
 void setup() {
@@ -141,12 +140,14 @@ void setup() {
   /* 4.5 初始化绘图模块（纸面参数用默认值，上机时用串口 p/n/o 标定） */
   drawSetup();
 
-  /* 5. 将 4 个舵机 attach 到对应引脚。
+  /* 5. 启动舵机驱动并把 4 路 attach 到对应引脚。
+   *    servoDriveBegin() 必须在 attach 之前：它初始化 Timer1 与各通道默认脉宽。
    *    引脚号请按实际硬件修改 (示例: 9, 7, 8, 6) */
-  servos[1].attach(9);   /* 水平回转 */
-  servos[2].attach(7);   /* 上臂俯仰 */
-  servos[3].attach(8);   /* 下臂俯仰 */
-  servos[4].attach(6);   /* 末端 */
+  servoDriveBegin();
+  servoDriveAttach(0, 9);   /* 水平回转 */
+  servoDriveAttach(1, 7);   /* 上臂俯仰 */
+  servoDriveAttach(2, 8);   /* 下臂俯仰 */
+  servoDriveAttach(3, 6);   /* 末端 */
 
   /* 6. 上电后先让机械臂到位，再开始接收手柄输入 */
   writeServo();

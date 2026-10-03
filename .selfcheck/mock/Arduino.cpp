@@ -20,6 +20,24 @@ int g_mockDigital[20] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, 
 int g_mockPinMode[20] = { INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT,
                           INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT };
 
+/* digitalWrite() 的仿真记录（v1.3.0 起）：除了每个引脚的当前电平，
+ * 还按调用顺序记录最近 MOCK_WRITE_LOG_MAX 次"写引脚"事件。
+ * probe_servo_drive 靠这个日志验证 servo_drive.cpp 的脉冲顺序/极性；
+ * 其它探针仍然只读 g_mockPinMode，不受影响。 */
+int g_mockPinLevel[20] = { LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW,
+                           LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW };
+int g_mockWriteLogPin[MOCK_WRITE_LOG_MAX];
+int g_mockWriteLogLevel[MOCK_WRITE_LOG_MAX];
+int g_mockWriteLogCount = 0;
+int g_mockWriteTotal = 0;   /* 累计 digitalWrite 次数（日志满了也继续计数，便于发现"还有脉冲"） */
+
+void mockDigitalWriteReset(void) {
+  for (int i = 0; i < 20; i++) g_mockPinLevel[i] = LOW;
+  for (int i = 0; i < MOCK_WRITE_LOG_MAX; i++) { g_mockWriteLogPin[i] = -1; g_mockWriteLogLevel[i] = -1; }
+  g_mockWriteLogCount = 0;
+  g_mockWriteTotal = 0;
+}
+
 unsigned long millis(void) { return g_mockMillis; }
 unsigned long micros(void) { return g_mockMillis * 1000UL; }
 void delay(unsigned long ms) { g_mockMillis += ms; }
@@ -27,7 +45,15 @@ void delayMicroseconds(unsigned int us) { (void) us; }
 void pinMode(uint8_t pin, uint8_t mode) {
   if (pin < 20) g_mockPinMode[pin] = (int) mode;
 }
-void digitalWrite(uint8_t, uint8_t) {}
+void digitalWrite(uint8_t pin, uint8_t value) {
+  if (pin < 20) g_mockPinLevel[pin] = (int) value;
+  if (g_mockWriteLogCount < MOCK_WRITE_LOG_MAX) {
+    g_mockWriteLogPin[g_mockWriteLogCount]   = (int) pin;
+    g_mockWriteLogLevel[g_mockWriteLogCount] = (int) value;
+    g_mockWriteLogCount++;
+  }
+  g_mockWriteTotal++;
+}
 // 模拟真实按钮的电气行为：如果测试脚本把引脚电平设成 LOW，
 // 就让它保持 LOW 一段时间（由 g_mockButtonHoldMs 控制），
 // 这样固件里"读两次确认"的消抖逻辑也能被正确模拟。

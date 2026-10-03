@@ -1,12 +1,14 @@
 /*
 // serial_protocol.cpp
-// Serial command protocol: fixed commands + multi-servo sync angles (x/y/z).
+// Serial command protocol: fixed commands + Cartesian end effector targets
+// (x/y/z, ground frame: origin under the shoulder joint, x = initial facing
+// direction, z = up, right handed - see serial_protocol.h).
 // Also hosts the start entry of the A/B/C pick-and-place sequences (while a
 // sequence runs this layer holds back every other motion command), the serial
 // twins N/R/P/M of the four physical buttons (implementation lives in
 // button_control.cpp) and the drawing commands F/D/G/E/Q/U/W plus the paper
 // calibration commands p/n/o (implementation lives in draw_control.cpp).
-// Handles character input, line buffering, command parsing and servo writes.
+// Handles character input, line buffering, command parsing and moves.
 */
 
 #include "Arduino.h"
@@ -47,9 +49,9 @@ static unsigned long s_lastCharMs = 0;
  * single out-of-line copy anyway, and the whole dispatcher only exists once
  * because protoHandleLine() has no caller outside this file. */
 static void protoFlushLine(void);
-static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen);
+static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
-static void protoApplyAngles(const double angles[3], uint8_t seen);
+static bool protoMoveToCoords(const double coords[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
 #define PROTO_FEATURE_PICK   0x01u
@@ -89,16 +91,117 @@ static const char *protoSkipBlanks(const char *p)
 #define PROGMEM
 #endif
 
-/* ========== response layer (WEARM_SERIAL_RESPONSES) ========== */
-#if WEARM_SERIAL_RESPONSES
-/* One byte out. Print::print(char) forwards straight to
- * HardwareSerial::write(uint8_t), so none of the Arduino number formatting
- * code is reachable from here - that is what keeps this layer at a few hundred
- * bytes instead of the ~9.5 KB that Serial.print(double) would drag in. */
+/* ========== serial backend ========== */
+/* The release build on the real Uno drives the ATmega328P USART registers
+ * directly instead of going through the Arduino Serial object.
+ *
+ * Why: the protocol only needs "send one byte" and "is there a byte". Linking
+ * *any* of HardwareSerial keeps its vtable alive, and the vtable keeps every
+ * virtual member (write / flush / available / read / peek / availableForWrite)
+ * plus both USART interrupt vectors and the 64+64 byte ring buffers - measured
+ * about 1.2 KB of flash and 600 bytes of SRAM on the all-features build, i.e.
+ * more than the whole remaining budget.
+ *
+ * WEARM_DEBUG_SERIAL=1 (debug traces then share one ordered stream) or
+ * -DWEARM_SERIAL_ARDUINO=1 (escape hatch) keep the Arduino Serial object for
+ * both directions. The PC self-check mock has no UCSR0A/UDR0, so every host
+ * build - and therefore every probe - uses the same Serial branch. */
+#ifndef WEARM_SERIAL_ARDUINO
+#define WEARM_SERIAL_ARDUINO 0
+#endif
+
+#if defined(__AVR__) && !WEARM_DEBUG_SERIAL && !WEARM_SERIAL_ARDUINO
+#define WEARM_UART_RAW 1
+#else
+#define WEARM_UART_RAW 0
+#endif
+
+#if WEARM_UART_RAW
+#include <avr/interrupt.h>
+
+/* Receive ring buffer with the same shape as the one in the Arduino core: the
+ * mask works because the size is a power of two, and a full buffer drops the
+ * newest byte instead of destroying unread data. */
+#define PROTO_RX_BUF_MASK 63u
+static volatile uint8_t s_rxBuf[PROTO_RX_BUF_MASK + 1u];
+static volatile uint8_t s_rxHead = 0;
+static volatile uint8_t s_rxTail = 0;
+
+/* Plain function on purpose: the "full buffer drops the byte" rule then lives
+ * in one statement instead of inside the interrupt routine. */
+static void protoRxStore(uint8_t b)
+{
+  uint8_t next = (uint8_t)((s_rxHead + 1u) & PROTO_RX_BUF_MASK);
+
+  if (next != s_rxTail) {
+    s_rxBuf[s_rxHead] = b;
+    s_rxHead = next;
+  }
+}
+
+ISR(USART_RX_vect)
+{
+  protoRxStore(UDR0);
+}
+
+/* One byte out. Waiting for UDRE0 costs at most 87 us per character at
+ * 115200 baud and replies are at most a dozen bytes long. */
+static void protoPut(char c)
+{
+  while ((UCSR0A & (1u << UDRE0)) == 0u) {
+  }
+  UDR0 = (uint8_t)c;
+}
+
+/* Received byte, or -1 when the buffer is empty. */
+static int protoRxTake(void)
+{
+  uint8_t b;
+
+  if (s_rxHead == s_rxTail) {
+    return -1;
+  }
+  b = s_rxBuf[s_rxTail];
+  s_rxTail = (uint8_t)((s_rxTail + 1u) & PROTO_RX_BUF_MASK);
+  return (int)b;
+}
+
+/* UART setup, mirrored from the Arduino core: double speed (U2X0), the same
+ * UBRR, 8N1, receiver + transmitter + receive interrupt. F_CPU and PROTO_BAUD
+ * are compile time constants, so UBRR is folded here. */
+static void protoSerialBegin(void)
+{
+  uint16_t ubrr = (uint16_t)((F_CPU / 4UL / (unsigned long)PROTO_BAUD - 1UL) / 2UL);
+
+  UCSR0A = (uint8_t)(1u << U2X0);
+  UBRR0H = (uint8_t)(ubrr >> 8);
+  UBRR0L = (uint8_t)ubrr;
+  UCSR0C = (uint8_t)((1u << UCSZ01) | (1u << UCSZ00));   /* 8 data bits, no parity, 1 stop */
+  UCSR0B = (uint8_t)((1u << RXEN0) | (1u << TXEN0) | (1u << RXCIE0));
+}
+#else
+/* Arduino Serial: debug build, forced fallback, or the PC self-check mock */
 static void protoPut(char c)
 {
   Serial.print(c);
 }
+
+static int protoRxTake(void)
+{
+  if (Serial.available() <= 0) {
+    return -1;
+  }
+  return Serial.read();
+}
+
+static void protoSerialBegin(void)
+{
+  Serial.begin(PROTO_BAUD);
+}
+#endif
+
+/* ========== response layer (WEARM_SERIAL_RESPONSES) ========== */
+#if WEARM_SERIAL_RESPONSES
 
 /* Gripper echo: angle4 is clamped into servoLimit f, i.e. 0..999, so a plain
  * three digit printer is enough. */
@@ -138,12 +241,26 @@ static const char s_rOk[] PROGMEM = "OK";
 static const char s_rErr[] PROGMEM = "ERR";
 static const char s_rRej[] PROGMEM = "REJECTED";
 static const char s_rOkN[] PROGMEM = "OK #";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
+/* The three "understood, but did not run" answers the button family used to
+ * collapse into REJECTED. Telling them apart is what makes a serial-only host
+ * able to act: BUSY = the arm is moving, DISCARD = the recording was thrown
+ * away (too short / no travel / buffer full), EMPTY = P with nothing stored.
+ * OFF = the firmware has the module but the user switched it off with !P/!B/!D,
+ * as opposed to REJECTED meaning it was never compiled in. */
+static const char s_rBusy[] PROGMEM = "BUSY";
+static const char s_rDiscard[] PROGMEM = "DISCARD";
+static const char s_rEmpty[] PROGMEM = "EMPTY";
+static const char s_rOff[] PROGMEM = "OFF";
+static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno XYZ x,y,z ! !P !B !D";
 
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
 #define R_REJ()  protoReply(s_rRej)
 #define R_OKN()  protoReply(s_rOkN)
+#define R_BUSY() protoReply(s_rBusy)
+#define R_DISCARD() protoReply(s_rDiscard)
+#define R_EMPTY() protoReply(s_rEmpty)
+#define R_OFF()  protoReply(s_rOff)
 #define R_BOOT() protoReply(s_rBoot)
 #define R_FEATURE() do { protoPut('P'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0'); protoPut(' '); protoPut('B'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0'); protoPut(' '); protoPut('D'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0'); protoPut(10); } while (0)
 #else
@@ -151,6 +268,10 @@ static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG
 #define R_ERR()  do { } while (0)
 #define R_REJ()  do { } while (0)
 #define R_OKN()  do { } while (0)
+#define R_BUSY() do { } while (0)
+#define R_DISCARD() do { } while (0)
+#define R_EMPTY() do { } while (0)
+#define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
 #define R_FEATURE() do { } while (0)
 #endif
@@ -174,14 +295,53 @@ __attribute__((noinline)) static bool protoCmdBit(const uint8_t *bits, char cmd)
   return (pgm_read_byte(bits + (i >> 3)) & (uint8_t)(1u << (i & 7u))) != 0;
 }
 
+/* Which feature module a command character needs: two bits per character,
+ * indexed exactly like the maps above (i = cmd - '0'). 0 = the command is not
+ * gated by any module, 1 = pick & place, 2 = buttons, 3 = drawing.
+ *
+ * This replaces the three if chains in the dispatcher (3 + 5 + 10 = 18 character
+ * comparisons, all with their own WEARM_ENABLE_* and runtime tests).
+ *
+ * Measured on the real Uno build (all features on): the dispatcher itself shrank
+ * from 2192 to 2134 bytes, but the table plus the lookup add about the same
+ * amount back, so the whole image ended up 10 bytes *larger* (32710 -> 32720).
+ * Kept because it is the clearer way to say "which module owns this command"
+ * and the all-features build fits with room to spare - not because it saves
+ * anything. Revert to the explicit chains if every last byte is needed.
+ *
+ * Bit layout of byte k: bits 1:0 = char (4k), 3:2 = char (4k+1),
+ *                       5:4 = char (4k+2), 7:6 = char (4k+3). */
+static const uint8_t s_featureBits[17] PROGMEM = {
+  0x02,                                     /* '0' -> buttons (home, alias of M)  */
+  0x00, 0x00, 0x00,
+  0x54,                                     /* A B C -> pick, D -> draw           */
+  0xFF,                                     /* D E F G all -> draw                */
+  0x00,
+  0x28,                                     /* M N -> buttons                     */
+  0x2E,                                     /* P -> buttons, Q -> draw, R -> btn  */
+  0xCC,                                     /* U -> draw, W -> draw               */
+  0x00, 0x00, 0x00, 0x00, 0x00,
+  0xF0,                                     /* n o -> draw                        */
+  0x03                                      /* p -> draw                          */
+};
+
+__attribute__((noinline)) static uint8_t protoCmdFeature(char cmd)
+{
+  uint8_t i = (uint8_t)cmd - (uint8_t)'0';
+
+  if (i > 64u) {
+    return 0u;
+  }
+  return (uint8_t)((pgm_read_byte(s_featureBits + (i >> 2)) >> (uint8_t)((i & 3u) * 2u)) & 0x03u);
+}
+
 /* ========== main loop interface ========== */
 /* Called once per loop(): collect the characters that arrived into one line and run it */
 void serialProtocolLoop(void)
 {
-  while (Serial.available() > 0) {
-    int c = Serial.read();
-    if (c < 0) break;
+  int c;
 
+  while ((c = protoRxTake()) >= 0) {
     /* remember when the last character arrived */
     s_lastCharMs = millis();
 
@@ -244,6 +404,37 @@ static uint8_t protoCompiledFeatures(void)
   return (WEARM_ENABLE_PICK_PLACE ? PROTO_FEATURE_PICK : 0u) |
          (WEARM_ENABLE_BUTTONS ? PROTO_FEATURE_BUTTON : 0u) |
          (WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u);
+}
+
+/* Reply for one button-family result (N/R/P/M/0) so every one of those commands
+ * is answered the same way: OK / BUSY / DISCARD / EMPTY / ERR. */
+static void protoReplyButtonResult(int result)
+{
+  (void)result; /* keep -Wunused-parameter quiet when responses are compiled out */
+  if (result == PROTO_RES_BUSY) {
+    R_BUSY();
+  } else if (result == PROTO_RES_REC_REJECTED) {
+    R_DISCARD();
+  } else if (result == PROTO_RES_PLAY_NO_RECORD) {
+    R_EMPTY();
+  } else if (result < 0) {
+    R_ERR();
+  } else {
+    R_OK();
+  }
+}
+
+/* Answer a command whose module will not take it right now: "OFF" when the
+ * firmware does contain the module but the user switched it off with !P/!B/!D,
+ * "REJECTED" when it was compiled out of this build. Shared by every refusal
+ * site so the two cases cannot drift apart. */
+static void protoRefuseModule(uint8_t feature)
+{
+  if ((protoCompiledFeatures() & feature) != 0u) {
+    R_OFF();
+  } else {
+    R_REJ();
+  }
 }
 
 static void protoFlushLine(void)
@@ -310,28 +501,23 @@ int protoHandleLine(const char *line)
     R_ERR();
     return PROTO_RES_BAD_SYNTAX;
   }
-  if (single && (cmd == PROTO_CMD_PICK_A || cmd == PROTO_CMD_PICK_B || cmd == PROTO_CMD_PICK_C)) {
-    if (!WEARM_ENABLE_PICK_PLACE || !protoRuntimeEnabled(PROTO_FEATURE_PICK)) {
-      R_REJ();
-      return PROTO_RES_UNKNOWN;
+  if (single) {
+    /* Feature gate: a command that belongs to a module (pick & place, buttons,
+     * drawing) is refused unless that module is both compiled in and switched on
+     * at runtime. s_runtimeFeatures starts out as the compiled set and only the
+     * '!' commands change it, so protoRuntimeEnabled() alone is the whole test:
+     * a module compiled out can never be switched on. */
+    uint8_t module = protoCmdFeature(cmd);
+
+    if (module != 0u) {
+      uint8_t feature = (module == 1u) ? PROTO_FEATURE_PICK :
+                        (module == 2u) ? PROTO_FEATURE_BUTTON : PROTO_FEATURE_DRAW;
+
+      if (!protoRuntimeEnabled(feature)) {
+        protoRefuseModule(feature);
+        return PROTO_RES_UNKNOWN;
+      }
     }
-  }
-  if (single && (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
-      cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME ||
-      cmd == PROTO_CMD_BTN_HOME_ALT)) {
-    if (!WEARM_ENABLE_BUTTONS || !protoRuntimeEnabled(PROTO_FEATURE_BUTTON)) {
-      R_REJ();
-      return PROTO_RES_UNKNOWN;
-    }
-  }
-  if (single && (cmd == PROTO_CMD_DRAW_TASK || cmd == PROTO_CMD_DRAW_START ||
-       cmd == PROTO_CMD_DRAW_RECORD || cmd == PROTO_CMD_DRAW_UNDO ||
-       cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
-       cmd == PROTO_CMD_DRAW_CANCEL || cmd == PROTO_CMD_DRAW_PAPER_Z ||
-       cmd == PROTO_CMD_DRAW_HALF || cmd == PROTO_CMD_DRAW_CENTER) &&
-      (!WEARM_ENABLE_DRAW || !protoRuntimeEnabled(PROTO_FEATURE_DRAW))) {
-    R_REJ();
-    return PROTO_RES_UNKNOWN;
   }
 
   /* Busy decision: while a pick/place sequence runs, or the button module is
@@ -353,7 +539,7 @@ int protoHandleLine(const char *line)
    * Measured: -8 bytes versus pickPlaceIsBusy() first. */
   if (drawControlBusy() || buttonControlBusy() || pickPlaceIsBusy()) {
     if (!protoCmdBit(s_liveBits, cmd)) {
-      R_REJ();
+      R_BUSY();
       return PROTO_RES_BUSY;
     }
   }
@@ -379,8 +565,8 @@ int protoHandleLine(const char *line)
      * wide instead of 40. */
     if (cmd == PROTO_CMD_BTN_HOME_ALT) {
       int result = buttonHandleCommand(cmd);
-      if (result >= 0) R_OK(); else R_REJ();
-      return result >= 0 ? result : PROTO_RES_UNKNOWN;
+      protoReplyButtonResult(result);
+      return result < 0 ? PROTO_RES_UNKNOWN : result;
     }
     if (cmd >= PROTO_CMD_SPEED_SLOW && cmd <= PROTO_CMD_SPEED_FAST) {
       /* '1','2','3' are SPEED_SLOW..SPEED_FAST in that order */
@@ -431,7 +617,7 @@ int protoHandleLine(const char *line)
           R_OK();
           return PROTO_RES_PICK_STARTED;
         }
-        R_REJ();
+        R_BUSY();
         return PROTO_RES_BUSY;
 
     /* N/R/P/M and '0': serial twins of the four physical buttons. Whether they
@@ -442,10 +628,7 @@ int protoHandleLine(const char *line)
     } else if (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
                cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME) {
       int result = buttonHandleCommand(cmd);
-      if (result == PROTO_RES_BUSY || result == PROTO_RES_REC_REJECTED ||
-          result == PROTO_RES_PLAY_NO_RECORD) R_REJ();
-      else if (result < 0) R_ERR();
-      else R_OK();
+      protoReplyButtonResult(result);
       return result < 0 ? PROTO_RES_UNKNOWN : result;
 
     /* F/D/G/E/Q/U/W: drawing commands (pick task / start / teach point / undo /
@@ -459,7 +642,8 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      if (result == PROTO_RES_BUSY || result == PROTO_RES_DRAW_REJECTED) R_REJ();
+      if (result == PROTO_RES_BUSY) R_BUSY();
+      else if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
       else if (result < 0) R_ERR();
       else R_OK();
       return result;
@@ -473,8 +657,8 @@ int protoHandleLine(const char *line)
   if ((cmd == PROTO_CMD_DRAW_PAPER_Z ||
        cmd == PROTO_CMD_DRAW_HALF ||
        cmd == PROTO_CMD_DRAW_CENTER) && !single) {
-    if (!WEARM_ENABLE_DRAW || !protoRuntimeEnabled(PROTO_FEATURE_DRAW)) {
-      R_REJ();
+    if (!protoRuntimeEnabled(PROTO_FEATURE_DRAW)) {
+      protoRefuseModule(PROTO_FEATURE_DRAW);
       return PROTO_RES_UNKNOWN;
     }
     int result = protoHandleDrawCalib(p, cmd);
@@ -482,55 +666,63 @@ int protoHandleLine(const char *line)
     return result;
   }
 
-  int rc = PROTO_RES_UNKNOWN;
-
+  /* x/y/z: the Cartesian point the end effector must move to. The frame is the
+   * ground frame documented in serial_protocol.h (origin under the shoulder,
+   * x = initial facing direction, z = up, right handed). */
   if (protoAxisIndexFromChar(cmd) >= 0) {
-    /* angle command */
-    double angles[3];
+    double coords[3];
     uint8_t seen = 0;
 
-    rc = PROTO_RES_BAD_SYNTAX;
-    if (protoParseAxisLine(p, angles, &seen)) {
-      protoApplyAngles(angles, seen);
-      {
-#if WEARM_DEBUG_SERIAL
-        Serial.print(F("[proto] sync angles b="));
-        Serial.print(Pos.ser.angle1);
-        Serial.print(F(" r="));
-        Serial.print(Pos.ser.angle2);
-        Serial.print(F(" c="));
-        Serial.println(Pos.ser.angle3);
-#endif
-        rc = PROTO_RES_ANGLES_SET;
-      }
+    if (!protoParseAxisLine(p, coords, &seen)) {
+      DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
+      R_ERR();
+      return PROTO_RES_BAD_SYNTAX;
     }
-    DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
-  } else {
-    /* Not an axis letter, but it contains a comma or starts with '=': it looks
-     * like an angle command that was mistyped. Everything else is unknown. */
+
+    if (!protoMoveToCoords(coords, seen)) {
+      /* unreachable, or below the ground plane: nothing was changed at all */
+      R_REJ();
+      DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
+      return PROTO_RES_COORDS_REJECTED;
+    }
+
+#if WEARM_DEBUG_SERIAL
+    Serial.print(F("[proto] move -> b="));
+    Serial.print(Pos.ser.angle1);
+    Serial.print(F(" r="));
+    Serial.print(Pos.ser.angle2);
+    Serial.print(F(" c="));
+    Serial.println(Pos.ser.angle3);
+#endif
+    R_OK();
+    return PROTO_RES_ANGLES_SET;
+  }
+
+  /* Not an axis letter, but it contains a comma or starts with '=': it looks
+   * like a coordinate command that was mistyped. Everything else is unknown. */
+  {
     const char *scan = p;
     while (*scan != '\0' && *scan != ',') {
       scan++;
     }
-    if (*scan == ',' || cmd == '=') {
-      rc = PROTO_RES_BAD_SYNTAX;
+    if (*scan != ',' && cmd != '=') {
+      R_ERR();
+      return PROTO_RES_UNKNOWN;
     }
   }
 
-  if (rc == PROTO_RES_ANGLES_SET) {
-    R_OK();
-  } else {
-    R_ERR();
-  }
-  return rc;
+  R_ERR();
+  return PROTO_RES_BAD_SYNTAX;
 }
 
-/* ========== angle parsing ========== */
-/* Parse an angle command: group (',' group)*, group = [blank] axis letter [blank]
- * [optional '='] [blank] value. The whole line must parse; an axis given twice
- * keeps its last value. Anything that does not match the grammar returns false
- * and touches nothing but angles/seen. */
-static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
+/* ========== coordinate parsing ========== */
+/* Parse a coordinate command: group (',' group)*, group = [blank] axis letter
+ * [blank] [optional '='] [blank] value. The parsed numbers are Cartesian
+ * coordinates in the ground frame (see serial_protocol.h), x/y/z in the order
+ * protoAxisIndexFromChar() returns them. The whole line must parse; an axis
+ * given twice keeps its last value. Anything that does not match the grammar
+ * returns false and touches nothing but coords/seen. */
+static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen)
 {
   const char *p = s;
   int groups = 0;
@@ -554,7 +746,7 @@ static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
     }
 
     /* 5) the value (must really start with a digit) */
-    if (!protoParseNumber(&p, &angles[axis])) return false;
+    if (!protoParseNumber(&p, &coords[axis])) return false;
 
     /* 6) record it (an axis given twice keeps the last value) */
     *seen |= (uint8_t)(1u << axis);
@@ -672,26 +864,59 @@ static int protoHandleDrawCalib(const char *line, char cmd)
   return PROTO_RES_DRAW_REJECTED;
 }
 
-/* ========== landing the parsed angles ========== */
-/* Write the parsed angles to the servos */
-static void protoApplyAngles(const double angles[3], uint8_t seen)
+/* ========== landing the parsed coordinates ========== */
+/* Move the end effector to a point given in the ground frame.
+ *
+ * Frame (serial_protocol.h): origin O = the foot of the perpendicular dropped
+ * from the shoulder joint to the ground, x+ = the direction the arm faces in its
+ * initial pose, z+ = straight up, right handed. The firmware's internal frame
+ * has the same axes and only differs by where z counts from: its origin sits on
+ * the shoulder joint, so z_internal = z_coordinate - WEARM_SHOULDER_HEIGHT.
+ *
+ * Unlike the old module (which wrote joint angles straight into the servos and
+ * clamped whatever the host asked for), this is a strict move: the point is
+ * solved with the inverse kinematics and a target the arm cannot stand at is
+ * rejected with nothing written at all, so a rejected command never leaves the
+ * arm half way to a pose nobody asked for. An axis the line did not mention
+ * keeps the value it already had.
+ *
+ * Returns true when the arm was moved. */
+static bool protoMoveToCoords(const double coords[3], uint8_t seen)
 {
-  for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
-    if (!(seen & (uint8_t)(1u << a))) continue;
+  pos target = Pos;
 
-    /* angle1 = b, angle2 = r, angle3 = c, so the servo index of axis a is a
-     * itself; protoAxisServoIndex[] only spells that same mapping out. */
-    (&Pos.ser.angle1)[a] = angles[a];
+  if (seen & (uint8_t)(1u << 0)) {
+    target.rec.x = coords[0];
+  }
+  if (seen & (uint8_t)(1u << 1)) {
+    target.rec.y = coords[1];
+  }
+  if (seen & (uint8_t)(1u << 2)) {
+    /* z is the height above the ground: below the ground plane does not exist */
+    if (coords[2] < 0.0) {
+      return false;
+    }
+    target.rec.z = coords[2] - WEARM_SHOULDER_HEIGHT;
   }
 
-  /* sync semantics: clamp every joint into its travel range (the same check the
-   * rest of the firmware shares, which keeps six double comparisons out of this
-   * file) and run the forward kinematics once. The caller only reaches this
-   * point with at least one axis seen, so the old guard was always true. */
-  clampServoAngles(&Pos.ser);
+  /* getAngleEx() writes target.ser only when it returns true: out of reach (or
+   * out of joint travel) leaves the struct untouched. Its clamped flag speaks
+   * about the tool servo (angle4) alone, which this command never sets, so a
+   * successful solve of the requested point is all we ask for. The tool angle
+   * therefore stays exactly where it was, and is never clamped into range here. */
+  if (!getAngleEx(&target, NULL)) {
+    return false;
+  }
+
+  Pos = target;
+
+  /* Keep the derived coordinates coming from the forward kinematics, exactly the
+   * way the rest of the firmware maintains them, so Pos.rec and Pos.ser can
+   * never disagree about where the arm is. */
   if (!recFromServo(&Pos.rec, &Pos.ser)) {
     DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
   }
+  return true;
 }
 
 /* ========== speed control ========== */
@@ -731,10 +956,11 @@ static int protoSpeedStep(int delta)
 }
 
 /* ========== initialization ========== */
-/* Serial.begin(PROTO_BAUD) plus the command table */
+/* UART setup (raw registers on the release AVR build, Serial otherwise) plus
+ * the command table */
 void serialProtocolBegin(void)
 {
-  Serial.begin(PROTO_BAUD);
+  protoSerialBegin();
   s_runtimeFeatures = protoCompiledFeatures();
 
   /* command table: kept under WEARM_SERIAL_RESPONSES so the host still gets the
@@ -747,24 +973,31 @@ void serialProtocolBegin(void)
   DEBUG_PRINTLN(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
   DEBUG_PRINTLN(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
   DEBUG_PRINTLN(F("[proto] H / L        speed up / down one level"));
-  DEBUG_PRINTLN(F("[proto] x deg,y deg,z deg  sync 3 servos, e.g. x10,y30,z20"));
+  DEBUG_PRINTLN(F("[proto] x,y,z        end effector point, ground frame, e.g. x20,y0,z40"));
+  DEBUG_PRINTLN(F("[proto]              O = under the shoulder joint, x = initial facing"));
+  DEBUG_PRINTLN(F("[proto]              direction, z = up (right handed), z >= 0"));
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     double lo, hi;
     if (!protoAxisGetLimit(a, &lo, &hi)) continue;
-    /* the axis letter and the joint letter are printed as one character C
-     * strings so they are not taken for code values */
+    if (a == 2) {
+      /* the internal limits count z from the shoulder joint; the command counts
+       * it from the ground, so shift the window by the shoulder height */
+      lo = 0.0;
+      hi += WEARM_SHOULDER_HEIGHT;
+    }
+    /* the axis letter is printed through a one character C string so it is not
+     * taken for a code value */
     DEBUG_PRINT(F("[proto] "));
     DEBUG_PRINT(protoAxisChar[a]);
-    DEBUG_PRINT(F(" -> angle"));
-    DEBUG_PRINT(protoAxisServoIndex[a]);
-    DEBUG_PRINT(F(" ("));
-    DEBUG_PRINT(protoAxisJoint[a]);
-    DEBUG_PRINT(F(") "));
+    DEBUG_PRINT(F(" = "));
     DEBUG_PRINTF(lo, 1);
-    DEBUG_PRINT(F(".."));
+    DEBUG_PRINT(F(" .. "));
     DEBUG_PRINTF(hi, 1);
     DEBUG_PRINTLN();
   }
+  DEBUG_PRINTLN(F("[proto] shoulder height (ground -> shoulder): "));
+  DEBUG_PRINTF(WEARM_SHOULDER_HEIGHT, 1);
+  DEBUG_PRINTLN();
   DEBUG_PRINTLN(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
   DEBUG_PRINTLN(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
   DEBUG_PRINTLN(F("[proto] ================================"));

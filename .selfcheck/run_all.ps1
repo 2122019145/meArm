@@ -6,8 +6,8 @@
 # 或  powershell -NoProfile -ExecutionPolicy Bypass -File D:\dsh1\wearm\.selfcheck\run_all.ps1
 #
 # 做三件事：
-#   1. 严格编译 8 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）
-#   2. 严格编译并运行 9 个自检程序，逐个要求 "ALL PASS" 且退出码 0
+#   1. 严格编译 9 个固件 TU（-Wall -Wextra -Wshadow -Wconversion）
+#   2. 严格编译并运行 10 个自检程序，逐个要求 "ALL PASS" 且退出码 0
 #   3. 汇总退出码（任一失败则 exit 1）
 #
 # 【注意 PowerShell / g++ 的坑】
@@ -26,7 +26,7 @@ $mock = Join-Path $sc 'mock'
 
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null }
 
-$fw  = @('constant_and_positions.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp', 'pick_place.cpp', 'button_control.cpp', 'draw_control.cpp') | ForEach-Object { Join-Path $root $_ }
+$fw  = @('constant_and_positions.cpp', 'servo_drive.cpp', 'move.cpp', 'joystick_control.cpp', 'protocol_constants.cpp', 'serial_protocol.cpp', 'pick_place.cpp', 'button_control.cpp', 'draw_control.cpp') | ForEach-Object { Join-Path $root $_ }
 $inc = @("-I$root", "-I$mock")
 
 # 【v1.1.0】PC 端自检固定用「全功能 + 调试日志开」的配置。
@@ -52,16 +52,16 @@ foreach ($f in $fw) {
 
 Write-Host ''
 Write-Host '================ 2) 自检程序（必须 ALL PASS）================'
-# 每个自检程序都链接全部固件 TU + 两个 mock。
+# 每个自检程序都链接全部固件 TU + mock/Arduino.cpp。
 # 【为什么不再按探针分别配源文件】早期按"这个探针需要哪些 .cpp"逐个列，
 # 结果 $fw 里已经含 move.cpp、又在 extra 里再列一次，触发
 # "multiple definition of moveJointStep(int, double)" 链接错误。
 # 全部链接既简单又不会漏（未用到的目标文件由链接器按需取舍）。
-$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place', 'probe_button', 'probe_draw')
+$probes = @('probe_axes', 'probe_rt', 'probe_move', 'probe_joystick', 'wearm_ino_test', 'probe_protocol', 'probe_pick_place', 'probe_button', 'probe_draw', 'probe_servo_drive')
 foreach ($n in $probes) {
     $src  = Join-Path $sc ($n + '.cpp')
     $exe  = Join-Path $out ($n + '.exe')
-    $srcs = @($src) + $fw + @((Join-Path $mock 'Arduino.cpp'), (Join-Path $mock 'Servo.cpp'))
+    $srcs = @($src) + $fw + @((Join-Path $mock 'Arduino.cpp'))
     $clog = & $gpp -std=gnu++17 -O2 -Wall -Wextra -Wshadow @cfg @inc @srcs -o $exe 2>&1
     $cn = ($clog | Measure-Object).Count
     if ($LASTEXITCODE -ne 0 -or $cn -gt 0) {
