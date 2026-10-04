@@ -319,20 +319,15 @@ static bool teachFive(const double tgt[5][3], double out[5][3]) {
 
 /* ==================== 用例 ==================== */
 
-/* 内置图形的期望顶点（中心 + 归一化 u,v × 半宽，z = 纸面高度） */
+/* 内置图形的期望顶点（中心 + 归一化 u,v × 半宽，z = 纸面高度）
+ * 本分支只剩两个内置图形：直线 / 字母V（N / 三角形 / Z 已随分支删掉）。 */
 static void shapeVerts(int task, double half, double z, double out[5][3], int *n) {
   static const double LINE[2][2]     = { { -1.0, 0.0 },  { 1.0, 0.0 } };
-  static const double NN[4][2]       = { { -1.0, -1.0 }, { -1.0, 1.0 }, { 1.0, -1.0 }, { 1.0, 1.0 } };
-  static const double TRI[4][2]      = { { -1.0, -1.0 }, { 1.0, -1.0 }, { 0.0, 1.0 }, { -1.0, -1.0 } };
-  static const double ZZ[4][2]       = { { -1.0, 1.0 },  { 1.0, 1.0 },  { -1.0, -1.0 }, { 1.0, -1.0 } };
   static const double VV[3][2]       = { { -1.0, 1.0 },  { 0.0, -1.0 }, { 1.0, 1.0 } };
 
   const double (*src)[2] = LINE;
   int cnt = 2;
-  if (task == DRAW_TASK_N) { src = NN; cnt = 4; }
-  else if (task == DRAW_TASK_TRIANGLE) { src = TRI; cnt = 4; }
-  else if (task == DRAW_TASK_Z) { src = ZZ; cnt = 4; }
-  else if (task == DRAW_TASK_V) { src = VV; cnt = 3; }
+  if (task == DRAW_TASK_V) { src = VV; cnt = 3; }
 
   for (int i = 0; i < cnt; i++) {
     out[i][0] = drawGetCenterX() + src[i][0] * half;   /* 中心与半宽由标定接口给出 */
@@ -354,7 +349,7 @@ int main(void) {
 
   /* ================= 1) 初始化与纸面标定 ================= */
   printf("\n[1] 初始化与纸面标定\n");
-  check("drawSetup 后默认任务 = 三角形", drawGetTask() == DRAW_TASK_TRIANGLE, drawTaskName(drawGetTask()));
+  check("drawSetup 后默认任务 = 直线", drawGetTask() == DRAW_TASK_LINE, drawTaskName(drawGetTask()));
   snprintf(d, sizeof d, "纸面 z=%.2f 半宽=%.2f 中心=(%.2f,%.2f)",
            drawGetPaperZ(), drawGetHalfSize(), drawGetCenterX(), drawGetCenterY());
   check("默认纸面 z=12 / 半宽 6 / 中心 (20,0)",
@@ -371,25 +366,25 @@ int main(void) {
       const char *nm = drawTaskName(t);
       if (nm == NULL || nm[0] == '\0' || strcmp(nm, "未知") == 0) names = false;
     }
-    snprintf(d, sizeof d, "直线/%s/三角形/%s/%s/五点折线/五点曲线", drawTaskName(1), drawTaskName(3),
-             drawTaskName(4));
-    check("7 个任务名都齐全", names && DRAW_TASK_COUNT == 7, d);
+    snprintf(d, sizeof d, "%s/%s/%s/%s", drawTaskName(0), drawTaskName(1),
+             drawTaskName(2), drawTaskName(3));
+    check("4 个任务名都齐全（直线/字母V/五点折线/五点曲线）", names && DRAW_TASK_COUNT == 4, d);
   }
   check("drawSelectTask 非法任务回 -1",
         drawSelectTask(-1) == -1 && drawSelectTask(DRAW_TASK_COUNT) == -1, "task<0 / task>=COUNT");
 
   {
-    drawSelectTask(DRAW_TASK_TRIANGLE);
+    drawSelectTask(DRAW_TASK_LINE);
     int a = drawTaskCycle();
     int b = drawTaskCycle();
     int c = drawTaskCycle();
     int e = drawTaskCycle();
     int f = drawTaskCycle();
-    snprintf(d, sizeof d, "三角形->%s->%s->%s->%s->%s", drawTaskName(a), drawTaskName(b),
+    snprintf(d, sizeof d, "直线->%s->%s->%s->%s->%s", drawTaskName(a), drawTaskName(b),
              drawTaskName(c), drawTaskName(e), drawTaskName(f));
-    check("循环顺序 = Z>V>折线>曲线>直线",
-          a == DRAW_TASK_Z && b == DRAW_TASK_V && c == DRAW_TASK_POLYLINE &&
-          e == DRAW_TASK_CURVE && f == DRAW_TASK_LINE, d);
+    check("循环顺序 = 直线>字母V>折线>曲线>直线",
+          a == DRAW_TASK_V && b == DRAW_TASK_POLYLINE && c == DRAW_TASK_CURVE &&
+          e == DRAW_TASK_LINE && f == DRAW_TASK_V, d);
   }
 
   check("标定纸面高度 p：合法通过", drawSetPaperZ(11.5) && fabs(drawGetPaperZ() - 11.5) < 1e-9, "11.5");
@@ -444,7 +439,8 @@ int main(void) {
     check("绘制中沿 y=0 走，x 从 14 到 26",
           fabs(pa.ymin) < 0.02 && fabs(pa.ymax) < 0.02 &&
           fabs(pa.xmin - 14.0) < 0.05 && fabs(pa.xmax - 26.0) < 0.05, d);
-    check("直线真直（每步位移均匀、不超过 8 单位/秒）", pa.maxStep > 0.0 && pa.maxStep <= 0.09, d);
+    check("直线真直（每步位移 ≤ 0.02 单位 —— 本分支的精细化插值）",
+          pa.maxStep > 0.0 && pa.maxStep <= 0.025, d);
 
     {
       const double seg[2][3] = { { 14.0, 0.0, 12.0 }, { 26.0, 0.0, 12.0 } };
@@ -456,8 +452,8 @@ int main(void) {
     snprintf(d, sizeof d, "抬笔段 z 最高 %.2f，x/y 漂移 %.3f", lf.zmax, lf.maxXYStep);
     check("画完垂直抬笔（先离纸再走）", lf.n > 5 && lf.zmax > 12.0 + 3.5 && lf.maxXYStep < 0.05, d);
 
-    snprintf(d, sizeof d, "用时 %lu ms（弧长 12 单位）", drawLastRunMs());
-    check("绘制用时合理（12 单位 / <= 8 单位每秒）",
+    snprintf(d, sizeof d, "用时 %lu ms（弧长 12 单位，笔尖 3 单位/秒）", drawLastRunMs());
+    check("绘制用时合理（12 单位 / 3 单位每秒，加上抬笔落笔与回待机）",
           drawLastRunMs() > 1000UL && drawLastRunMs() < 20000UL, d);
 
     snprintf(d, sizeof d, "b=%.2f r=%.2f c=%.2f", Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
@@ -466,12 +462,11 @@ int main(void) {
           fabs(Pos.ser.angle3 - 90.0) < 0.5, d);
   }
 
-  /* ================= 3) 内置图形几何（N / 三角形 / Z / V） ================= */
+  /* ================= 3) 内置图形几何（本分支只剩 字母V；直线在 [2] 段已覆盖） ================= */
   printf("\n[3] 内置图形几何：顶点都走到、轨迹只在这些顶点的连线上\n");
   {
-    const int tasks[4] = { DRAW_TASK_N, DRAW_TASK_TRIANGLE, DRAW_TASK_Z, DRAW_TASK_V };
-    for (int k = 0; k < 4; k++) {
-      int task = tasks[k];
+    {
+      int task = DRAW_TASK_V;
       double want[5][3];
       int n = 0;
       shapeVerts(task, 6.0, 12.0, want, &n);
@@ -481,19 +476,19 @@ int main(void) {
       seqReset();
       if (drawStartTask() != PROTO_RES_DRAW_STARTED) {
         check("内置图形能启动", false, drawTaskName(task));
-        continue;
-      }
-      bool done = runToIdleTrace(40000);
+      } else {
+        bool done = runToIdleTrace(40000);
 
-      double worstVert = 0.0;
-      for (int i = 0; i < n; i++) {
-        double dd = minDistToPoint(want[i]);
-        if (dd > worstVert) worstVert = dd;
+        double worstVert = 0.0;
+        for (int i = 0; i < n; i++) {
+          double dd = minDistToPoint(want[i]);
+          if (dd > worstVert) worstVert = dd;
+        }
+        double worstOff = maxDistToPolyline(want, n);
+        snprintf(d, sizeof d, "%s：顶点最差 %.3f、离线最远 %.3f", drawTaskName(task), worstVert, worstOff);
+        check("形状正确（顶点都经过 + 只走顶点连线）",
+              done && worstVert <= 0.30 && worstOff <= 0.05, d);
       }
-      double worstOff = maxDistToPolyline(want, n);
-      snprintf(d, sizeof d, "%s：顶点最差 %.3f、离线最远 %.3f", drawTaskName(task), worstVert, worstOff);
-      check("形状正确（顶点都经过 + 只走顶点连线）",
-            done && worstVert <= 0.30 && worstOff <= 0.05, d);
     }
   }
 
@@ -589,6 +584,71 @@ int main(void) {
       check("回待机后进入示教阶段", inTeach, drawPhaseName());
     }
     check("示教开始时已记录 0 个点", drawTeachCount() == 0, "每个任务都从 0 开始");
+
+    /* —— 示教点动的逐轴回归（修的是"示教状态下摇杆控制错乱"）——
+     * 满偏一格只该让对应的那一个坐标动一点（≤0.26 工作区单位），而不是一格跳半个工作区；
+     * 轻推要走比满偏更小的步；A2（夹爪）默认整路不响应，免得把夹着的笔带歪。 */
+    {
+      const double CAP  = 0.26;   /* draw_control.cpp 的 DRAW_JOG_STEP_MAX(0.25) + 余量 */
+      const double ZERO = 0.02;   /* 判"这个坐标没动"的容差（此时步长 ~0.19） */
+      double x0, y0, z0, dx, dy, dz, dFull;
+
+      /* A0 满偏：x 增大，y/z 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[0] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      dFull = dx;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A0：只让 x 增大（方向对、无串扰）",
+            dx > 0.01 && fabs(dy) < ZERO && fabs(dz) < ZERO, d);
+      check("示教点动 A0：单格位移不超过 0.25 单位上限", fabs(dx) <= CAP, d);
+
+      /* A1 满偏：y 增大，x/z 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[1] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A1：只让 y 增大（方向对、无串扰）",
+            dy > 0.01 && fabs(dx) < ZERO && fabs(dz) < ZERO, d);
+      check("示教点动 A1：单格位移不超过 0.25 单位上限", fabs(dy) <= CAP, d);
+
+      /* A3 满偏：z 减小（前推 = 下压），x/y 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[3] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A3：只让 z 减小（前推=下压）",
+            dz < -0.01 && fabs(dx) < ZERO && fabs(dy) < ZERO, d);
+      check("示教点动 A3：单格位移不超过 0.25 单位上限", fabs(dz) <= CAP, d);
+
+      /* 轻推：步长按偏转比例缩小（0.02 下限），必须明显小于满偏 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x;
+      g_mockAnalog[0] = 550; step(); centerSticks(); advance(80);
+      {
+        const double dSmall = Pos.rec.x - x0;
+        snprintf(d, sizeof d, "轻推 dx=%+.3f（满偏 %.3f）", dSmall, dFull);
+        check("示教点动：轻推走小步（比满偏小很多），对点更细",
+              dSmall > 0.005 && dSmall < dFull * 0.5, d);
+      }
+
+      /* A2（夹爪）：默认整路不响应 */
+      {
+        const SER before = Pos.ser;
+        const double px = Pos.rec.x, py = Pos.rec.y, pz = Pos.rec.z;
+        centerSticks(); advance(80);
+        g_mockAnalog[2] = 900; step();
+        g_mockAnalog[2] = 100; step();
+        centerSticks(); advance(80);
+        snprintf(d, sizeof d, "笔尖 (%.2f,%.2f,%.2f) angle4=%.3f", Pos.rec.x, Pos.rec.y, Pos.rec.z, Pos.ser.angle4);
+        check("示教点动 A2（夹爪）：默认整路不响应，笔尖与 angle4 都不动",
+              Pos.rec.x == px && Pos.rec.y == py && Pos.rec.z == pz &&
+              Pos.ser.angle4 == before.angle4, d);
+      }
+    }
 
     {
       bool okAll = teachFive(tgt, got);

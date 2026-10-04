@@ -100,7 +100,7 @@
 #define PROTO_RES_HOME_STARTED   17 /* M/0：开始回中 */
 
 /* 绘图命令的返回值（F/D/G/E/Q/U/W 与 p/n/o，实现见 draw_control.cpp） */
-#define PROTO_RES_DRAW_TASK_SELECTED 18 /* F：切换绘制任务（直线/N/三角形/Z/V/五点折线/五点曲线） */
+#define PROTO_RES_DRAW_TASK_SELECTED 18 /* F：切换绘制任务（直线/字母V/五点折线/五点曲线） */
 #define PROTO_RES_DRAW_STARTED       19 /* D：绘图任务已启动（内置图形，或进入五点示教） */
 #define PROTO_RES_DRAW_PAUSED        20 /* Q：绘制已暂停（停在原地，任务状态保留） */
 #define PROTO_RES_DRAW_RESUMED       21 /* U：从暂停处继续绘制 */
