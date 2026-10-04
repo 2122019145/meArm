@@ -585,6 +585,71 @@ int main(void) {
     }
     check("示教开始时已记录 0 个点", drawTeachCount() == 0, "每个任务都从 0 开始");
 
+    /* —— 示教点动的逐轴回归（修的是"示教状态下摇杆控制错乱"）——
+     * 满偏一格只该让对应的那一个坐标动一点（≤0.26 工作区单位），而不是一格跳半个工作区；
+     * 轻推要走比满偏更小的步；A2（夹爪）默认整路不响应，免得把夹着的笔带歪。 */
+    {
+      const double CAP  = 0.26;   /* draw_control.cpp 的 DRAW_JOG_STEP_MAX(0.25) + 余量 */
+      const double ZERO = 0.02;   /* 判"这个坐标没动"的容差（此时步长 ~0.19） */
+      double x0, y0, z0, dx, dy, dz, dFull;
+
+      /* A0 满偏：x 增大，y/z 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[0] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      dFull = dx;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A0：只让 x 增大（方向对、无串扰）",
+            dx > 0.01 && fabs(dy) < ZERO && fabs(dz) < ZERO, d);
+      check("示教点动 A0：单格位移不超过 0.25 单位上限", fabs(dx) <= CAP, d);
+
+      /* A1 满偏：y 增大，x/z 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[1] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A1：只让 y 增大（方向对、无串扰）",
+            dy > 0.01 && fabs(dx) < ZERO && fabs(dz) < ZERO, d);
+      check("示教点动 A1：单格位移不超过 0.25 单位上限", fabs(dy) <= CAP, d);
+
+      /* A3 满偏：z 减小（前推 = 下压），x/y 不动 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
+      g_mockAnalog[3] = 900; step(); centerSticks(); advance(80);
+      dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
+      snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
+      check("示教点动 A3：只让 z 减小（前推=下压）",
+            dz < -0.01 && fabs(dx) < ZERO && fabs(dy) < ZERO, d);
+      check("示教点动 A3：单格位移不超过 0.25 单位上限", fabs(dz) <= CAP, d);
+
+      /* 轻推：步长按偏转比例缩小（0.02 下限），必须明显小于满偏 */
+      centerSticks(); advance(80);
+      x0 = Pos.rec.x;
+      g_mockAnalog[0] = 550; step(); centerSticks(); advance(80);
+      {
+        const double dSmall = Pos.rec.x - x0;
+        snprintf(d, sizeof d, "轻推 dx=%+.3f（满偏 %.3f）", dSmall, dFull);
+        check("示教点动：轻推走小步（比满偏小很多），对点更细",
+              dSmall > 0.005 && dSmall < dFull * 0.5, d);
+      }
+
+      /* A2（夹爪）：默认整路不响应 */
+      {
+        const SER before = Pos.ser;
+        const double px = Pos.rec.x, py = Pos.rec.y, pz = Pos.rec.z;
+        centerSticks(); advance(80);
+        g_mockAnalog[2] = 900; step();
+        g_mockAnalog[2] = 100; step();
+        centerSticks(); advance(80);
+        snprintf(d, sizeof d, "笔尖 (%.2f,%.2f,%.2f) angle4=%.3f", Pos.rec.x, Pos.rec.y, Pos.rec.z, Pos.ser.angle4);
+        check("示教点动 A2（夹爪）：默认整路不响应，笔尖与 angle4 都不动",
+              Pos.rec.x == px && Pos.rec.y == py && Pos.rec.z == pz &&
+              Pos.ser.angle4 == before.angle4, d);
+      }
+    }
+
     {
       bool okAll = teachFive(tgt, got);
       snprintf(d, sizeof d, "记录 %d/5，第1点 (%.2f,%.2f,%.2f) 第5点 (%.2f,%.2f,%.2f)",

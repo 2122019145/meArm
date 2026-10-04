@@ -104,8 +104,20 @@
 
 /* --- 示教 --- */
 #define DRAW_POINT_TOL         0.8   /* 过点判定容差（工作区单位） */
-#define DRAW_JOG_SCALE         0.5   /* 点动步长 = speed.stepSize × 这个系数 */
+#define DRAW_JOG_SCALE         0.5   /* 末端 f 的点动步长 = speed.stepSize × 这个系数（度） */
 #define DRAW_JOG_CENTER      512     /* 摇杆中位 ADC 值 */
+/* 【示教点动的坐标步长（本次修复）】
+ * x/y/z 是"工作区单位"（0~40 左右），而 speed.stepSize 在手动模式里的含义是
+ * "每个控制周期转过的角度（度）" —— 直接拿它当位移用会让笔尖一格跳出半个工作区。
+ * 所以这里单独给一套坐标步长：满偏时每格最多 DRAW_JOG_STEP_MAX 工作区单位，
+ * 并按偏转比例缩小；配上 10~40ms 的步进间隔，满偏速度约 6 单位/秒
+ * （比自动绘制的 DRAW_V_MAX 3 快一倍，手动点动够灵敏，但不会"一推就飞"）。 */
+#define DRAW_JOG_STEP_MAX      0.25  /* 满偏时每格位移（工作区单位） */
+#define DRAW_JOG_STEP_MIN      0.02  /* 轻微偏转时的每格位移下限（再小就点不动了） */
+/* 示教期间是否允许摇杆动末端夹爪：默认 0 = 不响应 A2。
+ * 夹爪里夹着笔（或笔夹），示教时顺手推右摇杆很容易带开夹爪把笔顶歪/掉笔，
+ * 而"点动"本身根本不需要它。要恢复旧行为把这里改成 1。 */
+#define DRAW_JOG_TOOL_ENABLE   0
 /* 哪一路觉得方向反了就把对应的宏改成 1（不用改逻辑） */
 #define DRAW_JOG_INVERT_X      0
 #define DRAW_JOG_INVERT_Y      0
@@ -791,20 +803,25 @@ static void beginLiftToReturn(void)
 
 /* ==================== 示教 ==================== */
 
-/* 示教点动一步的步进间隔：偏转越大步越慢，范围就是全局调速的 min~fullDelay */
+/* 示教点动一步的步进间隔：与摇杆模块的 speedIntervalMs() 同一条约定 ——
+ * 轻微偏转用最短间隔（连续细走），满偏用最长间隔（慢而稳、最安全）。
+ * 注意方向：**偏转越大间隔越长**（旧版写反了：满偏用最短间隔，等于"推得越狠冲得越快"）。 */
 static int jogIntervalMs(int amp)
 {
-  int slow = speed.fullDelayMs;
   int fast = speed.minDelayMs;
+  int slow = speed.fullDelayMs;
   if (fast < 1) fast = 1;
   if (slow < fast) slow = fast;
   int span = slow - fast;
-  int ms = slow - (int)(((long)span * (long)amp) / (long)DRAW_JOG_CENTER);
-  if (ms < fast) ms = fast;
-  return ms;
+  if (amp < 0) amp = 0;
+  else if (amp > DRAW_JOG_CENTER) amp = DRAW_JOG_CENTER;
+  return fast + (int)(((long)span * (long)amp) / (long)DRAW_JOG_CENTER);
 }
 
-/* 示教点动：读摇杆 -> 一路一路按各自的计时门控动一点笔尖（笛卡尔点动） */
+/* 示教点动：读摇杆 -> 一路一路按各自的计时门控动一点笔尖（笛卡尔点动）。
+ * 三路坐标（A0→x、A1→y、A3→z）用"工作区单位"的步长与间隔，轻微偏转走小步、
+ * 满偏走大步；末端 A2 默认整路不响应（DRAW_JOG_TOOL_ENABLE 0）。
+ * 每格位移都被 DRAW_JOG_STEP_MAX 卡住 ⇒ 单轴推杆只让对应的那一个坐标变化。 */
 static void teachJogTick(void)
 {
   struct joyState st;
@@ -817,19 +834,28 @@ static void teachJogTick(void)
 
   for (int i = 0; i < 4; i++) {
     if (amp[i] <= 0) continue;
+#if !DRAW_JOG_TOOL_ENABLE
+    /* 夹爪里夹着笔：示教点动不响应 A2（右摇杆的左右推），免得一推带歪笔尖 */
+    if (i == 3) continue;
+#endif
     int interval = jogIntervalMs(amp[i]);
     if (now - s_jogLastMs[i] < (unsigned long)interval) continue;
     s_jogLastMs[i] = now;
 
     int sign = (raw[i] > DRAW_JOG_CENTER) ? 1 : -1;
-    double step = speed.stepSize * DRAW_JOG_SCALE;
-    if (step < 0.05) step = 0.05;
 
     if (i == 3) {
-      /* 末端 f：与摇杆模块同一方向约定（右推收回、左推张开） */
-      (void) posSetAngle4(Pos.ser.angle4 - (double)sign * step);
+      /* 末端 f：这一路是角度（度），与摇杆模块 toolStep() 同一比例，按偏转缩放 */
+      double deg = speed.stepSize * DRAW_JOG_SCALE *
+                   ((double)amp[i] / (double)DRAW_JOG_CENTER);
+      if (deg < 0.05) deg = 0.05;
+      (void) posSetAngle4(Pos.ser.angle4 - (double)sign * deg);
       continue;
     }
+
+    /* x/y/z：这一路是工作区单位，按偏转比例缩放（绝不用 speed.stepSize 当距离） */
+    double step = DRAW_JOG_STEP_MAX * ((double)amp[i] / (double)DRAW_JOG_CENTER);
+    if (step < DRAW_JOG_STEP_MIN) step = DRAW_JOG_STEP_MIN;
 
     double nx = Pos.rec.x;
     double ny = Pos.rec.y;
