@@ -3034,7 +3034,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define JOY_CAL_MAX_OFF 64  /* 允许的静态偏差上限（计数） */
 
 /* ---------- 配置：时序 ---------- */
-#define BTN_DEBOUNCE_MS 30  /* 按键消抖窗口（本套件默认无按键，保留供扩展） */
+#define JOY_BTN_DEBOUNCE_MS 30  /* 按键消抖窗口（本套件默认无按键，保留供扩展） */
 #define LED_FAST_MS    100  /* 运动中闪烁半周期 */
 
 /* 关节编号（用于 lastStepTime[] 与调试打印，顺序与 JOY_ACT_* 位图一致） */
@@ -3111,7 +3111,7 @@ static void logBlocked(const __FlashStringHelper *msg) {
 /* ---------- 按键读取（时间消抖，本套件默认不用） ---------- */
 #if WEARM_HAVE_BUTTONS
 /* 内部上拉 + 外部按下拉低，因此"按下"= LOW。
- * 消抖策略：引脚电平必须连续保持 BTN_DEBOUNCE_MS 不变，才认可为新的稳定状态。
+ * 消抖策略：引脚电平必须连续保持 JOY_BTN_DEBOUNCE_MS 不变，才认可为新的稳定状态。
  * 这样抖动只会推迟状态翻转，不会产生多次边沿。
  * 注意: 这里不能用 delay()，否则会阻塞串口命令的响应。 */
 static bool buttonDown(uint8_t pin) {
@@ -3122,13 +3122,13 @@ static bool buttonDown(uint8_t pin) {
   bool raw = (digitalRead(pin) == LOW);
   if (raw == stable[pin]) return stable[pin];   /* 与稳定态一致，直接返回 */
 
-  /* 电平与稳定态不同：开始/继续计时，满 BTN_DEBOUNCE_MS 才翻转 */
+  /* 电平与稳定态不同：开始/继续计时，满 JOY_BTN_DEBOUNCE_MS 才翻转 */
   unsigned long now = millis();
   if (changeAt[pin] == 0) {
     changeAt[pin] = now;
     return stable[pin];                    /* 仍在消抖窗口内，维持旧状态 */
   }
-  if (now - changeAt[pin] >= BTN_DEBOUNCE_MS) {
+  if (now - changeAt[pin] >= JOY_BTN_DEBOUNCE_MS) {
     stable[pin] = raw;
     changeAt[pin] = 0;
   }
