@@ -48,5 +48,9 @@ function Add-Source([string]$name) {
 foreach ($name in $headers) { Add-Source $name }
 foreach ($name in $sources) { Add-Source $name }
 Add-Source $sketch
-[System.IO.File]::WriteAllLines($outFile, $chunks, [System.Text.UTF8Encoding]::new($false))
+# Write LF-only on purpose: .gitattributes declares "* text=auto eol=lf", so LF is what a
+# checkout produces. Matching it keeps the on-disk artifact byte-identical to the committed
+# blob (WriteAllLines would have emitted CRLF on Windows and forced git to normalise).
+$text = [string]::Join("`n", $chunks) + "`n"
+[System.IO.File]::WriteAllText($outFile, $text, [System.Text.UTF8Encoding]::new($false))
 Write-Host ("generated {0} ({1} bytes, {2} lines)" -f $outFile, (Get-Item -LiteralPath $outFile).Length, $chunks.Count)

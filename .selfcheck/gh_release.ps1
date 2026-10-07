@@ -7,7 +7,7 @@
 #
 # ASCII-ONLY ON PURPOSE: Windows PowerShell 5.1 mis-decodes .ps1 files that
 # contain non-ASCII bytes unless they carry a UTF-8 BOM (see .selfcheck/README.md,
-# "PowerShell / 脚本的几个坑").  Chinese text belongs in the -BodyFile, not here.
+# the "PowerShell / script traps" section).  Chinese text belongs in the -BodyFile, not here.
 #
 # Release name: taken from the first line of the body file when it looks like
 # "# vX.Y.Z - something" (leading "# " stripped), otherwise from -Name.

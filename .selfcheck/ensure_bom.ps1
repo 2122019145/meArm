@@ -1,4 +1,4 @@
-﻿# ensure_bom.ps1 -- keep every repo .ps1 script readable by Windows PowerShell 5.1.
+# ensure_bom.ps1 -- keep every repo .ps1 script readable by Windows PowerShell 5.1.
 #
 # Why this exists:
 #   The tool shell here is Windows PowerShell 5.1 (NOT pwsh 7). For a .ps1 file
@@ -32,6 +32,13 @@ foreach ($f in $files) {
     $b = [System.IO.File]::ReadAllBytes($f.FullName)
     if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
         if ($Check) { Write-Host ("  [ OK ] {0} has BOM" -f $f.Name) }
+        continue
+    }
+    $nonAscii = $false
+    foreach ($x in $b) { if ($x -gt 0x7F) { $nonAscii = $true; break } }
+    if (-not $nonAscii) {
+        # Pure ASCII parses identically under every code page, so a BOM is optional.
+        if ($Check) { Write-Host ("  [ OK ] {0} ASCII-only, BOM not required" -f $f.Name) }
         continue
     }
     $bad++
