@@ -141,7 +141,7 @@ void mockDigitalWriteReset(void);
 #define MOCK_SW2 17
 
 /* 串口输入仿真：测试可以用 mockSerialFeed() 喂字符，模拟你在串口助手敲的
- * '1'/'2'/'3'（调速）与 'k'/'K'（末端开合）。 */
+ * 单字符命令（O/S 夹爪、H/L 调速）与 x/y/z 角度行。 */
 void mockSerialFeed(const char *chars);
 void mockSerialClear(void);
 

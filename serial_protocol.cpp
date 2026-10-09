@@ -1,19 +1,18 @@
 /*
 // serial_protocol.cpp
-// Serial command protocol: fixed commands + Cartesian end effector targets
-// (x/y/z, ground frame: origin under the shoulder joint, x = initial facing
-// direction, z = up, right handed - see serial_protocol.h).
+// Serial command protocol: fixed commands + the three-servo synchronous angle
+// command (x/y/z in degrees: x = base, y = shoulder, z = elbow - see
+// serial_protocol.h).
 // Also hosts the start entry of the A/B/C pick-and-place sequences (while a
 // sequence runs this layer holds back every other motion command), the serial
 // twins N/R/P/M of the four physical buttons (implementation lives in
 // button_control.cpp) and the drawing commands F/D/G/E/Q/U/W plus the paper
 // calibration commands p/n/o (implementation lives in draw_control.cpp).
-// Handles character input, line buffering, command parsing and moves.
+// Handles character input, line buffering, command parsing and joint writes.
 */
 
 #include "Arduino.h"
 #include "constant_and_positions.h"
-#include "move.h"           /* moveToPoint(): x/y/z 指令落点用的公共核心 */
 #include "pick_place.h"
 #include "protocol_constants.h"
 #include "serial_protocol.h"
@@ -50,8 +49,9 @@ static unsigned long s_lastCharMs = 0;
  * single out-of-line copy anyway, and the whole dispatcher only exists once
  * because protoHandleLine() has no caller outside this file. */
 static void protoFlushLine(void);
-static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen);
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
+static void protoApplyAngles(const double angles[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
 #define PROTO_FEATURE_PICK   0x01u
@@ -251,7 +251,25 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno XYZ x,y,z ! !P !B !D";
+static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
+
+/* 'F' (pick drawing task) answers "OK F=<tag>": the tag is a short ASCII name
+ * ("LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE") so a serial-only host -
+ * a PC terminal or the ESP8266 board - can see which drawing mode is armed.
+ * The tag itself comes from draw_control.cpp (drawTaskTag). */
+__attribute__((noinline))
+static void protoReplyTaskTag(const char *tag)
+{
+  protoPut('O');
+  protoPut('K');
+  protoPut(' ');
+  protoPut('F');
+  protoPut('=');
+  while (*tag != '\0') {
+    protoPut(*tag++);
+  }
+  protoPut('\n');
+}
 
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
@@ -274,6 +292,7 @@ static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno XYZ
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
 #define R_FEATURE() do { } while (0)
+#define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
 #endif
 
 /* ========== command class bitmaps ========== */
@@ -488,7 +507,7 @@ int protoHandleLine(const char *line)
     if (!protoRuntimeEnabled(feature)) s_runtimeFeatures |= feature;
     else s_runtimeFeatures &= (uint8_t)~feature;
     R_FEATURE();
-    return PROTO_RES_SPEED_LEVEL;
+    return PROTO_RES_FEATURE;
   }
   if (cmd == '!' && single) {
     R_FEATURE();
@@ -546,41 +565,17 @@ int protoHandleLine(const char *line)
 
   /* single character commands */
   if (single) {
-    /* k/K are pulled out of the switch below: 'k' is the only case above 'W',
-     * so the emitted jump table stays 40 entries wide instead of 60. */
-    if (cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP) {
-      if (cmd == PROTO_CMD_TOOL_OPEN_STEP) {
-        posToolOpen(PROTO_TOOL_STEP_DEG);
-      } else {
-        posToolClose(PROTO_TOOL_STEP_DEG);
-      }
-      DEBUG_PRINT(F("[tool] angle4 -> "));
-      DEBUG_PRINTLN(Pos.ser.angle4);
-      R_OKN();
-      return PROTO_RES_TOOL_STEP;
-    }
-
-    /* '0' (home) and '1'..'3' (speed presets) sit far below the high end of the
-     * switch, so they are handled here: the emitted jump table stays 23 entries
-     * wide instead of 40. */
+    /* '0' is the only command below the 'O'..'W' range, so it is pulled out of
+     * the if chain: the chain then only pays for the comparisons it needs. */
     if (cmd == PROTO_CMD_BTN_HOME_ALT) {
       int result = buttonHandleCommand(cmd);
       protoReplyButtonResult(result);
       return result < 0 ? PROTO_RES_UNKNOWN : result;
     }
-    if (cmd >= PROTO_CMD_SPEED_SLOW && cmd <= PROTO_CMD_SPEED_FAST) {
-      /* '1','2','3' are SPEED_SLOW..SPEED_FAST in that order */
-      int level = cmd - PROTO_CMD_SPEED_SLOW;
-      adjustSpeed(level);
-      DEBUG_PRINT(F("[speed] serial cmd -> "));
-      DEBUG_PRINTLN(speedLevelName(level));
-      R_OK();
-      return PROTO_RES_SPEED_LEVEL;
-    }
 
     /* An if chain instead of a switch on purpose: the case labels span 'O'..'W',
-     * but '0' and '1' keep the table's low bound, so switch emits a 64 entry
-     * jump table while the chain only pays for the comparisons it needs.
+     * so switch would emit a 64 entry jump table while the chain only pays for
+     * the comparisons it needs.
      * Measured on the real AVR build: -78 bytes for this whole dispatcher. */
     if (cmd == PROTO_CMD_GRIPPER_OPEN) {
         posSetAngle4(servoLimit.maxF);
@@ -642,7 +637,12 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      if (result == PROTO_RES_BUSY) R_BUSY();
+      /* 'F' is answered with the shape that is now selected ("OK F=V") instead
+       * of a bare "OK": the operator (and the ESP8266 board) has no other way
+       * to tell which of the seven drawing tasks is armed. */
+      if (result == PROTO_RES_DRAW_TASK_SELECTED) {
+        protoReplyTaskTag(drawTaskTag(drawGetTask()));
+      } else if (result == PROTO_RES_BUSY) R_BUSY();
       else if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
       else if (result < 0) R_ERR();
       else R_OK();
@@ -666,52 +666,31 @@ int protoHandleLine(const char *line)
     return result;
   }
 
-  /* x/y/z: the Cartesian point the end effector must move to. The frame is the
-   * ground frame documented in serial_protocol.h (origin under the shoulder,
-   * x = initial facing direction, z = up, right handed). */
+  /* x/y/z: the three-servo synchronous angle command (exam task 1.3).
+   * x -> base servo (angle1 = b), y -> shoulder servo (angle2 = r),
+   * z -> elbow servo (angle3 = c). Every axis the line mentions is written in
+   * one go and the forward kinematics runs once afterwards, so one line is one
+   * synchronized pose change - the same convention the rest of the firmware
+   * uses (Pos.ser is the truth, Pos.rec is derived from it). */
   if (protoAxisIndexFromChar(cmd) >= 0) {
-    double coords[3];
+    double angles[3];
     uint8_t seen = 0;
 
-    if (!protoParseAxisLine(p, coords, &seen)) {
+    if (!protoParseAxisLine(p, angles, &seen)) {
       DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
       R_ERR();
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    /* Landing the parsed point is delegated to move.h's moveToPoint() — the very
-     * same "move to a given x,y,z" core the drawing module calls.
-     *
-     * Frame (serial_protocol.h): origin O = the foot of the perpendicular dropped
-     * from the shoulder joint to the ground, x+ = the direction the arm faces in
-     * its initial pose, z+ = straight up, right handed. The firmware's internal
-     * frame has the same axes and only differs by where z counts from: its origin
-     * sits on the shoulder joint, so z_internal = z_coordinate - WEARM_SHOULDER_HEIGHT.
-     * Below the ground plane does not exist: the whole line is rejected.
-     *
-     * MOVE_XYZ_NOW is the instant, unlimited strategy, which is what this command
-     * always was: a strict move — a target the arm cannot stand at is rejected with
-     * nothing written at all, so a rejected command never leaves the arm half way
-     * to a pose nobody asked for. An axis the line did not mention keeps the value
-     * it already had (moveToPoint() handles that from the seen mask). */
-    if ((seen & (uint8_t)(1u << 2)) != 0u) {
-      if (coords[2] < 0.0) {
-        R_REJ();
-        DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
-        return PROTO_RES_COORDS_REJECTED;
-      }
-      coords[2] -= WEARM_SHOULDER_HEIGHT;
-    }
-
-    if (moveToPoint(coords, seen, 0.0, 0.0, MOVE_XYZ_NOW) != MOVE_XYZ_OK) {
-      /* unreachable, or out of joint travel: nothing was changed at all */
-      R_REJ();
-      DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
-      return PROTO_RES_COORDS_REJECTED;
-    }
+    /* Out of travel is clamped rather than rejected: the limits come from
+     * servoLimit (the one shared truth, also used by the joystick and the
+     * drawing module), so "x200" lands on that joint's travel maximum instead of
+     * turning the whole command into a no-op. A line naming no axis at all never
+     * gets this far - protoParseAxisLine rejects it. */
+    protoApplyAngles(angles, seen);
 
 #if WEARM_DEBUG_SERIAL
-    Serial.print(F("[proto] move -> b="));
+    Serial.print(F("[proto] sync angles b="));
     Serial.print(Pos.ser.angle1);
     Serial.print(F(" r="));
     Serial.print(Pos.ser.angle2);
@@ -723,7 +702,7 @@ int protoHandleLine(const char *line)
   }
 
   /* Not an axis letter, but it contains a comma or starts with '=': it looks
-   * like a coordinate command that was mistyped. Everything else is unknown. */
+   * like an angle command that was mistyped. Everything else is unknown. */
   {
     const char *scan = p;
     while (*scan != '\0' && *scan != ',') {
@@ -739,14 +718,13 @@ int protoHandleLine(const char *line)
   return PROTO_RES_BAD_SYNTAX;
 }
 
-/* ========== coordinate parsing ========== */
-/* Parse a coordinate command: group (',' group)*, group = [blank] axis letter
- * [blank] [optional '='] [blank] value. The parsed numbers are Cartesian
- * coordinates in the ground frame (see serial_protocol.h), x/y/z in the order
- * protoAxisIndexFromChar() returns them. The whole line must parse; an axis
- * given twice keeps its last value. Anything that does not match the grammar
- * returns false and touches nothing but coords/seen. */
-static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen)
+/* ========== angle parsing ========== */
+/* Parse an angle command: group (',' group)*, group = [blank] axis letter
+ * [blank] [optional '='] [blank] value. The parsed numbers are servo angles in
+ * degrees, x/y/z in the order protoAxisIndexFromChar() returns them. The whole
+ * line must parse; an axis given twice keeps its last value. Anything that does
+ * not match the grammar returns false and touches nothing but angles/seen. */
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
 {
   const char *p = s;
   int groups = 0;
@@ -770,7 +748,7 @@ static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen)
     }
 
     /* 5) the value (must really start with a digit) */
-    if (!protoParseNumber(&p, &coords[axis])) return false;
+    if (!protoParseNumber(&p, &angles[axis])) return false;
 
     /* 6) record it (an axis given twice keeps the last value) */
     *seen |= (uint8_t)(1u << axis);
@@ -837,6 +815,30 @@ static bool protoParseNumber(const char **pp, double *out)
   *out = neg ? -value : value;
   *pp = p;
   return true;
+}
+
+/* ========== angle application ========== */
+/* Write the axes the line mentioned into the three joints and refresh the
+ * forward kinematics once. Axis a is joint a+1: angle1 = b (base), angle2 = r
+ * (shoulder), angle3 = c (elbow) - that is exactly the x/y/z mapping the exam
+ * asks for, and it is also why the three joints can be written through one
+ * pointer walk instead of a switch.
+ *
+ * clampServoAngles() is the same clamp every other writer uses (joystick,
+ * drawing jog, pick & place), so a value outside the mechanical travel snaps to
+ * the travel limit and the command is still an OK - the host sees the arm move
+ * to the nearest legal pose instead of getting an error it cannot act on. */
+static void protoApplyAngles(const double angles[3], uint8_t seen)
+{
+  for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
+    if ((seen & (uint8_t)(1u << a)) == 0u) continue;
+    (&Pos.ser.angle1)[a] = angles[a];
+  }
+
+  clampServoAngles(&Pos.ser);
+  if (!recFromServo(&Pos.rec, &Pos.ser)) {
+    DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
+  }
 }
 
 /* ========== drawing parameter calibration ========== */
@@ -942,31 +944,26 @@ void serialProtocolBegin(void)
   DEBUG_PRINTLN(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
   DEBUG_PRINTLN(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
   DEBUG_PRINTLN(F("[proto] H / L        speed up / down one level"));
-  DEBUG_PRINTLN(F("[proto] x,y,z        end effector point, ground frame, e.g. x20,y0,z40"));
-  DEBUG_PRINTLN(F("[proto]              O = under the shoulder joint, x = initial facing"));
-  DEBUG_PRINTLN(F("[proto]              direction, z = up (right handed), z >= 0"));
+  DEBUG_PRINTLN(F("[proto] x,y,z        three servo angles in degrees, e.g. x10,y30,z20"));
+  DEBUG_PRINTLN(F("[proto]              x = base (angle1), y = shoulder (angle2), z = elbow (angle3)"));
+  DEBUG_PRINTLN(F("[proto]              one line = one synchronized write, out-of-travel is clamped"));
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     double lo, hi;
     if (!protoAxisGetLimit(a, &lo, &hi)) continue;
-    if (a == 2) {
-      /* the internal limits count z from the shoulder joint; the command counts
-       * it from the ground, so shift the window by the shoulder height */
-      lo = 0.0;
-      hi += WEARM_SHOULDER_HEIGHT;
-    }
     /* the axis letter is printed through a one character C string so it is not
-     * taken for a code value */
+     * taken for a code value; the joint letter comes from the mapping table */
     DEBUG_PRINT(F("[proto] "));
     DEBUG_PRINT(protoAxisChar[a]);
-    DEBUG_PRINT(F(" = "));
+    DEBUG_PRINT(F(" = angle"));
+    DEBUG_PRINT((char)('1' + a));
+    DEBUG_PRINT(F(" ("));
+    DEBUG_PRINT(protoAxisJoint[a]);
+    DEBUG_PRINT(F(") travel "));
     DEBUG_PRINTF(lo, 1);
     DEBUG_PRINT(F(" .. "));
     DEBUG_PRINTF(hi, 1);
     DEBUG_PRINTLN();
   }
-  DEBUG_PRINTLN(F("[proto] shoulder height (ground -> shoulder): "));
-  DEBUG_PRINTF(WEARM_SHOULDER_HEIGHT, 1);
-  DEBUG_PRINTLN();
   DEBUG_PRINTLN(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
   DEBUG_PRINTLN(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
   DEBUG_PRINTLN(F("[proto] ================================"));

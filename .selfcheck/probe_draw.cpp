@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "Arduino.h"
 #include "constant_and_positions.h"
@@ -320,14 +321,20 @@ static bool teachFive(const double tgt[5][3], double out[5][3]) {
 /* ==================== 用例 ==================== */
 
 /* 内置图形的期望顶点（中心 + 归一化 u,v × 半宽，z = 纸面高度）
- * 本分支只剩两个内置图形：直线 / 字母V（N / 三角形 / Z 已随分支删掉）。 */
+ * 题目要求从 字母N / 三角形 / 字母Z / 字母V 里选一种，本工程四种都保留（同组不得完全相同）。 */
 static void shapeVerts(int task, double half, double z, double out[5][3], int *n) {
   static const double LINE[2][2]     = { { -1.0, 0.0 },  { 1.0, 0.0 } };
+  static const double NN[4][2]       = { { -1.0, -1.0 }, { -1.0, 1.0 }, { 1.0, -1.0 }, { 1.0, 1.0 } };
+  static const double TRIANGLE[4][2] = { { -1.0, -1.0 }, { 1.0, -1.0 }, { 0.0, 1.0 }, { -1.0, -1.0 } };
+  static const double ZZ[4][2]       = { { -1.0, 1.0 },  { 1.0, 1.0 },  { -1.0, -1.0 }, { 1.0, -1.0 } };
   static const double VV[3][2]       = { { -1.0, 1.0 },  { 0.0, -1.0 }, { 1.0, 1.0 } };
 
   const double (*src)[2] = LINE;
   int cnt = 2;
-  if (task == DRAW_TASK_V) { src = VV; cnt = 3; }
+  if (task == DRAW_TASK_N)        { src = NN;       cnt = 4; }
+  if (task == DRAW_TASK_TRIANGLE) { src = TRIANGLE; cnt = 4; }
+  if (task == DRAW_TASK_Z)        { src = ZZ;       cnt = 4; }
+  if (task == DRAW_TASK_V)        { src = VV;       cnt = 3; }
 
   for (int i = 0; i < cnt; i++) {
     out[i][0] = drawGetCenterX() + src[i][0] * half;   /* 中心与半宽由标定接口给出 */
@@ -366,9 +373,10 @@ int main(void) {
       const char *nm = drawTaskName(t);
       if (nm == NULL || nm[0] == '\0' || strcmp(nm, "未知") == 0) names = false;
     }
-    snprintf(d, sizeof d, "%s/%s/%s/%s", drawTaskName(0), drawTaskName(1),
-             drawTaskName(2), drawTaskName(3));
-    check("4 个任务名都齐全（直线/字母V/五点折线/五点曲线）", names && DRAW_TASK_COUNT == 4, d);
+    snprintf(d, sizeof d, "%s/%s/%s/%s/%s/%s/%s", drawTaskName(0), drawTaskName(1),
+             drawTaskName(2), drawTaskName(3), drawTaskName(4), drawTaskName(5), drawTaskName(6));
+    check("7 个任务名都齐全（直线/字母N/三角形/字母Z/字母V/五点折线/五点曲线）",
+          names && DRAW_TASK_COUNT == 7, d);
   }
   check("drawSelectTask 非法任务回 -1",
         drawSelectTask(-1) == -1 && drawSelectTask(DRAW_TASK_COUNT) == -1, "task<0 / task>=COUNT");
@@ -380,11 +388,14 @@ int main(void) {
     int c = drawTaskCycle();
     int e = drawTaskCycle();
     int f = drawTaskCycle();
-    snprintf(d, sizeof d, "直线->%s->%s->%s->%s->%s", drawTaskName(a), drawTaskName(b),
-             drawTaskName(c), drawTaskName(e), drawTaskName(f));
-    check("循环顺序 = 直线>字母V>折线>曲线>直线",
-          a == DRAW_TASK_V && b == DRAW_TASK_POLYLINE && c == DRAW_TASK_CURVE &&
-          e == DRAW_TASK_LINE && f == DRAW_TASK_V, d);
+    int g = drawTaskCycle();
+    int h = drawTaskCycle();
+    snprintf(d, sizeof d, "直线->%s->%s->%s->%s->%s->%s->%s", drawTaskName(a), drawTaskName(b),
+             drawTaskName(c), drawTaskName(e), drawTaskName(f), drawTaskName(g), drawTaskName(h));
+    check("循环顺序 = 直线>字母N>三角形>字母Z>字母V>折线>曲线>直线",
+          a == DRAW_TASK_N && b == DRAW_TASK_TRIANGLE && c == DRAW_TASK_Z &&
+          e == DRAW_TASK_V && f == DRAW_TASK_POLYLINE && g == DRAW_TASK_CURVE &&
+          h == DRAW_TASK_LINE, d);
   }
 
   check("标定纸面高度 p：合法通过", drawSetPaperZ(11.5) && fabs(drawGetPaperZ() - 11.5) < 1e-9, "11.5");
@@ -462,11 +473,12 @@ int main(void) {
           fabs(Pos.ser.angle3 - 90.0) < 0.5, d);
   }
 
-  /* ================= 3) 内置图形几何（本分支只剩 字母V；直线在 [2] 段已覆盖） ================= */
+  /* ================= 3) 内置图形几何（题目四种图形全测；直线在 [2] 段已覆盖） ================= */
   printf("\n[3] 内置图形几何：顶点都走到、轨迹只在这些顶点的连线上\n");
   {
-    {
-      int task = DRAW_TASK_V;
+    const int letterTasks[4] = { DRAW_TASK_N, DRAW_TASK_TRIANGLE, DRAW_TASK_Z, DRAW_TASK_V };
+    for (int li = 0; li < 4; li++) {
+      int task = letterTasks[li];
       double want[5][3];
       int n = 0;
       shapeVerts(task, 6.0, 12.0, want, &n);
@@ -489,6 +501,11 @@ int main(void) {
         check("形状正确（顶点都经过 + 只走顶点连线）",
               done && worstVert <= 0.30 && worstOff <= 0.05, d);
       }
+
+      /* 串口换到该模式时必须在回复里带上模式提示（题目要求的"输出当前图形模式的提示"） */
+      snprintf(d, sizeof d, "task=%d tag=%s", task, drawTaskTag(task));
+      check("每个内置图形都有非空 ASCII 模式标签", drawTaskTag(task) != NULL &&
+            drawTaskTag(task)[0] != '\0' && strcmp(drawTaskTag(task), "?") != 0, d);
     }
   }
 
@@ -572,7 +589,7 @@ int main(void) {
     };
     static double got[5][3];
 
-    setSpeed(0.5, 20, 60);            /* 示教点动用细步长，好对准目标点 */
+    setSpeed(0.5, 60);            /* 示教点动用细步长，好对准目标点，固定间隔60ms */
 
     (void) drawSelectTask(DRAW_TASK_POLYLINE);
     check("选中五点折线", drawGetTask() == DRAW_TASK_POLYLINE, drawTaskName(drawGetTask()));
@@ -594,9 +611,9 @@ int main(void) {
       double x0, y0, z0, dx, dy, dz, dFull;
 
       /* A0 满偏：x 增大，y/z 不动 */
-      centerSticks(); advance(80);
+      centerSticks(); advance(40);
       x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
-      g_mockAnalog[0] = 900; step(); centerSticks(); advance(80);
+      g_mockAnalog[0] = 900; step(); centerSticks(); advance(40);
       dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
       dFull = dx;
       snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
@@ -605,9 +622,9 @@ int main(void) {
       check("示教点动 A0：单格位移不超过 0.25 单位上限", fabs(dx) <= CAP, d);
 
       /* A1 满偏：y 增大，x/z 不动 */
-      centerSticks(); advance(80);
+      centerSticks(); advance(40);
       x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
-      g_mockAnalog[1] = 900; step(); centerSticks(); advance(80);
+      g_mockAnalog[1] = 900; step(); centerSticks(); advance(40);
       dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
       snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
       check("示教点动 A1：只让 y 增大（方向对、无串扰）",
@@ -615,19 +632,21 @@ int main(void) {
       check("示教点动 A1：单格位移不超过 0.25 单位上限", fabs(dy) <= CAP, d);
 
       /* A3 满偏：z 减小（前推 = 下压），x/y 不动 */
-      centerSticks(); advance(80);
+      centerSticks(); advance(40);
       x0 = Pos.rec.x; y0 = Pos.rec.y; z0 = Pos.rec.z;
-      g_mockAnalog[3] = 900; step(); centerSticks(); advance(80);
+      g_mockAnalog[3] = 900; step(); centerSticks(); advance(40);
       dx = Pos.rec.x - x0; dy = Pos.rec.y - y0; dz = Pos.rec.z - z0;
       snprintf(d, sizeof d, "dx=%+.3f dy=%+.3f dz=%+.3f", dx, dy, dz);
       check("示教点动 A3：只让 z 减小（前推=下压）",
             dz < -0.01 && fabs(dx) < ZERO && fabs(dy) < ZERO, d);
       check("示教点动 A3：单格位移不超过 0.25 单位上限", fabs(dz) <= CAP, d);
 
-      /* 轻推：步长按偏转比例缩小（0.02 下限），必须明显小于满偏 */
-      centerSticks(); advance(80);
+      /* 轻推：步长按偏转比例缩小（DRAW_JOG_STEP_MIN 0.02 下限），必须明显小于满偏。
+       * 注意偏转量要真的越过死区：v1.6.4 起 JOY_DEADZONE = 40，旧探针用 550（偏 38）
+       * 在新死区里等于"没推杆"；这里用偏 +100（有效偏转 60 计数）。 */
+      centerSticks(); advance(40);
       x0 = Pos.rec.x;
-      g_mockAnalog[0] = 550; step(); centerSticks(); advance(80);
+      g_mockAnalog[0] = 512 + 100; step(); centerSticks(); advance(40);
       {
         const double dSmall = Pos.rec.x - x0;
         snprintf(d, sizeof d, "轻推 dx=%+.3f（满偏 %.3f）", dSmall, dFull);
@@ -647,6 +666,28 @@ int main(void) {
         check("示教点动 A2（夹爪）：默认整路不响应，笔尖与 angle4 都不动",
               Pos.rec.x == px && Pos.rec.y == py && Pos.rec.z == pz &&
               Pos.ser.angle4 == before.angle4, d);
+      }
+
+      /* 节奏方向（v1.6.4）：同样时长下"推得越狠走得越多"。
+       * 老版本 jogIntervalMs() 方向相反（轻推用最短间隔），这条会失败 ——
+       * 它和摇杆模块的 speedIntervalMs() 必须是同一条约定。 */
+      {
+        double xr0;
+        centerSticks(); advance(80);
+        xr0 = Pos.rec.x;
+        g_mockAnalog[0] = 512 + 100;      /* 轻推（有效偏转 60 计数） */
+        advance(200);
+        const double dLightRun = Pos.rec.x - xr0;
+
+        centerSticks(); advance(80);
+        xr0 = Pos.rec.x;
+        g_mockAnalog[0] = 900;            /* 满偏 */
+        advance(200);
+        const double dHeavyRun = Pos.rec.x - xr0;
+
+        snprintf(d, sizeof d, "200ms 内 轻推 dx=%+.3f  满偏 dx=%+.3f", dLightRun, dHeavyRun);
+        check("示教点动：同样时长下大幅偏转位移 > 小幅偏转（推得越狠越快）",
+              dHeavyRun > dLightRun && dLightRun > 0.001, d);
       }
     }
 
@@ -780,7 +821,7 @@ int main(void) {
     check("模块自己判定的过点数 = 5/5",
           drawLastPointsHit() == 5 && drawLastPointsTotal() == 5, d);
 
-    setSpeed(1.0, 10, 40);            /* 恢复默认调速 */
+    setSpeed(1.0, 40);            /* 恢复默认调速 */
   }
 
   /* ================= 8) 串口入口与忙守卫 ================= */
@@ -795,11 +836,17 @@ int main(void) {
     {
       int before = drawGetTask();
       int after = -1;
+      Serial.clearOutput();
       int rc = protoHandleLine("F");
       after = drawGetTask();
-      snprintf(d, sizeof d, "%s -> %s（回 %d）", drawTaskName(before), drawTaskName(after), rc);
-      check("串口 F 换任务回 PROTO_RES_DRAW_TASK_SELECTED",
-            rc == PROTO_RES_DRAW_TASK_SELECTED && after == (before + 1) % DRAW_TASK_COUNT, d);
+      std::string out = Serial.getOutput();
+      char wantTag[32];
+      snprintf(wantTag, sizeof(wantTag), "OK F=%s\n", drawTaskTag(after));
+      snprintf(d, sizeof d, "%s -> %s（回 %d，串口=%s）", drawTaskName(before), drawTaskName(after),
+               rc, out.c_str());
+      check("串口 F 换任务回 PROTO_RES_DRAW_TASK_SELECTED 且回复里带当前模式标签",
+            rc == PROTO_RES_DRAW_TASK_SELECTED && after == (before + 1) % DRAW_TASK_COUNT &&
+            out.find(wantTag) != std::string::npos, d);
     }
 
     check("串口 p11.5 标定纸面高度",

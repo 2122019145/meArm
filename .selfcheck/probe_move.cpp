@@ -167,29 +167,39 @@ int main(void) {
 
   printf("=== 5) 调速档位 ===\n");
   {
-    /* 注意: adjustSpeed 返回"生效档位"本身 (0/1/2)，非法档位返回 -1 */
+    /* 注意: adjustSpeed 返回"生效档位"本身 (0/1/2)，非法档位返回 -1。
+     * 档位含义: 步长 / 固定间隔 delay */
     int r0 = adjustSpeed(SPEED_SLOW);
-    snprintf(buf, sizeof(buf), "ret=%d step=%.1f min=%d full=%d", r0, speed.stepSize, speed.minDelayMs, speed.fullDelayMs);
-    check("adjustSpeed(SLOW) -> 0.5/20/80",
-          r0 == SPEED_SLOW && fabs(speed.stepSize - 0.5) < 1e-9 && speed.minDelayMs == 20 && speed.fullDelayMs == 80, buf);
+    snprintf(buf, sizeof(buf), "ret=%d step=%.1f delay=%d", r0, speed.stepSize, speed.stepDelayMs);
+    check("adjustSpeed(SLOW) -> 0.5/80",
+          r0 == SPEED_SLOW && fabs(speed.stepSize - 0.5) < 1e-9 && speed.stepDelayMs == 80, buf);
 
     int r1 = adjustSpeed(SPEED_NORMAL);
-    snprintf(buf, sizeof(buf), "ret=%d step=%.1f min=%d full=%d", r1, speed.stepSize, speed.minDelayMs, speed.fullDelayMs);
-    check("adjustSpeed(NORMAL) -> 1.0/10/40",
-          r1 == SPEED_NORMAL && fabs(speed.stepSize - 1.0) < 1e-9 && speed.minDelayMs == 10 && speed.fullDelayMs == 40, buf);
+    snprintf(buf, sizeof(buf), "ret=%d step=%.1f delay=%d", r1, speed.stepSize, speed.stepDelayMs);
+    check("adjustSpeed(NORMAL) -> 1.0/40",
+          r1 == SPEED_NORMAL && fabs(speed.stepSize - 1.0) < 1e-9 && speed.stepDelayMs == 40, buf);
 
     int r2 = adjustSpeed(SPEED_FAST);
-    snprintf(buf, sizeof(buf), "ret=%d step=%.1f min=%d full=%d", r2, speed.stepSize, speed.minDelayMs, speed.fullDelayMs);
-    check("adjustSpeed(FAST) -> 2.0/5/20",
-          r2 == SPEED_FAST && fabs(speed.stepSize - 2.0) < 1e-9 && speed.minDelayMs == 5 && speed.fullDelayMs == 20, buf);
+    snprintf(buf, sizeof(buf), "ret=%d step=%.1f delay=%d", r2, speed.stepSize, speed.stepDelayMs);
+    check("adjustSpeed(FAST) -> 2.0/20",
+          r2 == SPEED_FAST && fabs(speed.stepSize - 2.0) < 1e-9 && speed.stepDelayMs == 20, buf);
 
     check("adjustSpeed(3) 非法 -> -1", adjustSpeed(3) == -1, "越界档位被拒绝");
-    /* setSpeed 返回 void：非法参数应被内部忽略，配置保持不变 */
-    setSpeed(-1.0, 0, -5);
-    snprintf(buf, sizeof(buf), "step=%.1f min=%d full=%d（应仍为 2.0/5/20）",
-             speed.stepSize, speed.minDelayMs, speed.fullDelayMs);
-    check("setSpeed(-1,0,-5) 被忽略、配置不变",
-          fabs(speed.stepSize - 2.0) < 1e-9 && speed.minDelayMs == 5 && speed.fullDelayMs == 20, buf);
+    /* setSpeed 返回 void：每个参数是**各自独立**校验的（stepSize > 0、stepDelayMs > 0），
+     * 一次调用里合法的那个仍然生效: 所以这里要分别验证"两个都非法"与"只非法一个"。 */
+    setSpeed(-1.0, 0);
+    snprintf(buf, sizeof(buf), "step=%.1f delay=%d（应仍为 2.0/20）",
+             speed.stepSize, speed.stepDelayMs);
+    check("setSpeed(-1.0, 0) 两个参数都非法 -> 配置完全不变",
+          fabs(speed.stepSize - 2.0) < 1e-9 && speed.stepDelayMs == 20, buf);
+
+    setSpeed(1.0, 0);
+    snprintf(buf, sizeof(buf), "step=%.1f delay=%d（应为 1.0/20：只采纳合法的 stepSize）",
+             speed.stepSize, speed.stepDelayMs);
+    check("setSpeed(1.0, 0) 只采纳合法项 -> 步长 1.0、间隔仍为 20",
+          fabs(speed.stepSize - 1.0) < 1e-9 && speed.stepDelayMs == 20, buf);
+
+    adjustSpeed(SPEED_FAST);   /* 恢复 2.0/20，下一段用例依赖这个档位 */
   }
 
   printf("=== 6) 大行程压力: 随机方向 4000 步，零越界/零 NaN/零失配 ===\n");

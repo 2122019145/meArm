@@ -133,11 +133,10 @@ struct rangeLimit limit = {
   .minZ = -20.0, .maxZ = 40.0
 };
 
-/* 全局调速默认值：中速 */
+/* 全局调速默认值：中速（1.0 度/格、固定 40ms 一格 = 25°/s） */
 struct speedCfg speed = {
   .stepSize    = 1.0,
-  .minDelayMs  = 10,
-  .fullDelayMs = 40
+  .stepDelayMs = 40
 };
 
 /* 【关节硬限位】四个舵机的机械允许行程（度）
@@ -306,24 +305,6 @@ int rangeClampConfig(void) {
   return bad;
 }
 
-/* 判断 pos1->rec 是否贴在范围边界上（容差 RANGE_EPS）。
- * 三个轴的判断完全一样，用指针走一遍即可；轴名按 'x'/'y'/'z' 递推，
- * 与原来三次 edgeHit 调用一致（多轴同时贴边时取第一个）。
- * Kept out-of-line for the same reason as isServoInRange: one shared copy. */
-bool __attribute__((noinline)) atRangeEdge(const pos *pos1, char *axis) {
-  if (axis != NULL) *axis = 0;
-  if (pos1 == NULL) return false;
-  const double *v = &pos1->rec.x;
-  const double *lim = &limit.minX;
-  for (int i = 0; i < 3; i++, v++, lim += 2) {
-    if (*v <= lim[0] + RANGE_EPS || *v >= lim[1] - RANGE_EPS) {
-      if (axis != NULL) *axis = (char)('x' + i);
-      return true;
-    }
-  }
-  return false;
-}
-
 /* 将位置钳制到配置的范围内，若有轴越界则返回 true。
  * 三个轴各自独立钳制，不会因为一个轴越界而影响其它轴。 */
 bool clampToRange(pos *pos1) {
@@ -479,7 +460,7 @@ bool getAngle(pos *pos1) {
 }
 
 /* getAngle 的扩展版：额外回传"是否因关节限位被吸附"。
- * 需要区分"精确到达目标"与"被限位挡住"的调用方（moveAxisStep）用这个版本。 */
+ * 需要区分"精确到达目标"与"被限位挡住"的调用方（moveToPoint / 绘图轨迹校验）用这个版本。 */
 /* getAngleEx 内部用的分支求解。
  *
  * 【为什么不能用 alpha + beta 凑】
@@ -812,33 +793,32 @@ bool posGetHomeAngles(SER *ser) {
 
 /* ---------- 全局调速 ---------- */
 /* 设置全局调速参数 (带合法性校验)
- * 校验规则: stepSize > 0；minDelayMs > 0；fullDelayMs >= minDelayMs。
+ * 校验规则: stepSize > 0；stepDelayMs > 0。
  * 不合法的项保持原值，只有确实改动了参数才把档位标记为自定义。-1。 */
-void setSpeed(double stepSize, int minDelayMs, int fullDelayMs) {
+void setSpeed(double stepSize, int stepDelayMs) {
   bool changed = false;
   if (stepSize > 0 && stepSize != speed.stepSize) {
     speed.stepSize = stepSize; changed = true;
   }
-  if (minDelayMs > 0 && minDelayMs <= fullDelayMs && minDelayMs != speed.minDelayMs) {
-    speed.minDelayMs = minDelayMs; changed = true;
-  }
-  if (fullDelayMs >= minDelayMs && fullDelayMs >= 0 && fullDelayMs != speed.fullDelayMs) {
-    speed.fullDelayMs = fullDelayMs; changed = true;
+  if (stepDelayMs > 0 && stepDelayMs != speed.stepDelayMs) {
+    speed.stepDelayMs = stepDelayMs; changed = true;
   }
   /* 参数被手动改动后，当前档位名已不再代表实际参数 */
   if (changed) speedLevel = -1;
 }
 
 /* 按档位调整速度，返回生效档位 (-1 表示档位非法)
- * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、间隔 20/10/5 ms、80/40/20 ms，
- * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，整数右移也是精确的），
- * 于是三份 setSpeed 调用点收成一份。SPEED_SLOW/NORMAL/FAST 就是 0/1/2，
- * 所以 speedLevel = level、return level 与原 switch 里逐条赋值逐位相同。
+ * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、固定间隔 80/40/20 ms（慢/中/快），
+ * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，
+ * 整数右移也是精确的），于是三份 setSpeed 调用点收成一份。
+ * SPEED_SLOW/NORMAL/FAST 就是 0/1/2，所以 speedLevel = level、return level
+ * 与原 switch 里逐条赋值逐位相同。
  * 【实测】逐档 switch 写法整机 Program = 34970 B，本写法 34932 B，
  * 所以即使 adjustSpeed 自身的符号从 112 B 涨到 246 B，整机仍净省 38 B。 */
 int adjustSpeed(int level) {
   if (level < SPEED_SLOW || level > SPEED_FAST) return -1;
-  setSpeed(0.5 * (1 << level), 20 >> level, 80 >> level);   /* 慢/中/快 = ×1 / ×2 / ×4 */
+  setSpeed(0.5 * (1 << level), 80 >> level);
+  /* 慢/中/快 → 步长 0.5/1/2 度、固定间隔 80/40/20 ms */
   speedLevel = level;
   return level;
 }
@@ -880,17 +860,4 @@ bool posSetAngle4(double angleDeg) {
   if (v == Pos.ser.angle4) return false;
   Pos.ser.angle4 = v;
   return true;
-}
-
-/* 末端张开：朝 f 的行程上限方向走一步。
- * stepDeg <= 0 时用默认步长 5 度，方便串口单条命令直接调用。 */
-bool posToolOpen(double stepDeg) {
-  if (stepDeg <= 0) stepDeg = 5.0;
-  return posSetAngle4(Pos.ser.angle4 + stepDeg);
-}
-
-/* 末端收回：朝 f 的行程下限方向走一步。 */
-bool posToolClose(double stepDeg) {
-  if (stepDeg <= 0) stepDeg = 5.0;
-  return posSetAngle4(Pos.ser.angle4 - stepDeg);
 }

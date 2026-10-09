@@ -12,9 +12,10 @@
  * 【轨迹是怎么走的】
  *   轨迹在笛卡尔空间定义（折线 = 顶点连线，曲线 = 向心 Catmull-Rom 样条）。
  *   每个采样点交给 move.h 的 moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，
- *   串口的 x/y/z 指令用的是同一个函数）：反解、速率限制、写入 Pos 与正解刷新
+ *   取放序列与绘图内部都走它）：反解、速率限制、写入 Pos 与正解刷新
  *   都在那里，本文件只决定"下一步走到哪个坐标"。
- *   （与串口角度指令、pick_place 同一约定：坐标永远等于角度的真实结果。）
+ *   （与 pick_place 同一约定：坐标永远等于角度的真实结果；串口 x/y/z 指令
+ *   按题目要求直接写关节角，不经过这里。）
  *
  *   速度规划用"按剩余距离刹车"的经典做法，不需要预先算速度表：
  *       v 允许的最大值 = min( DRAW_V_MAX, sqrt(2a·已走距离), 当前速度 + a·dt )
@@ -137,15 +138,35 @@ struct drawVertex {
 static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
   { -1.0,  0.0 }, {  1.0,  0.0 }
 };
+/* 字母 N：左下 -> 左上 -> 右下 -> 右上（两个竖 + 一道斜） */
+static const struct drawVertex SHAPE_N[4] PROGMEM = {
+  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
+};
+/* 三角形：左下 -> 右下 -> 顶点 -> 回到左下（最后一点与第一点重合，闭合） */
+static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
+  { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
+};
+/* 字母 Z：左上 -> 右上 -> 左下 -> 右下（上横 + 斜 + 下横） */
+static const struct drawVertex SHAPE_Z[4] PROGMEM = {
+  { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
+};
 /* 字母 V：左上 -> 底尖 -> 右上 */
 static const struct drawVertex SHAPE_V[3] PROGMEM = {
   { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
 };
 
 /* 任务名（下标即 DRAW_TASK_*）。
- * 本分支只有 4 个任务：原来的 字母N / 三角形 / 字母Z 连表一起删掉了。 */
+ * 7 个任务：5 个内置图形 + 2 个五点示教。
+ * 【恢复记录】字母N / 三角形 / 字母Z 曾在 v1.6.1 为省 flash 删掉过，
+ * 现按题目"同组同学所选图形不得完全相同"恢复；编号见 draw_control.h。 */
 static const char *const DRAW_TASK_NAME[DRAW_TASK_COUNT] = {
-  "直线", "字母V", "五点折线", "五点曲线"
+  "直线", "字母N", "三角形", "字母Z", "字母V", "五点折线", "五点曲线"
+};
+
+/* ASCII 任务短标签（下标即 DRAW_TASK_*），供串口回报当前图形模式用：
+ * 终端和 ESP8266 都按单字节比较，所以这里不能用中文任务名。 */
+static const char *const DRAW_TASK_TAG[DRAW_TASK_COUNT] = {
+  "LINE", "N", "TRI", "Z", "V", "POLY", "CURVE"
 };
 
 /* 阶段名（下标即 DRAW_PHASE_*） */
@@ -263,6 +284,9 @@ static int shapeTable(int task, const struct drawVertex **tbl)
 {
   switch (task) {
     case DRAW_TASK_LINE:     *tbl = SHAPE_LINE;     return 2;
+    case DRAW_TASK_N:        *tbl = SHAPE_N;        return 4;
+    case DRAW_TASK_TRIANGLE: *tbl = SHAPE_TRIANGLE; return 4;
+    case DRAW_TASK_Z:        *tbl = SHAPE_Z;        return 4;
     case DRAW_TASK_V:        *tbl = SHAPE_V;        return 3;
     default:                 *tbl = NULL;           return 0;
   }
@@ -516,7 +540,7 @@ static double applyDtSec(void)
 }
 
 /* 反解 (x,y,z) 并按策略写进 Pos —— 本文件所有"点位移"都走这里，实现则是 move.h 的
- * moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，串口 x/y/z 指令用同一个函数）。
+ * moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，取放序列与绘图共用）。
  *
  * 原来本文件自己展开过两份（严格版 tryApplyPoint / 夹取版 applyPointClamped），
  * 每份都要重算 maxDps×dtSec、逐轴比较或夹取；现在这些算式只存在于 moveToPoint()
@@ -803,20 +827,8 @@ static void beginLiftToReturn(void)
 
 /* ==================== 示教 ==================== */
 
-/* 示教点动一步的步进间隔：与摇杆模块的 speedIntervalMs() 同一条约定 ——
- * 轻微偏转用最短间隔（连续细走），满偏用最长间隔（慢而稳、最安全）。
- * 注意方向：**偏转越大间隔越长**（旧版写反了：满偏用最短间隔，等于"推得越狠冲得越快"）。 */
-static int jogIntervalMs(int amp)
-{
-  int fast = speed.minDelayMs;
-  int slow = speed.fullDelayMs;
-  if (fast < 1) fast = 1;
-  if (slow < fast) slow = fast;
-  int span = slow - fast;
-  if (amp < 0) amp = 0;
-  else if (amp > DRAW_JOG_CENTER) amp = DRAW_JOG_CENTER;
-  return fast + (int)(((long)span * (long)amp) / (long)DRAW_JOG_CENTER);
-}
+/* 示教点动一步的步进间隔：现在使用固定间隔 speed.stepDelayMs，不再随偏转变化。
+ * 旧版偏转越大间隔越短（推得越狠走得越快）的动态调速已被移除。 */
 
 /* 示教点动：读摇杆 -> 一路一路按各自的计时门控动一点笔尖（笛卡尔点动）。
  * 三路坐标（A0→x、A1→y、A3→z）用"工作区单位"的步长与间隔，轻微偏转走小步、
@@ -838,7 +850,7 @@ static void teachJogTick(void)
     /* 夹爪里夹着笔：示教点动不响应 A2（右摇杆的左右推），免得一推带歪笔尖 */
     if (i == 3) continue;
 #endif
-    int interval = jogIntervalMs(amp[i]);
+    int interval = speed.stepDelayMs;
     if (now - s_jogLastMs[i] < (unsigned long)interval) continue;
     s_jogLastMs[i] = now;
 
@@ -982,6 +994,13 @@ const char *drawTaskName(int task)
 {
   if (task < 0 || task >= DRAW_TASK_COUNT) return "未知";
   return DRAW_TASK_NAME[task];
+}
+
+/* ASCII 短标签，供串口"当前图形模式"提示使用（终端/ESP8266 按字节比较，不能用中文） */
+const char *drawTaskTag(int task)
+{
+  if (task < 0 || task >= DRAW_TASK_COUNT) return "?";
+  return DRAW_TASK_TAG[task];
 }
 
 int drawStartTask(void)

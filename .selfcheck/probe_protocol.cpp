@@ -9,11 +9,11 @@
  * 2) 兼容命令 1/2/3
  * 3) H/L 档位升降
  * 4) k/K 步进与到限不越界
- * 5) x/y/z 空间直角坐标（地面系：原点=肩关节垂足，x=初始面朝方向，z=上）
- * 6) 只写一部分轴（其余轴保持在原位）
+ * 5) x/y/z 三舵机同步角度（x->angle1(b)、y->angle2(r)、z->angle3(c)，一条指令一次写完）
+ * 6) 只写一部分轴（其余关节保持在原位）
  * 7) 大小写与空白容忍
  * 8) 小数与可选等号
- * 9) 不可达/地面以下一律拒绝，且一个字节都不写（不再夹取）
+ * 9) 超出行程按 servoLimit 夹取（不拒绝整条指令，题目要的是"输出对应角度的 PWM"）
  * 10) 错误输入不改变状态
  * 11) 分片到达与无换行超时
  * 12) 串口应答与运行时功能开关（必须先于压力测试：压力测试会随机发出 A/B/C，
@@ -24,8 +24,10 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include "Arduino.h"
 #include "constant_and_positions.h"
+#include "draw_control.h"
 #include "move.h"
 #include "serial_protocol.h"
 #include "protocol_constants.h"
@@ -68,14 +70,24 @@ static struct PosRecSnapshot snapRec(void) {
   return r;
 }
 
-/* 坐标指令给的是地面系 (x,y,z)：原点是"过肩关节往地面的垂足"，z 从地面往上量。
- * 固件内部（Pos.rec）的 x/y 与它完全一致，只有 z 换个起点：z_内部 = z_地面 - 肩高。
- * 探针不写死 20 这个数，而是用固件自己的 WEARM_SHOULDER_HEIGHT，
- * 这样标定值一改，探针跟着改，不会变成"用旧标定去测新标定"。 */
-static void probeInternalPoint(double x, double y, double zGround, REC *out) {
-  out->x = x;
-  out->y = y;
-  out->z = zGround - WEARM_SHOULDER_HEIGHT;
+/* 轴 a 的行程上下限（0=x->angle1/b，1=y->angle2/r，2=z->angle3/c）。
+ * 期望值不写死，直接取固件自己的 servoLimit：标定改了探针跟着改。 */
+static void probeTravel(int axis, double *lo, double *hi) {
+  switch (axis) {
+    case 0:  *lo = servoLimit.minB; *hi = servoLimit.maxB; break;
+    case 1:  *lo = servoLimit.minR; *hi = servoLimit.maxR; break;
+    default: *lo = servoLimit.minC; *hi = servoLimit.maxC; break;
+  }
+}
+
+/* 固件 protoApplyAngles() 的落地规则：写进去的度数按该关节的 servoLimit
+ * 夹取（SERVO_LIMIT_CLAMP），所以探针的期望值也必须先夹一遍。 */
+static double probeClampToTravel(int axis, double v) {
+  double lo, hi;
+  probeTravel(axis, &lo, &hi);
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  return v;
 }
 
 /* 探针期望的落点与固件落点之间允许的坐标差。
@@ -87,15 +99,14 @@ static double probePointErr(const REC *a, const REC *b) {
   return sqrt(pow(a->x - b->x, 2) + pow(a->y - b->y, 2) + pow(a->z - b->z, 2));
 }
 
-/* 压力测试用的坐标区间（地面系 mm）：故意跨到可达范围以外，
- * 好让"不可达就拒绝、且不动状态"这条不变量真的被压到。 */
-static const double PROBE_RAND_XY    = 50.0;
-static const double PROBE_RAND_Z_LO  = -10.0;
-static const double PROBE_RAND_Z_HI  = 70.0;
+/* 压力测试用的角度区间（度）：故意跨到两端的行程之外，
+ * 好让"超出行程按限位夹取、且未提到的轴不动"这条不变量真的被压到。 */
+static const double PROBE_RAND_LO = -40.0;
+static const double PROBE_RAND_HI = 220.0;
 
 /* 压力测试的每条不变量各占一位，判定与日志都对着这些名字看。
  * 命名规则：INV1..INV5 是"角度有效性"，INV6/INV7 是"派生坐标自洽"，
- * INV8 是"拒绝就必须原封不动"。 */
+ * INV8 是"角度指令逐轴落地正确 / 被拒的输入原封不动"。 */
 #define INV_FINITE    0x01u  /* 四个角都是有限数 */
 #define INV_A1_RANGE  0x02u  /* angle1(b) 在 servoLimit 行程内 */
 #define INV_A2_RANGE  0x04u  /* angle2(r) 在 servoLimit 行程内 */
@@ -103,7 +114,8 @@ static const double PROBE_RAND_Z_HI  = 70.0;
 #define INV_A4_RANGE  0x10u  /* angle4(f) 在 servoLimit 行程内 */
 #define INV_REC_OK    0x20u  /* recFromServo() 返回 true */
 #define INV_REC_MATCH 0x40u  /* Pos.rec 与 recFromServo() 结果逐分量一致 */
-#define INV_REJECT_KEEPS 0x80u /* 被拒绝的坐标指令必须一个字节都不改 */
+#define INV_ANGLE_LAND 0x80u /* 角度指令：逐轴落地=按行程夹取、未提到的关节不动 */
+                                  /* 语法错的整行必须原封不动 */
 
 int main(void) {
   (void) servoSelfCheck();
@@ -140,29 +152,11 @@ int main(void) {
           Pos.ser.angle4 == servoLimit.minF && protoHandleLine("S") == PROTO_RES_GRIPPER_CLOSE, buf);
   }
 
-  printf("=== 2) 兼容命令 1 / 2 / 3 ===\n");
-  {
-    mockSerialFeed("1");
-    serialProtocolLoop();
-    snprintf(buf, sizeof(buf), "stepSize=%.1f", speed.stepSize);
-    check("串口 \"1\" -> speed.stepSize == 0.5", fabs(speed.stepSize - 0.5) < 1e-9, buf);
-
-    mockSerialFeed("2");
-    serialProtocolLoop();
-    snprintf(buf, sizeof(buf), "stepSize=%.1f", speed.stepSize);
-    check("串口 \"2\" -> speed.stepSize == 1.0", fabs(speed.stepSize - 1.0) < 1e-9, buf);
-
-    mockSerialFeed("3");
-    serialProtocolLoop();
-    snprintf(buf, sizeof(buf), "stepSize=%.1f", speed.stepSize);
-    check("串口 \"3\" -> speed.stepSize == 2.0", fabs(speed.stepSize - 2.0) < 1e-9, buf);
-  }
-
   printf("=== 3) H / L 档位升降与端点行为 ===\n");
   {
-    protoHandleLine("2");  /* 回中档 */
+    adjustSpeed(SPEED_NORMAL);  /* 回中档 */
     snprintf(buf, sizeof(buf), "初始档位=%d", speedGetLevel());
-    check("protoHandleLine(\"2\") 回中档", speedGetLevel() == SPEED_NORMAL, buf);
+    check("adjustSpeed(SPEED_NORMAL) 回中档", speedGetLevel() == SPEED_NORMAL, buf);
 
     protoHandleLine("H");
     snprintf(buf, sizeof(buf), "第一次 H 后档位=%d", speedGetLevel());
@@ -185,87 +179,98 @@ int main(void) {
     check("protoHandleLine(\"L\") 第三次仍==SPEED_SLOW（到端点不变）", speedGetLevel() == SPEED_SLOW, buf);
   }
 
-  printf("=== 4) k / K 步进与到限不越界 ===\n");
+  printf("=== 4) O / S 到限不越界（重复执行幂等） ===\n");
   {
     resetInputs();
     Pos.ser.angle4 = (servoLimit.minF + servoLimit.maxF) / 2;
 
-    /* 连发 60 次 "k" */
+    /* 连发 60 次 "O"（张开） */
     for (int i = 0; i < 60; i++) {
-      protoHandleLine("k");
+      protoHandleLine("O");
     }
-    snprintf(buf, sizeof(buf), "60次\"k\"后 angle4=%.1f maxF=%.1f <= maxF",
+    snprintf(buf, sizeof(buf), "60次\"O\"后 angle4=%.1f maxF=%.1f <= maxF",
              Pos.ser.angle4, servoLimit.maxF);
-    check("连发60次\"k\" -> angle4==servoLimit.maxF且<=maxF",
+    check("连发60次\"O\" -> angle4==servoLimit.maxF且<=maxF",
           Pos.ser.angle4 == servoLimit.maxF && Pos.ser.angle4 <= servoLimit.maxF, buf);
 
-    /* 连发 60 次 "K" */
+    /* 连发 60 次 "S"（关闭） */
     for (int i = 0; i < 60; i++) {
-      protoHandleLine("K");
+      protoHandleLine("S");
     }
-    snprintf(buf, sizeof(buf), "60次\"K\"后 angle4=%.1f minF=%.1f >= minF",
+    snprintf(buf, sizeof(buf), "60次\"S\"后 angle4=%.1f minF=%.1f >= minF",
              Pos.ser.angle4, servoLimit.minF);
-    check("连发60次\"K\" -> angle4==servoLimit.minF且>=minF",
+    check("连发60次\"S\" -> angle4==servoLimit.minF且>=minF",
           Pos.ser.angle4 == servoLimit.minF && Pos.ser.angle4 >= servoLimit.minF, buf);
   }
 
-  printf("=== 5) x/y/z 空间直角坐标（本需求的核心） ===\n");
+  printf("=== 5) x/y/z 三舵机同步角度（本需求的核心） ===\n");
   {
     resetInputs();
-    /* resetInputs() 直接改 Pos.ser，不走固件写入路径，所以先把派生坐标对齐，
-     * 否则后面"只改一个轴"的用例会拿着陈旧的 Pos.rec 当基准。 */
+    /* 角度语义：x -> angle1(b)、y -> angle2(r)、z -> angle3(c)。
+     * 一条指令把提到的轴一次写完，写完立刻做一次正解刷新，
+     * 所以 Pos.rec 必须等于 recFromServo(Pos.ser)，而不是等于某个坐标目标。 */
     (void) recFromServo(&Pos.rec, &Pos.ser);
-
+    Serial.clearOutput();
     mockSerialFeed("x20,y0,z40\n");
     serialProtocolLoop();
 
-    REC want;
-    probeInternalPoint(20.0, 0.0, 40.0, &want);
+    double want1 = probeClampToTravel(0, 20.0);
+    double want2 = probeClampToTravel(1,  0.0);
+    double want3 = probeClampToTravel(2, 40.0);
+    snprintf(buf, sizeof(buf),
+             "angle1=%.6f(期望%.6f) angle2=%.6f(期望%.6f) angle3=%.6f(期望%.6f)",
+             Pos.ser.angle1, want1, Pos.ser.angle2, want2, Pos.ser.angle3, want3);
+    check("mockSerialFeed(\"x20,y0,z40\\n\") -> 三个关节角分别写成 20/0/40（按行程夹取）",
+          fabs(Pos.ser.angle1 - want1) < 1e-9 &&
+          fabs(Pos.ser.angle2 - want2) < 1e-9 &&
+          fabs(Pos.ser.angle3 - want3) < 1e-9, buf);
 
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f) 差=%.3g",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, want.x, want.y, want.z,
-             probePointErr(&Pos.rec, &want));
-    check("mockSerialFeed(\"x20,y0,z40\\n\") -> 末端落到地面系(20,0,40)（=开机初始位姿）",
-          probePointErr(&Pos.rec, &want) < PROBE_POINT_TOL, buf);
+    std::string out5 = Serial.getOutput();
+    check("角度指令回 OK（题目要求的\"输入有响应\"）且不出现 REJECTED/ERR",
+          out5.find("OK\n") != std::string::npos &&
+          out5.find("REJECTED") == std::string::npos &&
+          out5.find("ERR\n") == std::string::npos, out5.c_str());
 
-    /* 落点的真值不能只由反解自己说了算：拿落地后的关节角做一次正解，
-     * 正解必须回到同一点（Pos.rec 本身就是固件用正解刷新的）。 */
+    /* 写完立刻正解：Pos.rec 必须等于 recFromServo(Pos.ser)（坐标是角度的派生量） */
     REC fk;
     fk.x = 0.0; fk.y = 0.0; fk.z = 0.0;
     bool fkOk = recFromServo(&fk, &Pos.ser);
-    snprintf(buf, sizeof(buf), "正解=(%.6f,%.6f,%.6f) 落点=(%.6f,%.6f,%.6f) recFromServo=%d",
+    snprintf(buf, sizeof(buf), "正解=(%.6f,%.6f,%.6f) Pos.rec=(%.6f,%.6f,%.6f) recFromServo=%d",
              fk.x, fk.y, fk.z, Pos.rec.x, Pos.rec.y, Pos.rec.z, (int)fkOk);
-    check("落地后 recFromServo(Pos.ser) 与 Pos.rec 逐分量一致（<1e-9）",
+    check("写完角度后 Pos.rec == recFromServo(Pos.ser)（<1e-9，坐标永远等于角度的真实结果）",
           fkOk && probePointErr(&fk, &Pos.rec) < 1e-9, buf);
 
-    /* 肩高换算：地面系 z 减去 WEARM_SHOULDER_HEIGHT 必须正好是内部 z。
-     * 这条断言把"坐标系定义"钉死在固件自己的常量上，改标定也照样成立。 */
-    snprintf(buf, sizeof(buf), "内部 z=%.10g 地面 z=%.10g 肩高=%.10g",
-             Pos.rec.z, 40.0, WEARM_SHOULDER_HEIGHT);
-    check("内部 z == 地面 z - WEARM_SHOULDER_HEIGHT（精确到 1e-12）",
-          fabs(Pos.rec.z - (40.0 - WEARM_SHOULDER_HEIGHT)) < 1e-12, buf);
+    /* 同步性：一条指令里的三个轴必须是同一次写入 —— 探针从"一个字节都没写坏的
+     * 中间态"这一侧验证：拿一次只提到 x 的指令，y/z 必须保持上一次的值。 */
+    double keepR = Pos.ser.angle2, keepC = Pos.ser.angle3;
+    mockSerialFeed("x30\n");
+    serialProtocolLoop();
+    snprintf(buf, sizeof(buf), "angle1=%.6f(期望%.6f) angle2=%.6f(保持%.6f) angle3=%.6f(保持%.6f)",
+             Pos.ser.angle1, probeClampToTravel(0, 30.0), Pos.ser.angle2, keepR, Pos.ser.angle3, keepC);
+    check("只提到 x 时 y/z 保持（其余关节不被清零）",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 30.0)) < 1e-9 &&
+          Pos.ser.angle2 == keepR && Pos.ser.angle3 == keepC, buf);
   }
 
-  printf("=== 6) 只写一部分轴（其余轴留在原位） ===\n");
+  printf("=== 6) 只写一部分轴（其余关节留在原位） ===\n");
   {
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
 
-    mockSerialFeed("x20,y0,z40\n");        /* 先走到已知点 */
+    mockSerialFeed("x20,y0,z40\n");        /* 先写一组已知角度 */
     serialProtocolLoop();
-    struct PosRecSnapshot r0 = snapRec();
+    double b0 = Pos.ser.angle1, c0 = Pos.ser.angle3;
 
     mockSerialFeed("y10\n");               /* 只给 y */
     serialProtocolLoop();
 
-    snprintf(buf, sizeof(buf), "x=%.6f(基准%.6f) y=%.6f(期望10) z=%.6f(基准%.6f)",
-             Pos.rec.x, r0.x, Pos.rec.y, Pos.rec.z, r0.z);
-    check("mockSerialFeed(\"y10\\n\") -> 只有 y 变成 10，x/z 保持在原位",
-          fabs(Pos.rec.y - 10.0) < PROBE_POINT_TOL &&
-          fabs(Pos.rec.x - r0.x) < PROBE_POINT_TOL &&
-          fabs(Pos.rec.z - r0.z) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle2=%.6f(期望%.6f) angle1=%.6f(基准%.6f) angle3=%.6f(基准%.6f)",
+             Pos.ser.angle2, probeClampToTravel(1, 10.0), Pos.ser.angle1, b0, Pos.ser.angle3, c0);
+    check("mockSerialFeed(\"y10\\n\") -> 只有 angle2 变成 10（按行程夹取），angle1/angle3 不动",
+          fabs(Pos.ser.angle2 - probeClampToTravel(1, 10.0)) < 1e-9 &&
+          Pos.ser.angle1 == b0 && Pos.ser.angle3 == c0, buf);
 
-    /* 坐标指令只动三个关节：末端夹具角必须原样保留（反解不决定 angle4） */
+    /* 角度指令只动三个关节：末端夹具角必须原样保留 */
     Pos.ser.angle4 = servoLimit.minF;
     (void) recFromServo(&Pos.rec, &Pos.ser);
     mockSerialFeed("x20,y0,z40\n");
@@ -273,7 +278,7 @@ int main(void) {
 
     snprintf(buf, sizeof(buf), "angle4=%.6f(指令前%.6f) 行程[%.1f,%.1f]",
              Pos.ser.angle4, servoLimit.minF, servoLimit.minF, servoLimit.maxF);
-    check("坐标指令不碰末端夹具角（angle4 保持指令前的值）",
+    check("角度指令不碰末端夹具角（angle4 保持指令前的值）",
           Pos.ser.angle4 == servoLimit.minF, buf);
   }
 
@@ -285,12 +290,12 @@ int main(void) {
     mockSerialFeed(" X20 , Y0 , Z40 \n");
     serialProtocolLoop();
 
-    REC want;
-    probeInternalPoint(20.0, 0.0, 40.0, &want);
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, want.x, want.y, want.z);
-    check("mockSerialFeed(\" X20 , Y0 , Z40 \\n\") -> 同样落到(20,0,40)",
-          probePointErr(&Pos.rec, &want) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle1=%.6f angle2=%.6f angle3=%.6f",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
+    check("mockSerialFeed(\" X20 , Y0 , Z40 \\n\") -> 与全小写写法落地完全一致",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 20.0)) < 1e-9 &&
+          fabs(Pos.ser.angle2 - probeClampToTravel(1,  0.0)) < 1e-9 &&
+          fabs(Pos.ser.angle3 - probeClampToTravel(2, 40.0)) < 1e-9, buf);
   }
 
   printf("=== 8) 小数与可选等号 ===\n");
@@ -298,70 +303,81 @@ int main(void) {
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
 
-    mockSerialFeed("x20,y0,z40\n");        /* 先到已知点，再只改 x */
+    mockSerialFeed("x20,y0,z40\n");        /* 先写一组基准 */
     serialProtocolLoop();
-    mockSerialFeed("x12.5\n");
+    mockSerialFeed("x12.5\n");             /* 再只改 x，带小数 */
     serialProtocolLoop();
 
-    snprintf(buf, sizeof(buf), "x=%.6f(期望12.5)", Pos.rec.x);
-    check("mockSerialFeed(\"x12.5\\n\") -> x 变成 12.5",
-          fabs(Pos.rec.x - 12.5) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle1=%.6f(期望12.5) angle2=%.6f(基准) angle3=%.6f(基准)",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
+    check("mockSerialFeed(\"x12.5\\n\") -> angle1 变成 12.5，其余不动",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 12.5)) < 1e-9, buf);
 
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
     mockSerialFeed("x=20,y=0,z=40\n");
     serialProtocolLoop();
 
-    REC want;
-    probeInternalPoint(20.0, 0.0, 40.0, &want);
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f)", Pos.rec.x, Pos.rec.y, Pos.rec.z);
-    check("mockSerialFeed(\"x=20,y=0,z=40\\n\") -> 等号形式同样落到(20,0,40)",
-          probePointErr(&Pos.rec, &want) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle1=%.6f angle2=%.6f angle3=%.6f",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
+    check("mockSerialFeed(\"x=20,y=0,z=40\\n\") -> 等号形式与空格形式等价",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 20.0)) < 1e-9 &&
+          fabs(Pos.ser.angle2 - probeClampToTravel(1,  0.0)) < 1e-9 &&
+          fabs(Pos.ser.angle3 - probeClampToTravel(2, 40.0)) < 1e-9, buf);
   }
 
-  printf("=== 9) 不可达/地面以下一律拒绝，且一个字节都不写 ===\n");
+  printf("=== 9) 超出行程按 servoLimit 夹取（不拒绝整条指令） ===\n");
   {
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
     mockSerialFeed("x20,y0,z40\n");        /* 建立已知基准点 */
     serialProtocolLoop();
 
-    /* 每一条都是"不可能到位"的目标：要么超出臂展，要么在地面以下，
-     * 要么高到天上。固件必须一个字节都不写。 */
-    const char *bad[] = { "x200,y0,z40", "x20,y0,z-5", "x20,y0,z999", "x0,y200,z40" };
-    const char *badWhy[] = { "超出臂展", "地面以下", "高到天上", "侧向超出臂展" };
+    /* 题目要的是"控制对应编号的舵机输出对应角度的 PWM"：机械行程之外的角度
+     * 不能把整条指令作废，而是吸附到该关节的行程端点（与摇杆/取放的夹取一致）。 */
+    const char *over[]   = { "x200,y0,z40", "x20,y-90,z40", "x20,y0,z999", "x0,y200,z40" };
+    const char *overWhy[] = { "x 远超上限", "y 远低于下限", "z 远超上限", "y 远超上限" };
     for (int i = 0; i < 4; i++) {
-      struct Joints j0 = snap();
-      struct PosRecSnapshot r0 = snapRec();
-
+      resetInputs();
+      (void) recFromServo(&Pos.rec, &Pos.ser);
       Serial.clearOutput();
-      int rc = protoHandleLine(bad[i]);
+      int rc = protoHandleLine(over[i]);
+      std::string o = Serial.getOutput();
 
-      struct Joints j1 = snap();
-      struct PosRecSnapshot r1 = snapRec();
-      bool same = (j0.b == j1.b && j0.r == j1.r && j0.c == j1.c && j0.f == j1.f) &&
-                  (r0.x == r1.x && r0.y == r1.y && r0.z == r1.z);
-      bool replied = Serial.getOutput().find("REJECTED\n") != std::string::npos;
+      /* 该用例只提到哪些轴就只检查哪些轴，其余轴按中位保持 */
+      double mid1 = (servoLimit.minB + servoLimit.maxB) / 2;
+      double mid2 = (servoLimit.minR + servoLimit.maxR) / 2;
+      double mid3 = (servoLimit.minC + servoLimit.maxC) / 2;
+      double want1 = mid1, want2 = mid2, want3 = mid3;
+      if (strcmp(over[i], "x200,y0,z40") == 0)  { want1 = probeClampToTravel(0, 200.0); want2 = probeClampToTravel(1, 0.0); want3 = probeClampToTravel(2, 40.0); }
+      if (strcmp(over[i], "x20,y-90,z40") == 0) { want1 = probeClampToTravel(0,  20.0); want2 = probeClampToTravel(1, -90.0); want3 = probeClampToTravel(2, 40.0); }
+      if (strcmp(over[i], "x20,y0,z999") == 0)  { want1 = probeClampToTravel(0,  20.0); want2 = probeClampToTravel(1, 0.0); want3 = probeClampToTravel(2, 999.0); }
+      if (strcmp(over[i], "x0,y200,z40") == 0)  { want1 = probeClampToTravel(0,   0.0); want2 = probeClampToTravel(1, 200.0); want3 = probeClampToTravel(2, 40.0); }
 
-      snprintf(buf, sizeof(buf), "\"%s\"(%s): 返回=%d 回REJECTED=%s 状态未动=%s",
-               bad[i], badWhy[i], rc, replied ? "true" : "false", same ? "true" : "false");
-      check("非法坐标：返回COORDS_REJECTED + 回REJECTED + 状态零改动",
-            rc == PROTO_RES_COORDS_REJECTED && replied && same, buf);
+      bool landed = fabs(Pos.ser.angle1 - want1) < 1e-9 &&
+                    fabs(Pos.ser.angle2 - want2) < 1e-9 &&
+                    fabs(Pos.ser.angle3 - want3) < 1e-9;
+      bool okReply = o.find("OK\n") != std::string::npos && o.find("REJECTED") == std::string::npos;
+
+      snprintf(buf, sizeof(buf), "\"%s\"(%s): 返回=%d angle=(%.1f,%.1f,%.1f) 期望=(%.1f,%.1f,%.1f) 回OK=%s",
+               over[i], overWhy[i], rc, Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3,
+               want1, want2, want3, okReply ? "true" : "false");
+      check("超出行程：夹到行程端点 + 回 OK（不拒绝整条指令）",
+            rc == PROTO_RES_ANGLES_SET && landed && okReply, buf);
     }
 
-    /* 边界另一侧：地面系 z=0 正好贴着地面（内部 z=-20，正是可达下限），
-     * 必须能落地 —— 否则说明"地面"这个原点被算错了。 */
-    Serial.clearOutput();
-    mockSerialFeed("x20,y0,z0\n");
-    serialProtocolLoop();
-
-    REC want;
-    probeInternalPoint(20.0, 0.0, 0.0, &want);
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f) 差=%.3g",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, want.x, want.y, want.z,
-             probePointErr(&Pos.rec, &want));
-    check("地面系 z=0（贴地）是合法目标：能落地且落点就是 (20,0,-20)内部",
-          probePointErr(&Pos.rec, &want) < PROBE_POINT_TOL, buf);
+    /* 端点必须正好是 servoLimit 的限值，不是别的数（钉住"夹取"这件事本身） */
+    resetInputs();
+    (void) recFromServo(&Pos.rec, &Pos.ser);
+    (void) protoHandleLine("x200");
+    (void) protoHandleLine("y200");
+    (void) protoHandleLine("z200");
+    snprintf(buf, sizeof(buf), "b=%.6f(maxB=%.6f) r=%.6f(maxR=%.6f) c=%.6f(maxC=%.6f)",
+             Pos.ser.angle1, servoLimit.maxB, Pos.ser.angle2, servoLimit.maxR,
+             Pos.ser.angle3, servoLimit.maxC);
+    check("x200/y200/z200 后三个关节都停在自己的行程上限",
+          Pos.ser.angle1 == servoLimit.maxB && Pos.ser.angle2 == servoLimit.maxR &&
+          Pos.ser.angle3 == servoLimit.maxC, buf);
   }
 
   printf("=== 10) 错误输入不改变状态（**这是最重要的一段**） ===\n");
@@ -418,12 +434,9 @@ int main(void) {
 
   printf("=== 11) 分片到达与无换行超时（行缓冲行为） ===\n");
   {
-    REC want;
-    probeInternalPoint(20.0, 0.0, 40.0, &want);
-
     /* a) 分片到达
-     * "x1" 单独一片不是合法指令（缺 y/z 与行尾），先缓冲；第二片 "0,y0,z40\n"
-     * 接上后整行是 "x10,y0,z40" ⇒ 应当落到地面系 (10,0,40)，而不是 (20,0,40)：
+     * "x1" 单独一片不是合法指令（缺数字结尾与行尾），先缓冲；第二片 "0,y0,z40\n"
+     * 接上后整行是 "x10,y0,z40" ⇒ 三个关节角应当写成 10/0/40，而不是 20/0/40：
      * 这里同时验证"分片拼接"，所以期望值按拼接后的 x=10 算。 */
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
@@ -432,12 +445,13 @@ int main(void) {
     mockSerialFeed("0,y0,z40\n");
     serialProtocolLoop();
 
-    REC wantSplit;
-    probeInternalPoint(10.0, 0.0, 40.0, &wantSplit);
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, wantSplit.x, wantSplit.y, wantSplit.z);
-    check("分片到达: \"x1\"+\"0,y0,z40\\n\" 拼成 x10 -> 落到(10,0,40)",
-          probePointErr(&Pos.rec, &wantSplit) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3,
+             probeClampToTravel(0, 10.0), probeClampToTravel(1, 0.0), probeClampToTravel(2, 40.0));
+    check("分片到达: \"x1\"+\"0,y0,z40\\n\" 拼成 x10 -> 三个角度写成 10/0/40",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 10.0)) < 1e-9 &&
+          fabs(Pos.ser.angle2 - probeClampToTravel(1,  0.0)) < 1e-9 &&
+          fabs(Pos.ser.angle3 - probeClampToTravel(2, 40.0)) < 1e-9, buf);
 
     /* b) 无换行 + 超时
      * 必须调用两次 serialProtocolLoop()：固件是在"读到字符的那一刻"记
@@ -448,7 +462,7 @@ int main(void) {
      * 第 2 次调用没有新字符可读，末尾的 (millis()-s_lastCharMs) 才 >= 300。 */
     resetInputs();
     (void) recFromServo(&Pos.rec, &Pos.ser);
-    mockSerialFeed("x20,y0,z40\n");        /* 先到已知点，再改一个轴 */
+    mockSerialFeed("x20,y0,z40\n");        /* 先写一组基准 */
     serialProtocolLoop();
 
     mockSerialFeed("x12.5,y0,z40");        /* 不带换行 */
@@ -456,26 +470,27 @@ int main(void) {
     g_mockMillis += 400;                   /* 超过 PROTO_LINE_TIMEOUT_MS = 300 */
     serialProtocolLoop();                  /* 无字符可读，末尾判断超时并派发整行 */
 
-    REC wantPartial;
-    probeInternalPoint(12.5, 0.0, 40.0, &wantPartial);
-    snprintf(buf, sizeof(buf), "Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, wantPartial.x, wantPartial.y, wantPartial.z);
-    check("无换行+400ms超时(两次serialProtocolLoop): \"x12.5,y0,z40\" -> 落到(12.5,0,40)",
-          probePointErr(&Pos.rec, &wantPartial) < PROBE_POINT_TOL, buf);
+    snprintf(buf, sizeof(buf), "angle=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3,
+             probeClampToTravel(0, 12.5), probeClampToTravel(1, 0.0), probeClampToTravel(2, 40.0));
+    check("无换行+400ms超时(两次serialProtocolLoop): \"x12.5,y0,z40\" -> 角度写成 12.5/0/40",
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 12.5)) < 1e-9 &&
+          fabs(Pos.ser.angle2 - probeClampToTravel(1,   0.0)) < 1e-9 &&
+          fabs(Pos.ser.angle3 - probeClampToTravel(2,  40.0)) < 1e-9, buf);
 
     /* c) 超长行丢弃
      * mock 的串口输入缓冲是固定 64 字节、只追加不回退（读空后 inLen 也不回退），
      * 所以先 mockSerialClear()，否则测的是"mock 缓冲写满"而不是固件的"超长行丢弃"。
-     * 超长行用 39 个字节先填满行缓冲（PROTO_LINE_BUF_SIZE-1），前 11 个字节
-     * 是一整条合法坐标指令 "x20,y0,z40"，后面补空格 —— 空格在语法里会被跳过，
-     * 所以只要固件把"填满缓冲的那一行"冲出去，机械臂就会真的动到 (20,0,40)。
-     * 基准点故意取 (12.5,0,40)，与超长行前缀不同，误冲出去一定会被看出来。 */
+     * 超长行用 39 个字节先填满行缓冲（PROTO_LINE_BUF_SIZE-1），前 10 个字节
+     * 是一整条合法角度指令 "x20,y0,z40"，后面补空格 —— 空格在语法里会被跳过，
+     * 所以只要固件把"填满缓冲的那一行"冲出去，就会真的把 angle1 写成 20。
+     * 基准点故意取 x=12.5，与超长行前缀不同，误冲出去一定会被看出来。 */
     resetInputs();
     mockSerialClear();
     (void) recFromServo(&Pos.rec, &Pos.ser);
     mockSerialFeed("x12.5,y0,z40\n");      /* 基准点 */
     serialProtocolLoop();
-    struct PosRecSnapshot rKeep = snapRec();
+    struct Joints jKeep = snap();
 
     char tooLong[64];
     strcpy(tooLong, "x20,y0,z40");                 /* 10 字节的合法前缀 */
@@ -493,20 +508,23 @@ int main(void) {
     mockSerialFeed("\n");
     serialProtocolLoop();   /* 行尾把 s_dropUntilEol 清掉 */
 
-    struct PosRecSnapshot rNow = snapRec();
-    snprintf(buf, sizeof(buf), "超长行后 Pos.rec=(%.6f,%.6f,%.6f) 丢弃前=(%.6f,%.6f,%.6f)",
-             rNow.x, rNow.y, rNow.z, rKeep.x, rKeep.y, rKeep.z);
-    check("超长行丢弃: 40字节超长行(前缀是合法坐标指令 x20,y0,z40)被整行丢掉，坐标未动",
-          rNow.x == rKeep.x && rNow.y == rKeep.y && rNow.z == rKeep.z, buf);
+    struct Joints jNow = snap();
+    snprintf(buf, sizeof(buf), "超长行后 angle=(%.4f,%.4f,%.4f) 丢弃前=(%.4f,%.4f,%.4f)",
+             jNow.b, jNow.r, jNow.c, jKeep.b, jKeep.r, jKeep.c);
+    check("超长行丢弃: 40字节超长行(前缀是合法角度指令 x20,y0,z40)被整行丢掉，角度未动",
+          jNow.b == jKeep.b && jNow.r == jKeep.r && jNow.c == jKeep.c && jNow.f == jKeep.f, buf);
 
     mockSerialClear();      /* 清空 mock 输入缓冲（固件的丢行状态已在上一步清掉） */
     mockSerialFeed("x20,y0,z40\n");
     serialProtocolLoop();
 
-    snprintf(buf, sizeof(buf), "超长行丢弃后: Pos.rec=(%.6f,%.6f,%.6f) 期望=(%.6f,%.6f,%.6f)",
-             Pos.rec.x, Pos.rec.y, Pos.rec.z, want.x, want.y, want.z);
+    snprintf(buf, sizeof(buf), "超长行丢弃后: angle=(%.4f,%.4f,%.4f) 期望=(%.4f,%.4f,%.4f)",
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3,
+             probeClampToTravel(0, 20.0), probeClampToTravel(1, 0.0), probeClampToTravel(2, 40.0));
     check("超长行丢弃: 丢完并清空缓冲后，再\"x20,y0,z40\\n\" 正常落地",
-          probePointErr(&Pos.rec, &want) < PROBE_POINT_TOL, buf);
+          fabs(Pos.ser.angle1 - probeClampToTravel(0, 20.0)) < 1e-9 &&
+          fabs(Pos.ser.angle2 - probeClampToTravel(1,  0.0)) < 1e-9 &&
+          fabs(Pos.ser.angle3 - probeClampToTravel(2, 40.0)) < 1e-9, buf);
   }
 
   printf("=== 12) 串口应答与运行时功能开关 ===\n");
@@ -520,8 +538,8 @@ int main(void) {
     Serial.clearOutput();
     check("运行时功能开关可查询", protoHandleLine("!") == PROTO_RES_NONE &&
           Serial.getOutput() == "P=1 B=1 D=1\n", Serial.getOutput().c_str());
-    check("编译内功能可切换后恢复", protoHandleLine("!P") == PROTO_RES_SPEED_LEVEL &&
-          protoHandleLine("!P") == PROTO_RES_SPEED_LEVEL, "!P toggles then toggles back");
+    check("编译内功能可切换后恢复", protoHandleLine("!P") == PROTO_RES_FEATURE &&
+          protoHandleLine("!P") == PROTO_RES_FEATURE, "!P toggles then toggles back");
 
     /* 运行时关掉按键模块：同一个 N 从含混的 REJECTED 变成明确的 OFF。 */
     Serial.clearOutput();
@@ -531,12 +549,30 @@ int main(void) {
     check("运行时关掉按键后 N 回 OFF（不再是含混的 REJECTED）",
           nOff == PROTO_RES_UNKNOWN && offOut.find("OFF\n") != std::string::npos &&
           offOut.find("REJECTED") == std::string::npos, offOut.c_str());
-    check("compiled button feature toggles back on", protoHandleLine("!B") == PROTO_RES_SPEED_LEVEL, "!B toggles back");
-    check("compiled draw feature toggles off/on", protoHandleLine("!D") == PROTO_RES_SPEED_LEVEL &&
-          protoHandleLine("!D") == PROTO_RES_SPEED_LEVEL, "!D toggles twice");
+    check("compiled button feature toggles back on", protoHandleLine("!B") == PROTO_RES_FEATURE, "!B toggles back");
+    check("compiled draw feature toggles off/on", protoHandleLine("!D") == PROTO_RES_FEATURE &&
+          protoHandleLine("!D") == PROTO_RES_FEATURE, "!D toggles twice");
     Serial.clearOutput();
     check("speed command responds", protoHandleLine("H") == PROTO_RES_SPEED_UP &&
           Serial.getOutput().find("OK\n") != std::string::npos, Serial.getOutput().c_str());
+
+    /* F 换任务必须回报"当前图形模式"（题目要求 5 个内置图形 / 2 个示教任务可循环）：
+     * 回复形如 "OK F=TRI"，标签就是 drawTaskTag() 给出的 ASCII 短名。 */
+    (void) drawSelectTask(DRAW_TASK_LINE);
+    for (int t = 0; t < DRAW_TASK_COUNT; t++) {
+      Serial.clearOutput();
+      int fRes = protoHandleLine("F");
+      std::string fOut = Serial.getOutput();
+      int nowTask = drawGetTask();
+      int wantTask = (t + 1) % DRAW_TASK_COUNT;
+      char wantTag[32];
+      snprintf(wantTag, sizeof(wantTag), "OK F=%s\n", drawTaskTag(wantTask));
+      snprintf(buf, sizeof(buf), "\"F\" -> 任务 %d(%s) 回复=%s",
+               nowTask, drawTaskTag(nowTask), fOut.c_str());
+      check("F 换任务回 OK F=<模式>（依次覆盖 7 个任务）",
+            fRes == PROTO_RES_DRAW_TASK_SELECTED && nowTask == wantTask &&
+            fOut.find(wantTag) != std::string::npos, buf);
+    }
 
     /* R 的失败原因不再被压成一个 REJECTED：开始录制回 OK；录制期间动作指令
      * （'O' 不在"忙碌时仍放行"的表里）回 BUSY；随后立刻结束录制，数据不合格
@@ -577,7 +613,7 @@ int main(void) {
 
     /* 不变量清单：编号 -> 一句话判据。日志里的每条反例都按这些名字报出来。 */
     const unsigned invBits[8] = { INV_FINITE, INV_A1_RANGE, INV_A2_RANGE, INV_A3_RANGE,
-                                  INV_A4_RANGE, INV_REC_OK, INV_REC_MATCH, INV_REJECT_KEEPS };
+                                  INV_A4_RANGE, INV_REC_OK, INV_REC_MATCH, INV_ANGLE_LAND };
     const char *invNames[8] = {
       "INV1 四个关节角都必须是有限数(非 NaN/Inf)",
       "INV2 angle1(b 基座) 必须落在 servoLimit.minB..maxB 内",
@@ -586,7 +622,7 @@ int main(void) {
       "INV5 angle4(f 末端) 必须落在 servoLimit.minF..maxF 内",
       "INV6 recFromServo(&tmp,&Pos.ser) 必须成功返回 true",
       "INV7 Pos.rec 必须等于 recFromServo(&tmp,&Pos.ser)（逐分量差 < 1e-9）",
-      "INV8 返回 COORDS_REJECTED 的坐标指令必须一个字节都没改动"
+      "INV8 角度指令要么逐轴落地到（按 servoLimit 夹取）的结果、未提到的关节不动，要么被拒且原封不动"
     };
 
     /* 最多留 5 条反例的现场 */
@@ -620,16 +656,23 @@ int main(void) {
       struct PosRecSnapshot recBefore = snapRec();
       char input[40];
       input[0] = '\0';
-      bool isCoords = false;
+      bool isAngle = false;
+      double angWant[3] = { 0.0, 0.0, 0.0 };   /* 期望角度（只对提到过的轴有意义） */
+      bool   angSaw[3]  = { false, false, false };
       int rc = 0;
 
       if (testType == 0) {
-        /* 随机坐标指令（地面系 mm，故意含不可达点与地面以下的点）：
-         * 1~3 个轴，轴字母从 x/y/z 顺次取，值横跨可达区间之外 */
+        /* 随机角度指令（题目语义：x/y/z 就是三个舵机的角度）：
+         * 1~3 个轴，轴字母从 x/y/z 顺次取，值故意跨出行程（-40..220 覆盖 0..180 两侧），
+         * 期望值就是固件自己那套夹取规则算出来的角度（probeClampToTravel）。 */
+        /* 值取"整十分之一度"，保证 snprintf("%.1f") 打出来的数字与期望用的
+         * double 是同一个数（随机浮点直接格式化会在第四位小数处四舍五入，
+         * 造成"期望 48.14 / 指令 y48.1"的假失败）。 */
+        const int randSteps = (int)((PROBE_RAND_HI - PROBE_RAND_LO) * 10.0 + 0.5);  /* 0.1 度一档 */
         double v[3];
-        v[0] = -PROBE_RAND_XY + 2.0 * PROBE_RAND_XY * (double)((seed >> 4) % 1000UL) / 1000.0;
-        v[1] = -PROBE_RAND_XY + 2.0 * PROBE_RAND_XY * (double)((seed >> 6) % 1000UL) / 1000.0;
-        v[2] = PROBE_RAND_Z_LO + (PROBE_RAND_Z_HI - PROBE_RAND_Z_LO) * (double)((seed >> 8) % 1000UL) / 1000.0;
+        v[0] = PROBE_RAND_LO + (double)((seed >> 4) % (unsigned long)randSteps) / 10.0;
+        v[1] = PROBE_RAND_LO + (double)((seed >> 6) % (unsigned long)randSteps) / 10.0;
+        v[2] = PROBE_RAND_LO + (double)((seed >> 8) % (unsigned long)randSteps) / 10.0;
         int nAxes = 1 + (int)((seed >> 10) % 3UL);
         int first = (int)((seed >> 12) % 3UL);
 
@@ -638,13 +681,15 @@ int main(void) {
         int used = 0;
         for (int k = 0; k < 3 && used < nAxes; k++) {
           int a = (first + k) % 3;
+          angWant[a] = probeClampToTravel(a, v[a]);
+          angSaw[a]  = true;
           int len = snprintf(w, left, "%s%c%.1f", (used == 0) ? "" : ",", protoAxisChar[a], v[a]);
           if (len <= 0 || (size_t)len >= left) break;
           w += len;
           left -= (size_t)len;
           used++;
         }
-        isCoords = true;
+        isAngle = true;
         rc = protoHandleLine(input);
       } else if (testType == 1) {
         /* 随机语法错误 */
@@ -698,13 +743,26 @@ int main(void) {
         if (recErr >= 1e-9) badFlags |= INV_REC_MATCH;/* INV7 */
       }
 
-      /* INV8：坐标指令被拒绝时，机械臂必须原封不动（既不写关节角也不写坐标） */
-      if (isCoords && rc == PROTO_RES_COORDS_REJECTED) {
-        bool unchanged = (before.b == after.b && before.r == after.r &&
-                          before.c == after.c && before.f == after.f) &&
-                         (recBefore.x == recAfter.x && recBefore.y == recAfter.y &&
-                          recBefore.z == recAfter.z);
-        if (!unchanged) badFlags |= INV_REJECT_KEEPS;
+      /* INV8：角度指令要么逐轴落地到"按 servoLimit 夹取"的值（未提到的关节一个字节都不动），
+       * 要么被拒（忙守卫 BUSY 等）且整条一个字节都不动 —— 不存在第三种结果。 */
+      if (isAngle) {
+        bool okLand;
+        if (rc == PROTO_RES_ANGLES_SET) {
+          const double afterAng[3]  = { after.b, after.r, after.c };
+          const double beforeAng[3] = { before.b, before.r, before.c };
+          okLand = (after.f == before.f);
+          for (int a = 0; a < 3; a++) {
+            if (angSaw[a]) {
+              if (fabs(afterAng[a] - angWant[a]) > 1e-9) okLand = false;
+            } else if (afterAng[a] != beforeAng[a]) {
+              okLand = false;
+            }
+          }
+        } else {
+          okLand = (before.b == after.b && before.r == after.r &&
+                    before.c == after.c && before.f == after.f);
+        }
+        if (!okLand) badFlags |= INV_ANGLE_LAND;
       }
 
       for (int b = 0; b < 8; b++) {

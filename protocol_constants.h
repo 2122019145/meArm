@@ -32,24 +32,13 @@
 #define PROTO_CMD_SPEED_UP       'H'
 #define PROTO_CMD_SPEED_DOWN     'L'
 
-/* 兼容旧命令（v0.2.0 之前就在用，保留不删） */
-#define PROTO_CMD_SPEED_SLOW      '1'
-#define PROTO_CMD_SPEED_NORMAL    '2'
-#define PROTO_CMD_SPEED_FAST      '3'
-#define PROTO_CMD_TOOL_OPEN_STEP  'k'
-#define PROTO_CMD_TOOL_CLOSE_STEP 'K'
-
-/* 'k' 与 'K' 每次步进的角度（度） */
-#define PROTO_TOOL_STEP_DEG      5.0
-
 /* A/B/C 自动取放指令：分别启动物体 A/B/C 的取放序列 */
 #define PROTO_CMD_PICK_A    'A'
 #define PROTO_CMD_PICK_B    'B'
 #define PROTO_CMD_PICK_C    'C'
 
 /* 四个物理按键的串口等价命令（效果与按下按键完全一样）。
- * 用字母而不是 1/2/3/4：'1'/'2'/'3' 从 v0.2.0 起就是慢/中/快调速命令，
- * 抢过来会让老的上位机脚本突然开始动机械臂。 */
+ * 用字母而不是数字：数字键留给将来扩展，且与绘图任务的弹点时序无关。 */
 #define PROTO_CMD_BTN_CYCLE    'N'   /* 按键1 循环执行：下一次按顺序夹 A/B/C */
 #define PROTO_CMD_BTN_RECORD   'R'   /* 按键2 录制：第一次开始，第二次结束并保存 */
 #define PROTO_CMD_BTN_PLAY     'P'   /* 按键3 播放上一次录制的动作 */
@@ -59,7 +48,7 @@
 /* 绘图命令（v1.0.0 新增，实现见 draw_control.cpp）。
  * 选这些字母的理由：都是此前未被占用的字符，且不与 x/X/y/Y/z/Z 三个角度轴字母冲突
  * （轴字母开头的行会走角度解析，绘图命令一律用别的字母）。 */
-#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母V/五点折线/五点曲线 */
+#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母V/字母N/三角形/字母Z/五点折线/五点曲线 */
 #define PROTO_CMD_DRAW_START   'D'   /* 开始绘制（内置图形直接画；示教任务进入五点示教） */
 #define PROTO_CMD_DRAW_RECORD  'G'   /* 记录一个示教点（等价于示教中按按键1） */
 #define PROTO_CMD_DRAW_UNDO    'E'   /* 撤销一个示教点（等价于示教中按按键2） */
@@ -76,9 +65,8 @@
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */
 extern const char protoAxisChar[PROTO_AXIS_COUNT];
-/* 轴对应哪个舵机：1 = angle1(b 基座) 2 = angle2(r 上臂) 3 = angle3(c 下臂) */
-extern const int  protoAxisServoIndex[PROTO_AXIS_COUNT];
-/* 轴对应的关节字母，仅用于串口提示 */
+/* 轴对应的关节字母：b = 基座(angle1) r = 上臂(angle2) c = 下臂(angle3)，
+ * 只用于串口提示；写入本身按"轴 a 写 angle(a+1)"进行。 */
 extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 
 /* ---------- 3) 解析与缓冲区 ---------- */

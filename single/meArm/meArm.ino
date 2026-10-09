@@ -22,8 +22,9 @@
  *      852 B flash 和 109 B SRAM。想退回官方串口库：-DWEARM_SERIAL_ARDUINO=1。
  *   2) 自研 servo_drive（Timer1 硬件 PWM）取代 Servo 库，省 550 B。
  *
- * 三功能全开现在是 31770 B / 1414 B，离可用 flash 只剩 486 B、
- * SRAM 也到了 69% —— 已经很挤了，
+ * 三功能全开现在是 32114 B / 1457 B，离可用 flash 只剩 142 B、
+ * SRAM 也到了 71% —— 已经很挤了（摇杆手感修正那一轮又花掉 202 B flash，
+ * 见下面的容量表），
  * 后面再加功能之前，先用下面的容量表挑一个开关关掉，或者重新做一轮瘦身。
  *
  * 这里提供两个维度的编译期开关：
@@ -63,12 +64,29 @@
  * 把多个 -D 塞进一个带空格的字符串会被当成一个参数，报
  * "token "=" is not valid in preprocessor expressions"。
  *
- * 实测容量（Program / Data，分支 draw_control"绘图裁剪 + 减速细化 + 示教点动修复"后实编；百分比按 32768 / 2048 算）：
- *     取放 + 按键 + 绘图       : 31656 B (96.6%) / 1415 B (69.1%)  <- 出厂默认
- *     取放 + 绘图   + 按键关   : 28478 B (86.9%) /  498 B (24.3%)
- *     取放 + 按键   + 绘图关   : 19198 B (58.6%) / 1206 B (58.9%)
- *     绘图 + 按键   + 取放关   : 28818 B (87.9%) / 1381 B (67.4%)
- * 默认配置相对 Uno 可用 flash（32256 B）还剩 600 B 余量，改动前务必复测。
+ * 实测容量（Program / Data，**上一轮**"摇杆手感修正 / 偏转越大越快"后实编；百分比按 32768 / 2048 算）：
+ *     取放 + 按键 + 绘图       : 32114 B (98.0%) / 1457 B (71.1%)  <- 出厂默认
+ *     取放 + 绘图   + 按键关   : 28922 B (88.3%) /  540 B (26.4%)
+ *     取放 + 按键   + 绘图关   : 19280 B (58.8%) / 1206 B (58.9%)
+ *     绘图 + 按键   + 取放关   : 29240 B (89.2%) / 1423 B (69.5%)
+ * 默认配置相对 Uno 可用 flash（32256 B）只剩 **142 B** 余量，改动前务必复测。
+ * 【本轮未重新实编】删掉"偏转越大走得越快"的**动态步间间隔**：`speedIntervalMs()` 与
+ * `jogIntervalMs()` 两个函数整段删除（原先各自带浮点乘除与区间夹取），
+ * 改为所有移动源直接用固定的 `speed.stepDelayMs`（慢/中/快 = 80/40/20 ms）；
+ * 同时给摇杆加施密特迟滞起控门槛（`JOY_HYST 25`，静止起控 65、已起控保持 40）
+ * 与中位跟踪的时间门控（`JOY_TRACK_MS 20`）。**flash 方向是净省**（删掉的插值函数比
+ * 新增的迟滞判断大得多），SRAM 多出 `s_axisHot[4]` + `s_trackMs[4]` = 24 B
+ * （近似 Data 1481 B / 72.3%）；所以上面四行数字属于**保守偏大**的估计，复测只会更小。
+ * 上一轮（"偏转越大越快"版）四行分别 **+202 / +202 / +198 / +92 B**、Data 四行**全部不变**：
+ * 花掉的是运行期中位跟踪（`readAxisAmp()` 里死区内每轮挪 1 个计数）、
+ * `speedIntervalMs()` 的插值带来的乘除、以及关节步长按偏转缩放
+ * （每格 `speed.stepSize × 偏转/500`，下限 `JOY_STEP_MIN_DEG 0.1` 度）。
+ * **余量已经小于 1% 的 flash，再加功能必须先关一个模块。**
+ * 上面四行之前是"角度语义回归 + 恢复字母N/三角形/字母Z"之后重测的（v1.6.3 的同一批
+ * 行是 31656 / 28478 / 19198 / 28818，Data 1415 / 498 / 1206 / 1381）：
+ * 恢复三张顶点表与三个任务名、加 drawTaskTag() 与 F 的 "OK F=<tag>" 回执，
+ * 扣掉删掉串口 1/2/3 与 k/K（及其 posToolOpen/posToolClose）省下的部分，
+ * 默认配置净 **+256 B flash / +42 B SRAM**，其余三行同样小幅上浮。
  * 对照 v1.1.0 的旧数字（29476 / 20126 / 30074 / 32842）看版本演进。
  * （v1.3.0 的四行是 31936 / 28534 / 19226 / 29184：摇杆中位自标定、方向镜像、
  *   录制中按 P 先收尾再播放这三个实机修复，一共让体积涨了 200~240 B；
@@ -240,7 +258,7 @@
 //      rangeLimit / speedCfg)
 //   3. 全局实例 (Pos / arm1 / limit / speed)
 //   4. 范围边界: 配置自检 rangeClampConfig() / 坐标钳制 clampToRange()
-//      / 边界判定 atRangeEdge() / 可达性 isReachable()
+//      / 可达性 isReachable()
 //   5. 反解算法 getAngle()（越界或不可达时拒绝写入并返回 false）
 //   6. 全局调速 setSpeed()、档位 adjustSpeed()、降档 speedStepDown()
 //
@@ -352,14 +370,14 @@ bool isServoInRange(const SER *ser);
 /* 把四个关节角吸附到 servoLimit 区间内，返回是否有角度被改动。 */
 bool clampServoAngles(SER *ser);
 
-/* 全局调速配置：所有移动源 (摇杆/步进/手动) 共用。
- * stepSize      —— 每次步进移动的坐标单位 (越大移动越快)
- * minDelayMs    —— 输入较弱时的最小步间间隔 (ms)，控制最高速度
- * fullDelayMs   —— 满偏时的步间间隔 (ms)，满偏最慢最安全 */
+/* 全局调速配置：所有移动源 (摇杆/示教点动/手动步进) 共用。
+ * stepSize      —— 摇杆满偏时每格的关节角 (度)，也是步进移动的坐标单位
+ * stepDelayMs   —— 每个档位固定的步间间隔 (ms)：不再随偏转变化。
+ * 手感：偏转越大只是"一步走得越远"（步长按偏转比例缩放），
+ * 节奏（每秒走几格）对任何偏转都一样，不存在"推得越狠走得越快"。 */
 struct speedCfg {
   double stepSize;
-  int    minDelayMs;
-  int    fullDelayMs;
+  int    stepDelayMs;
 };
 extern struct speedCfg speed;
 
@@ -370,10 +388,6 @@ bool clampToRange(pos *pos1);
 /* 校验并修正 limit 配置：对每个轴做 (min,max) 排序，并统计写反的轴数。
  * 返回写反（现已自动纠正）的轴数，0 表示配置本来就正确。 */
 int rangeClampConfig(void);
-
-/* 判断 pos1->rec 是否贴在范围边界上（容差 RANGE_EPS）。
- * *axis 非空时写入出界轴名 'x'/'y'/'z'，多轴同时贴边时取第一个。 */
-bool atRangeEdge(const pos *pos1, char *axis);
 
 /* 判断坐标 rec 是否在机械臂可达工作空间内（反解不会出现 acos 越域）。 */
 bool isReachable(const REC *rec);
@@ -412,7 +426,7 @@ bool getAngle(pos *pos1);
 /* getAngle 的扩展版：*clamped 回传"是否因关节硬限位被吸附"。
  * CLAMP 策略下可能出现"返回 true 但角度被改过"（clamped=true），
  * 此时末端实际到不了目标点。需要"精确到达"语义的调用方
- * （moveAxisStep 的每一步移动）应改用本函数并在 clamped 时回退坐标，
+ * （moveJointStep 的每一步移动）应改用本函数并在 clamped 时回退坐标，
  * 否则坐标系会与真实姿态越差越远。
  * clamped 传 NULL 时行为与 getAngle 完全一致。 */
 bool getAngleEx(pos *pos1, bool *clamped);
@@ -443,15 +457,10 @@ bool posGetHomeAngles(SER *ser);
  * 角度会被夹在 servoLimit 的 f 行程内；返回 true 表示确实发生了变化。 */
 bool posSetAngle4(double angleDeg);
 
-/* 末端张开 / 收回一步（默认步长 5 度，传入 >0 的值可自定义）。
- * 返回 true 表示角度确实变了；已在限位上则返回 false。 */
-bool posToolOpen(double stepDeg);
-bool posToolClose(double stepDeg);
-
 /* 设置全局调速参数 (带合法性校验)。
- * stepSize 必须 > 0；minDelay 必须为正且不超过 fullDelay。
+ * stepSize 必须 > 0；stepDelayMs 必须 > 0。
  * 不合法的项保持原值；只有参数确实被改动时才把档位标记为自定义 (-1)。 */
-void setSpeed(double stepSize, int minDelayMs, int fullDelayMs);
+void setSpeed(double stepSize, int stepDelayMs);
 
 /* 按档位调整速度:
  *   SPEED_SLOW   —— 慢速: 小步长 + 长间隔, 精细移动
@@ -509,24 +518,13 @@ int  speedStepDown(void);
 #define PROTO_CMD_SPEED_UP       'H'
 #define PROTO_CMD_SPEED_DOWN     'L'
 
-/* 兼容旧命令（v0.2.0 之前就在用，保留不删） */
-#define PROTO_CMD_SPEED_SLOW      '1'
-#define PROTO_CMD_SPEED_NORMAL    '2'
-#define PROTO_CMD_SPEED_FAST      '3'
-#define PROTO_CMD_TOOL_OPEN_STEP  'k'
-#define PROTO_CMD_TOOL_CLOSE_STEP 'K'
-
-/* 'k' 与 'K' 每次步进的角度（度） */
-#define PROTO_TOOL_STEP_DEG      5.0
-
 /* A/B/C 自动取放指令：分别启动物体 A/B/C 的取放序列 */
 #define PROTO_CMD_PICK_A    'A'
 #define PROTO_CMD_PICK_B    'B'
 #define PROTO_CMD_PICK_C    'C'
 
 /* 四个物理按键的串口等价命令（效果与按下按键完全一样）。
- * 用字母而不是 1/2/3/4：'1'/'2'/'3' 从 v0.2.0 起就是慢/中/快调速命令，
- * 抢过来会让老的上位机脚本突然开始动机械臂。 */
+ * 用字母而不是数字：数字键留给将来扩展，且与绘图任务的弹点时序无关。 */
 #define PROTO_CMD_BTN_CYCLE    'N'   /* 按键1 循环执行：下一次按顺序夹 A/B/C */
 #define PROTO_CMD_BTN_RECORD   'R'   /* 按键2 录制：第一次开始，第二次结束并保存 */
 #define PROTO_CMD_BTN_PLAY     'P'   /* 按键3 播放上一次录制的动作 */
@@ -536,7 +534,7 @@ int  speedStepDown(void);
 /* 绘图命令（v1.0.0 新增，实现见 draw_control.cpp）。
  * 选这些字母的理由：都是此前未被占用的字符，且不与 x/X/y/Y/z/Z 三个角度轴字母冲突
  * （轴字母开头的行会走角度解析，绘图命令一律用别的字母）。 */
-#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母V/五点折线/五点曲线 */
+#define PROTO_CMD_DRAW_TASK    'F'   /* 切换绘制任务：直线/字母V/字母N/三角形/字母Z/五点折线/五点曲线 */
 #define PROTO_CMD_DRAW_START   'D'   /* 开始绘制（内置图形直接画；示教任务进入五点示教） */
 #define PROTO_CMD_DRAW_RECORD  'G'   /* 记录一个示教点（等价于示教中按按键1） */
 #define PROTO_CMD_DRAW_UNDO    'E'   /* 撤销一个示教点（等价于示教中按按键2） */
@@ -553,9 +551,8 @@ int  speedStepDown(void);
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */
 extern const char protoAxisChar[PROTO_AXIS_COUNT];
-/* 轴对应哪个舵机：1 = angle1(b 基座) 2 = angle2(r 上臂) 3 = angle3(c 下臂) */
-extern const int  protoAxisServoIndex[PROTO_AXIS_COUNT];
-/* 轴对应的关节字母，仅用于串口提示 */
+/* 轴对应的关节字母：b = 基座(angle1) r = 上臂(angle2) c = 下臂(angle3)，
+ * 只用于串口提示；写入本身按"轴 a 写 angle(a+1)"进行。 */
 extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 
 /* ---------- 3) 解析与缓冲区 ---------- */
@@ -698,7 +695,7 @@ void moveright(void);    /* x +1 右 */
 void moveforward(void);  /* y +1 前 */
 void movebackward(void); /* y -1 后 */
 
-/* 方向枚举，供 moveAxisStep 使用 */
+/* 方向枚举：JointDir 的数值基础，也是定长函数 moveup/movedown/... 的取值来源 */
 enum MoveDir {
   DIR_UP = 1, DIR_DOWN,
   DIR_LEFT, DIR_RIGHT,
@@ -717,7 +714,7 @@ enum JointDir {
   JOINT_R_BWD   = DIR_BWD     /* 上臂 r (angle2) 角度减小 */
 };
 
-/* moveAxisStep 的执行结果 */
+/* moveJointStep 的执行结果 */
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
@@ -744,21 +741,17 @@ enum MoveResult {
  *   返回 enum MoveResult；返回 MOVE_OK 以外的值时 Pos 完全不变。 */
 int moveJointStep(int dir, double stepSize);
 
-/* 与上面同一个实现，保留旧名字供"按方向轴理解"的调用方使用。
- * DIR_UP/DOWN -> 下臂 c，DIR_FWD/BWD -> 上臂 r，DIR_LEFT/RIGHT -> 基座 b。
- * 新代码请直接用 moveJointStep + JOINT_*，语义更清楚。 */
-int moveAxisStep(int dir, double stepSize);
-
-/* ==================== 移动到指定 x,y,z（绘图 / 串口共用） ====================
+/* ==================== 移动到指定 x,y,z（绘图 / 取放共用） ====================
  *
  * 「移动到指定坐标」在本工程只有这一份实现：反解目标点 -> 按关节速率上限把
  * b/r/c 朝解算结果推进一格。绘图的三处点位写入（直线平移 moveTick、轨迹跟随
- * pathAdvance、示教点动 teachJogTick）与串口的 x/y/z 指令全部调用这里，
- * 不再各自展开一份"反解 + 限速 + 写角度"的代码。
+ * pathAdvance、示教点动 teachJogTick）与取放模块都调用这里，不再各自展开一份
+ * "反解 + 限速 + 写角度"的代码。串口 x/y/z 按题目要求直接写关节角，不经过这里。
  *
  * 参数:
- *   goal[3]  目标点，与 Pos.rec 同一坐标系（肩关节为原点的内部坐标，
- *            z 从肩算起；串口的"地面坐标系"由串口层自己换算后再传进来）。
+ *   goal[3]  目标点，与 Pos.rec 同一坐标系（肩关节为原点的内部坐标，z 从肩算起）。
+ *            调用者：绘图模块（轨迹采样点）与取放模块；串口 x/y/z 指令按题目
+ *            要求直接写关节角，不再走这里。
  *   seen     位掩码：位 0/1/2 分别表示 x/y/z 被本次请求提及。**没被提及的轴
  *            沿用 Pos.rec 的当前值**（串口 "x10" 这类单轴命令就是这么处理的），
  *            传 0x07 表示三个轴都要走到 goal。
@@ -802,17 +795,20 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 // ===== serial_protocol.h =====
 /*
 // serial_protocol.h
-// 串口命令协议：固定指令通信 + 末端空间直角坐标（x/y/z）运动指令
+// 串口命令协议：固定指令通信 + 三舵机同步角度指令（x/y/z）
 //
 // 命令表:
 //   O                             爪子张开（angle4 走到 f 行程上限）
 //   S                             爪子关闭（angle4 走到 f 行程下限）
 //   H / L                         整体运行速度 提升 / 降低 一档
-//   x坐标,y坐标,z坐标              末端空间直角坐标，例: x20,y0,z40
-//                                 可只写其中一部分（如 y10），未写出的轴保持不动
-//                                 语法同旧版（字母、可选 '='、逗号分隔、支持小数）
-//   1 / 2 / 3                     兼容旧命令：直接切到 慢/中/快 档
-//   k / K                         兼容旧命令：爪子步进张开/收回
+//   x角度,y角度,z角度              三舵机同步角度指令，例: x10,y30,z20
+//                                 轴与舵机对应: x = 基座舵机(angle1/b)
+//                                              y = 上臂舵机(angle2/r)
+//                                              z = 下臂舵机(angle3/c)
+//                                 一行里写到的轴在同一次正解刷新中一起写入（同步控制）
+//                                 可只写其中一部分（如 y30），未写出的关节保持不动
+//                                 超出机械行程的值按 servoLimit 夹取（x200 最终写 180）
+//                                 语法：字母、可选 '='、逗号分隔、支持小数
 //   A / B / C                     启动物体 A/B/C 的自动取放序列，序列执行期间只有调速指令仍然有效、其它动作指令返回 BUSY
 //   N / R / P / M / 0             四个实体按键的串口孪生（需要「按键」模块已编译且启用，默认已启用）：
 //                                 N=循环取放  R=录制（第一次按下开始，再按一次结束并保存）
@@ -827,32 +823,20 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 // 每条命令都会回一行短回复（OK / BUSY / OFF / DISCARD / EMPTY / ERR / REJECTED），
 // 含义见下面 WEARM_SERIAL_RESPONSES 的说明。
 //
-// 【坐标系】原点 O = 过肩关节的地面垂足（肩关节往地面做垂线，垂足就是原点）;
-//   x+ = 机械臂初始面朝方向; z+ = 垂直地面向上; 右手系
-//   （面朝 +x 时 +y 在左手边，即从上方看逆时针 90°）。
-//   固件内部（Pos.rec）用同一组 (x,y,z)，但原点落在肩关节上，
-//   两者只差一个肩高：z_内部 = z_坐标 − WEARM_SHOULDER_HEIGHT（见下）。
-//   默认肩高 20 时: x20,y0,z40 = 开机初始位姿；可达范围 x/y ∈ ±40、z ∈ [0,60]。
-//   z 是"离地高度"，负值（地面以下）直接返回 REJECTED。
-//   【破坏性变更】旧固件的 x/y/z 是"直接给三个关节角度"，现在改为空间坐标：
-//   同样一条 x10,y30,z20 的含义已经不同（旧=角度，新=（10,30,20）这一点）。
+// 【x/y/z 就是三个舵机的角度，不做逆解】
+//   一条 x10,y30,z20 直接写基座/上臂/下臂三个舵机的角度（单位：度），
+//   写入前按各关节的真实机械行程 servoLimit 夹取，写完后做一次正解刷新
+//   Pos.rec，所以"给出的角度"与"机械臂的位置"始终是同一件事。
+//   一行里出现多个轴 = 三个舵机在同一轮 PWM 输出里同步到位。
+//   历史：v1.3.0 ~ v1.6.3 曾把同一串指令当作末端空间坐标（内部做逆解），
+//   现按题目要求改回角度语义。坐标版源码备份在 git 分支
+//   backup/xyz-cartesian（= tag v1.6.3）以及 dist/ 目录下的压缩包里。
 //
 // 【单一读者】串口字节只准由 serialProtocolLoop() 读取。旧的
 // handleSerialSpeedCmd() 已被本模块取代并删除 —— 两个读者会把同一串
 // 数据各吃掉一半，行缓冲永远拼不出完整指令。
 //
 */
-
-/* ===== 串口坐标系的肩关节离地高度 =====
- * 用户坐标系的原点是"过肩关节的地面垂足"，固件内部坐标以肩关节为原点，
- * 两者只差这一个高度，单位与 arm1 的 L1/L2 相同。
- * 默认 20.0 让地面正好落在内部 z 的可达下限 -20（由关节行程算出来），
- * 也就是可达 z ∈ [0,60] 且不会穿到地面以下。实机上只改这一个数：
- * 量一下肩关节离地多少（与 L1/L2 同单位）填进去即可。 */
-#ifndef WEARM_SHOULDER_HEIGHT
-#define WEARM_SHOULDER_HEIGHT 20.0
-#endif
-
 #ifndef WEARM_SERIAL_PROTOCOL_H
 #define WEARM_SERIAL_PROTOCOL_H
 
@@ -862,9 +846,10 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
  * answer every command with a very short UPPERCASE line, so the host still
  * sees what happened even when the verbose WEARM_DEBUG_SERIAL traces are off:
  *
- *   OK           命令已执行（O/S/k 带夹爪角度：OK #）
+ *   OK           命令已执行（O/S 带夹爪角度：OK #；F 带图形模式：OK F=<模式>）
  *   BUSY         命令看懂了但机械臂正忙（取放序列/录放/绘图进行中）
- *   REJECTED     这台固件没编进该模块；或坐标不可达/在地面以下；或绘图轨迹校验不过
+ *   REJECTED     这台固件没编进该模块；或绘图轨迹校验不过
+ *                （x/y/z 角度指令只会按行程夹取，不会因为数值大小被拒）
  *   OFF          固件里有该模块，但被 !P/!B/!D 关掉了
  *   DISCARD      R 结束录制时数据不合格（没位移/没有动作/缓冲满），已丢弃
  *   EMPTY        P 播放时还没有录制数据
@@ -884,9 +869,9 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define PROTO_RES_GRIPPER_CLOSE 2  /* S 爪子关闭 */
 #define PROTO_RES_SPEED_UP      3  /* H 速度提升 */
 #define PROTO_RES_SPEED_DOWN    4  /* L 速度降低 */
-#define PROTO_RES_SPEED_LEVEL   5  /* 1 或 2 或 3 直接指定档位 */
-#define PROTO_RES_TOOL_STEP     6  /* k 或 K 末端步进开合 */
-#define PROTO_RES_ANGLES_SET    7  /* x/y/z 坐标指令已被接受并解算成功（机械臂开始移动） */
+#define PROTO_RES_SPEED_LEVEL   5  /* 保留未用：原 '1'/'2'/'3' 档位直达（与题目无关，已删） */
+#define PROTO_RES_FEATURE       6  /* ! 查询、!P/!B/!D 切换运行时功能位 */
+#define PROTO_RES_ANGLES_SET    7  /* x/y/z 角度指令已写入三个舵机（同一次正解刷新） */
 #define PROTO_RES_UNKNOWN       8  /* 无法识别的命令（未改动任何状态） */
 #define PROTO_RES_BAD_SYNTAX    9  /* 像角度指令但语法错（未改动任何状态） */
 #define PROTO_RES_PICK_STARTED 10 /* A/B/C 取放序列已启动 */
@@ -901,7 +886,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define PROTO_RES_HOME_STARTED   17 /* M/0：开始回中 */
 
 /* 绘图命令的返回值（F/D/G/E/Q/U/W 与 p/n/o，实现见 draw_control.cpp） */
-#define PROTO_RES_DRAW_TASK_SELECTED 18 /* F：切换绘制任务（直线/字母V/五点折线/五点曲线） */
+#define PROTO_RES_DRAW_TASK_SELECTED 18 /* F：切换绘制任务（直线/字母V/字母N/三角形/字母Z/五点折线/五点曲线） */
 #define PROTO_RES_DRAW_STARTED       19 /* D：绘图任务已启动（内置图形，或进入五点示教） */
 #define PROTO_RES_DRAW_PAUSED        20 /* Q：绘制已暂停（停在原地，任务状态保留） */
 #define PROTO_RES_DRAW_RESUMED       21 /* U：从暂停处继续绘制 */
@@ -910,7 +895,6 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define PROTO_RES_DRAW_TEACH_UNDO    24 /* E：撤销一个示教点 */
 #define PROTO_RES_DRAW_REJECTED      25 /* 绘图请求被拒：轨迹校验不过 / 示教点不够 / 标定值非法 */
 #define PROTO_RES_DRAW_CALIBRATED    26 /* p/n/o：纸面高度、图形半宽、图形中心已更新 */
-#define PROTO_RES_COORDS_REJECTED    27 /* x/y/z 坐标点不可达或在地面以下（未改动任何状态） */
 
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */
@@ -943,8 +927,8 @@ int protoHandleLine(const char *line);
  * 【与摇杆、串口的关系】
  *  - 序列执行期间由本模块独占 b/r/c 三个关节角，摇杆步进被让位
  *    （joystick_control.cpp 里的轴步进会跳过）；
- *  - 序列执行期间串口的 O/S/k/K 与 x,y,z 角度指令会被拒绝（调用方拿到 PROTO_RES_BUSY），
- *    只有 H/L/1/2/3 这些调速指令仍然生效 —— 可以一边跑一边改速度；
+ *  - 序列执行期间串口的 O/S 与 x,y,z 角度指令会被拒绝（调用方拿到 PROTO_RES_BUSY），
+ *    只有 H/L 这些调速指令仍然生效 —— 可以一边跑一边改速度；
  *  - 序列本身是非阻塞的：每轮 loop() 调一次 pickPlaceLoop() 推进一步，
  *    期间串口接收与指示灯照常工作。
  *
@@ -1042,8 +1026,8 @@ static inline double pickPlaceApproachDz(void)  { return 0.0; }
  *
  * 【串口等价命令】（上位机发单个字母，效果与按下物理按键完全一样）
  *     N -> 按键1      R -> 按键2      P -> 按键3      M 或 0 -> 按键4
- *   之所以用字母而不是 1/2/3/4：'1'/'2'/'3' 从 v0.2.0 起就是"慢/中/快"调速命令，
- *   不能抢过来，否则老的上位机脚本会突然开始动机械臂。
+ *   之所以用字母而不是 1/2/3/4：'1'/'2'/'3' 历史上曾是"慢/中/快"调速命令
+ *   （v1.0.0~v1.6.3，本轮已按"与任务无关即删"去掉），字母键因此不会与旧脚本撞车。
  *
  * 【按键电气约定】
  *   四个按键脚统一 pinMode(INPUT_PULLUP)，按下 = 拉到 GND = 读到 LOW。
@@ -1058,10 +1042,10 @@ static inline double pickPlaceApproachDz(void)  { return 0.0; }
  *
  * 【谁让位给谁】
  *   录制期间：摇杆照常可用（录制就是要录你推摇杆的动作），但串口的
- *             O/S/k/K 与 x,y,z 角度指令会被拒绝，取放序列也起不来 ——
+ *             O/S 与 x,y,z 角度指令会被拒绝，取放序列也起不来 ——
  *             录制是"摇杆独占"，避免录进来一半是别人动的。
  *   播放/回中期间：摇杆被让位（buttonControlLocked() 为真，joystick_control.cpp
- *             的步进循环会跳过），串口动作指令同样被拒绝，只有 H/L/1/2/3 调速有效。
+ *             的步进循环会跳过），串口动作指令同样被拒绝，只有 H/L 调速有效。
  *   取放序列执行期间：四个按键的动作全部拒绝（返回 PROTO_RES_BUSY）。
  */
 #ifndef BUTTON_CONTROL_H
@@ -1157,7 +1141,8 @@ static inline const char *buttonStateName(void)     { return ""; }
  *   别的什么都不用管：
  *
  *     1. 直线绘制      任务 DRAW_TASK_LINE：在纸面上画一条连续直线。
- *     2. 字母V绘制     任务 DRAW_TASK_V：左上 -> 底尖 -> 右上，一笔画完。
+ *     2. 基础图形      任务 DRAW_TASK_N / TRIANGLE / Z / V：从字母 N、三角形、
+ *                      字母 Z、字母 V 里选一种（同组同学选不同图形），一笔画完。
  *     3. 绘图过程控制  暂停 / 继续 / 取消，三个物理按键分别触发（见下表）。
  *     4. 五点示教折线  任务 DRAW_TASK_POLYLINE：摇杆把笔尖依次移到 5 个目标点，
  *                      按键记录；记录完成后先回待机位、再走到第 1 点，然后依次
@@ -1165,8 +1150,9 @@ static inline const char *buttonStateName(void)     { return ""; }
  *     5. 五点示教曲线  任务 DRAW_TASK_CURVE：同样的示教方式，画一条依次经过
  *                      5 个目标点的连续平滑曲线（向心 Catmull-Rom 样条）。
  *
- *   （本分支删掉了原来的"字母N / 三角形 / 字母Z"三个内置图形：任务表从 7 项
- *     减到 4 项，连顶点表、任务名、F 循环与探针里的几何测试一起去掉。）
+ *   （字母N / 三角形 / 字母Z 曾在 v1.6.1 为省 flash 删掉过，现按题目"同组同学
+ *     所选图形不得完全相同"的要求恢复：任务表回到 7 项，顶点表、任务名、F 循环
+ *     与探针几何测试一并恢复；串口在 F 换任务后会回报当前图形模式。）
  *
  * 【运动为什么这么慢、这么细】
  *   本分支把绘制运动改得更慢更平滑（见 draw_control.cpp 顶部"运动参数"）：
@@ -1178,7 +1164,8 @@ static inline const char *buttonStateName(void)     { return ""; }
  * 【为什么是"先反解、再插值"】
  *   绘制轨迹在笛卡尔空间里定义（直线要真的直、曲线要真的经过示教点），
  *   每个采样点交给 move.h 的 moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，
- *   串口 x/y/z 指令用的是同一个函数；它内部用 getAngleEx() 反解成 b/r/c 并写回 Pos）。
+ *   它内部用 getAngleEx() 反解成 b/r/c 并写回 Pos；串口 x/y/z 指令按题目要求
+ *   直接写关节角，不经过这里）。
  *   ★ 启动前会把整条轨迹按 DRAW_PATH_SAMPLE_STEP 采样校验一遍
  *     （在 limit 内 + isReachable() + 反解没被吸附 + 相邻点反解分支不跳变），
  *     任何一条不满足就拒绝启动、一个字节都不改（与 pick_place 同一套做法）。
@@ -1197,7 +1184,8 @@ static inline const char *buttonStateName(void)     { return ""; }
  *     暂停中   按键1 = 仍然暂停（无动作），按键2 = 继续，按键3 = 取消
  *
  * 【串口等价命令】（单字符，与上面一一对应；空闲时也能用，用来选任务/启动）
- *     F  循环选择绘图任务（直线 -> 字母V -> 五点折线 -> 五点曲线）
+ *     F  循环选择绘图任务（直线 -> 字母N -> 三角形 -> 字母Z -> 字母V -> 五点折线
+ *        -> 五点曲线 -> 直线），串口回报 "OK F=<模式>"，例如 OK F=TRI
  *     D  开始当前任务：内置图形直接开始绘制；两个示教任务进入示教模式（先回中）
  *     G  记录当前示教点（= 按键1）
  *     E  撤销最后一个示教点（= 按键2）
@@ -1213,8 +1201,8 @@ static inline const char *buttonStateName(void)     { return ""; }
  *   本模块忙（示教/绘制/暂停/回待机）时：
  *     - 摇杆让位（joystick_control.cpp 用 drawControlLocked() 判断）；
  *       但示教模式下摇杆由本模块自己读，用来点动笔尖 —— 见"示教点动"一节。
- *     - 串口的动作指令（O/S/k/K、x,y,z 角度、A/B/C 取放）被拒绝，
- *       只有调速 H/L/1/2/3 与绘图/按键命令本身有效。
+ *     - 串口的动作指令（O/S、x,y,z 角度、A/B/C 取放）被拒绝，
+ *       只有调速 H/L 与绘图/按键命令本身有效。
  *   反过来，取放序列执行中或按键模块录制/播放/回中时，本模块拒绝启动（回 BUSY）。
  *
  * 【示教点动：笛卡尔点动，不是关节角点动】
@@ -1228,9 +1216,9 @@ static inline const char *buttonStateName(void)     { return ""; }
  *   每格的位移量是"工作区单位"，由 DRAW_JOG_STEP_MAX（0.25）按偏转比例缩放：
  *     轻微偏转 -> 0.02 单位/格（慢慢挪，对点用）
  *     满偏     -> 0.25 单位/格（约 6 单位/秒，比自动绘制快一倍）
- *   步进间隔按偏转量在 speed.minDelayMs~fullDelayMs 之间插值，**偏转越大间隔越长**
- *   （与摇杆模块 speedIntervalMs() 同一条"慢而稳"的约定），所以示教点动也吃
- *   调速 H/L/1/2/3 档位。
+ *   步进间隔固定为 speed.stepDelayMs；只有步长按偏转比例缩放
+ *   （与摇杆模块的调速约定），所以示教点动也吃
+ *   调速 H/L 档位。
  *   注意：这三路的步长**不是** speed.stepSize（那是"关节角每周期转多少度"，
  *   当位移用会让笔尖一格跳出半个工作区 —— 曾经就是这样，见 README 的修复记录）。
  *   哪一路方向觉得反了，把 DRAW_JOG_INVERT_X/Y/Z 改成 1 即可（不用改逻辑）。
@@ -1247,13 +1235,20 @@ static inline const char *buttonStateName(void)     { return ""; }
 
 
 /* ---------- 绘图任务编号 ----------
- * 本分支只有 4 个任务：两个内置图形（直线 / 字母V）+ 两个五点示教（折线 / 曲线）。
- * 原来的 字母N(1) / 三角形(2) / 字母Z(3) 已删除，编号顺次前移。 */
+ * 7 个任务：5 个内置图形（直线 / 字母N / 三角形 / 字母Z / 字母V）
+ * + 2 个五点示教（折线 / 曲线）。
+ * 编号顺序就是串口 F 命令的循环顺序。
+ * 【恢复记录】字母N(1)/三角形(2)/字母Z(3) 曾在 v1.6.1 为省 flash 删除，
+ * 现按题目"同组同学所选图形不得完全相同"的要求恢复，编号回到删除前的值，
+ * 字母 V 由 1 回到 4（v1.6.1~v1.6.3 的编号是 LINE/V/POLYLINE/CURVE = 0/1/2/3）。 */
 #define DRAW_TASK_LINE      0   /* 直线（内置） */
-#define DRAW_TASK_V         1   /* 字母 V（内置） */
-#define DRAW_TASK_POLYLINE  2   /* 五点示教折线 */
-#define DRAW_TASK_CURVE     3   /* 五点示教平滑曲线 */
-#define DRAW_TASK_COUNT     4
+#define DRAW_TASK_N         1   /* 字母 N（内置） */
+#define DRAW_TASK_TRIANGLE  2   /* 三角形（内置） */
+#define DRAW_TASK_Z         3   /* 字母 Z（内置） */
+#define DRAW_TASK_V         4   /* 字母 V（内置） */
+#define DRAW_TASK_POLYLINE  5   /* 五点示教折线 */
+#define DRAW_TASK_CURVE     6   /* 五点示教平滑曲线 */
+#define DRAW_TASK_COUNT     7
 
 /* 示教点个数（两个示教任务 折线/曲线 固定 5 个目标点） */
 #define DRAW_TEACH_MAX_POINTS 5
@@ -1288,16 +1283,19 @@ void drawLoop(void);
 /* ---------- 任务选择与启动 ---------- */
 /* 选择绘图任务，返回生效的任务编号；task 非法时返回 -1 且不改动。 */
 int drawSelectTask(int task);
-/* 切到下一个任务（直线 -> 字母V -> 折线 -> 曲线 -> 直线），返回新编号。 */
+/* 切到下一个任务（直线 -> N -> 三角形 -> Z -> V -> 折线 -> 曲线 -> 直线），返回新编号。 */
 int drawTaskCycle(void);
 /* 当前选中的任务编号。 */
 int drawGetTask(void);
-/* 任务名（"直线"/"字母V"/"五点折线"/"五点曲线"）。 */
+/* 任务名（"直线"/"字母N"/"三角形"/"字母Z"/"字母V"/"五点折线"/"五点曲线"）。 */
 const char *drawTaskName(int task);
+/* ASCII 任务短标签（"LINE"/"N"/"TRI"/"Z"/"V"/"POLY"/"CURVE"），
+ * 供串口在 F 换任务后回报"当前图形模式"用（单字节终端，不能用中文名）。 */
+const char *drawTaskTag(int task);
 
 /* 开始当前选中的任务：
- *   内置图形（0~1：直线 / 字母V）：直接进入 回待机 -> 抬笔移动到起点 -> 落笔 -> 绘制 -> 抬笔 -> 回待机。
- *   示教任务（2~3：五点折线 / 五点曲线）：进入示教模式（先回待机位），之后用摇杆点动 + 按键记录。
+ *   内置图形（0~4：直线 / 字母N / 三角形 / 字母Z / 字母V）：直接进入 回待机 -> 抬笔移动到起点 -> 落笔 -> 绘制 -> 抬笔 -> 回待机。
+ *   示教任务（5~6：五点折线 / 五点曲线）：进入示教模式（先回待机位），之后用摇杆点动 + 按键记录。
  * 返回 PROTO_RES_DRAW_STARTED；状态不对或轨迹校验失败时返回
  * PROTO_RES_BUSY / PROTO_RES_DRAW_REJECTED（原因见串口日志与 drawLastResult()）。 */
 int drawStartTask(void);
@@ -1372,6 +1370,7 @@ int drawLastResult(void);
 /* 绘图功能已关闭，这里是空实现 */ static inline int drawTaskCycle(void) { return -1; }
 /* 绘图功能已关闭，这里是空实现 */ static inline int drawGetTask(void) { return -1; }
 /* 绘图功能已关闭，这里是空实现 */ static inline const char *drawTaskName(int task) { (void)task; return ""; }
+/* 绘图功能已关闭，这里是空实现 */ static inline const char *drawTaskTag(int task) { (void)task; return ""; }
 /* 绘图功能已关闭，这里是空实现 */ static inline int drawStartTask(void) { return -1; }
 
 /* 串口命令 */
@@ -1457,7 +1456,7 @@ int drawLastResult(void);
 //     串口发送 H / L          整体运行速度 提升 / 降低 一档  (波特率 115200)
 //     串口发送 x角度,y角度,z角度  同步设置三个舵机，例: x10,y30,z20
 //                             x -> angle1 基座、y -> angle2 上臂、z -> angle3 下臂
-//                             （旧的 '1'/'2'/'3' 调速与 k/K 末端开合仍兼容）
+//                             超出行程按 servoLimit 夹取，不会因为数值大小被拒
 //
 //   每个关节的行程由全局 servoLimit 限制（b 0~180 / r 0~180 / c 0~180 / f 60~150），
 //   推到行程尽头就停住（moveJointStep 返回 MOVE_AT_LIMIT），不会顶死舵机。
@@ -1483,9 +1482,21 @@ int drawLastResult(void);
 //             theta = 90 - b  ->  x = x_planar cos theta, y = x_planar sin theta。
 //
 // 【调速参数】存在全局 speedCfg (speed) 中，所有移动源共用：
-//     speed.stepSize    每个控制周期转过的角度（度）
-//     speed.minDelayMs  输入较弱时的最小步间间隔（最高速度）
-//     speed.fullDelayMs 满偏时的步间间隔（最低速度，最安全）
+//     speed.stepSize    满偏（推到底）时每格的关节角（度）；实际每格 = stepSize × 偏转比例
+//     speed.stepDelayMs 每个档位固定的步间间隔（ms）：不再随偏转变化
+//   手感：偏转越大只是"一步走得越远"（步长按偏转比例缩放），
+//   节奏（每秒走几格）对任何偏转都一样，不存在"推得越狠走得越快"。
+//
+// 【防"无故乱摆】四层措施（v1.6.4 加三层，v1.6.5 加施密特迟滞）：
+//     1) 死区 JOY_DEADZONE = 40（旧版 15）：把 ADC 噪声峰峰与电位器温漂一次关在门外；
+//     2) 开机自标定 JOY_CAL_SAMPLES = 32（旧版 8）+ 上限 JOY_CAL_MAX_OFF = 80：
+//        手柄机械中位偏 512 几十个计数也不会被当成推杆；
+//     3) 运行期缓慢跟踪中位（readAxisAmp 内，只在死区内部挪 1 个计数）：
+//        开机 30 秒后的温漂自动吸收，不必重新上电；
+//     4) 施密特迟滞 JOY_HYST 25（起控门槛 65）+ 中位跟踪每 20ms 才挪 1 个计数：
+//        彻底解决"没人碰摇杆、大臂自己一小格一小格往前抽"的问题。
+//   排查时把本文件对应 .cpp 里的 WEARM_JOY_DEBUG 改 1（有动作或每 500ms 打印四路原始
+//   ADC / 偏转量 / 角度），注意它会把 Serial 浮点格式化层链进来，需同时关掉一个功能腾 flash。
 //
 // 【可选扩展】板载摇杆按键（把按键脚接到空闲数字口即可）：
 //   可在 joystickSetup() 里 pinMode(pin, INPUT_PULLUP)，
@@ -1494,11 +1505,6 @@ int drawLastResult(void);
 #ifndef WEARM_JOYSTICK_CONTROL_H
 #define WEARM_JOYSTICK_CONTROL_H
 
-
-/* 保留的兼容值：本硬件用不到模式切换，恒为 0 */
-#define JOY_MODE_PLANE  0
-#define JOY_MODE_VERT   1
-#define JOY_MODE_COUNT  2
 
 /* 摇杆一次采样的完整结果（按"被控关节"命名，便于直接使用） */
 struct joyState {
@@ -1541,9 +1547,6 @@ void joystickReadState(struct joyState *st);
 
 /* 读取本轮选中的方向编码（JOY_DIR_*；无动作返回 JOY_DIR_NONE） */
 int joystickRead(void);
-
-/* 兼容接口：本硬件不做模式切换，恒返回 JOY_MODE_PLANE */
-int joystickGetMode(void);
 
 /* 每轮 loop 调一次，非阻塞（内部不使用 delay）。
  * 内部依次处理：摇杆采样 -> 按全局调速参数步进 -> LED 指示。 */
@@ -1919,11 +1922,10 @@ struct rangeLimit limit = {
   .minZ = -20.0, .maxZ = 40.0
 };
 
-/* 全局调速默认值：中速 */
+/* 全局调速默认值：中速（1.0 度/格、固定 40ms 一格 = 25°/s） */
 struct speedCfg speed = {
   .stepSize    = 1.0,
-  .minDelayMs  = 10,
-  .fullDelayMs = 40
+  .stepDelayMs = 40
 };
 
 /* 【关节硬限位】四个舵机的机械允许行程（度）
@@ -2092,24 +2094,6 @@ int rangeClampConfig(void) {
   return bad;
 }
 
-/* 判断 pos1->rec 是否贴在范围边界上（容差 RANGE_EPS）。
- * 三个轴的判断完全一样，用指针走一遍即可；轴名按 'x'/'y'/'z' 递推，
- * 与原来三次 edgeHit 调用一致（多轴同时贴边时取第一个）。
- * Kept out-of-line for the same reason as isServoInRange: one shared copy. */
-bool __attribute__((noinline)) atRangeEdge(const pos *pos1, char *axis) {
-  if (axis != NULL) *axis = 0;
-  if (pos1 == NULL) return false;
-  const double *v = &pos1->rec.x;
-  const double *lim = &limit.minX;
-  for (int i = 0; i < 3; i++, v++, lim += 2) {
-    if (*v <= lim[0] + RANGE_EPS || *v >= lim[1] - RANGE_EPS) {
-      if (axis != NULL) *axis = (char)('x' + i);
-      return true;
-    }
-  }
-  return false;
-}
-
 /* 将位置钳制到配置的范围内，若有轴越界则返回 true。
  * 三个轴各自独立钳制，不会因为一个轴越界而影响其它轴。 */
 bool clampToRange(pos *pos1) {
@@ -2265,7 +2249,7 @@ bool getAngle(pos *pos1) {
 }
 
 /* getAngle 的扩展版：额外回传"是否因关节限位被吸附"。
- * 需要区分"精确到达目标"与"被限位挡住"的调用方（moveAxisStep）用这个版本。 */
+ * 需要区分"精确到达目标"与"被限位挡住"的调用方（moveToPoint / 绘图轨迹校验）用这个版本。 */
 /* getAngleEx 内部用的分支求解。
  *
  * 【为什么不能用 alpha + beta 凑】
@@ -2598,33 +2582,32 @@ bool posGetHomeAngles(SER *ser) {
 
 /* ---------- 全局调速 ---------- */
 /* 设置全局调速参数 (带合法性校验)
- * 校验规则: stepSize > 0；minDelayMs > 0；fullDelayMs >= minDelayMs。
+ * 校验规则: stepSize > 0；stepDelayMs > 0。
  * 不合法的项保持原值，只有确实改动了参数才把档位标记为自定义。-1。 */
-void setSpeed(double stepSize, int minDelayMs, int fullDelayMs) {
+void setSpeed(double stepSize, int stepDelayMs) {
   bool changed = false;
   if (stepSize > 0 && stepSize != speed.stepSize) {
     speed.stepSize = stepSize; changed = true;
   }
-  if (minDelayMs > 0 && minDelayMs <= fullDelayMs && minDelayMs != speed.minDelayMs) {
-    speed.minDelayMs = minDelayMs; changed = true;
-  }
-  if (fullDelayMs >= minDelayMs && fullDelayMs >= 0 && fullDelayMs != speed.fullDelayMs) {
-    speed.fullDelayMs = fullDelayMs; changed = true;
+  if (stepDelayMs > 0 && stepDelayMs != speed.stepDelayMs) {
+    speed.stepDelayMs = stepDelayMs; changed = true;
   }
   /* 参数被手动改动后，当前档位名已不再代表实际参数 */
   if (changed) speedLevel = -1;
 }
 
 /* 按档位调整速度，返回生效档位 (-1 表示档位非法)
- * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、间隔 20/10/5 ms、80/40/20 ms，
- * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，整数右移也是精确的），
- * 于是三份 setSpeed 调用点收成一份。SPEED_SLOW/NORMAL/FAST 就是 0/1/2，
- * 所以 speedLevel = level、return level 与原 switch 里逐条赋值逐位相同。
+ * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、固定间隔 80/40/20 ms（慢/中/快），
+ * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，
+ * 整数右移也是精确的），于是三份 setSpeed 调用点收成一份。
+ * SPEED_SLOW/NORMAL/FAST 就是 0/1/2，所以 speedLevel = level、return level
+ * 与原 switch 里逐条赋值逐位相同。
  * 【实测】逐档 switch 写法整机 Program = 34970 B，本写法 34932 B，
  * 所以即使 adjustSpeed 自身的符号从 112 B 涨到 246 B，整机仍净省 38 B。 */
 int adjustSpeed(int level) {
   if (level < SPEED_SLOW || level > SPEED_FAST) return -1;
-  setSpeed(0.5 * (1 << level), 20 >> level, 80 >> level);   /* 慢/中/快 = ×1 / ×2 / ×4 */
+  setSpeed(0.5 * (1 << level), 80 >> level);
+  /* 慢/中/快 → 步长 0.5/1/2 度、固定间隔 80/40/20 ms */
   speedLevel = level;
   return level;
 }
@@ -2668,19 +2651,6 @@ bool posSetAngle4(double angleDeg) {
   return true;
 }
 
-/* 末端张开：朝 f 的行程上限方向走一步。
- * stepDeg <= 0 时用默认步长 5 度，方便串口单条命令直接调用。 */
-bool posToolOpen(double stepDeg) {
-  if (stepDeg <= 0) stepDeg = 5.0;
-  return posSetAngle4(Pos.ser.angle4 + stepDeg);
-}
-
-/* 末端收回：朝 f 的行程下限方向走一步。 */
-bool posToolClose(double stepDeg) {
-  if (stepDeg <= 0) stepDeg = 5.0;
-  return posSetAngle4(Pos.ser.angle4 - stepDeg);
-}
-
 // ===== protocol_constants.cpp =====
 /*
 // protocol_constants.cpp
@@ -2693,10 +2663,8 @@ bool posToolClose(double stepDeg) {
 /* 轴字符定义：x y z */
 const char protoAxisChar[PROTO_AXIS_COUNT] = { 'x', 'y', 'z' };
 
-/* 轴对应的舵机索引：1=angle1(b 基座) 2=angle2(r 上臂) 3=angle3(c 下臂) */
-const int protoAxisServoIndex[PROTO_AXIS_COUNT] = { 1, 2, 3 };
-
-/* 轴对应的关节字母，用于串口提示：b r c */
+/* 轴对应的关节字母，用于串口提示：b r c。
+ * 轴 a 写入的就是 angle(a+1)，所以这里不再单独维护一张舵机索引表。 */
 const char protoAxisJoint[PROTO_AXIS_COUNT] = { 'b', 'r', 'c' };
 
 /* 把 x/X/y/Y/z/Z 转成轴下标 0..2，其它字符返回 -1 */
@@ -2871,11 +2839,6 @@ int moveJointStep(int dir, double stepSize) {
   return MOVE_OK;
 }
 
-/* 旧名字：同一实现，历史上按"方向轴"理解调用方的兼容入口。 */
-int moveAxisStep(int dir, double stepSize) {
-  return moveJointStep(dir, stepSize);
-}
-
 /* 定长函数共用的封装：走一步并忽略结果（到限位时保持原位） */
 static void stepFixed(int dir) {
   (void) moveJointStep(dir, 1.0);
@@ -2998,7 +2961,11 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 /* ---------- 编译开关 ---------- */
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 需与 constant_and_positions.cpp 中的同名开关保持一致。 */
-#define WEARM_JOY_DEBUG    0   /* 置 1 时每次移动都打印各轴与角度，调试用 */
+#define WEARM_JOY_DEBUG    0   /* 置 1：有动作或每 500ms 打印四路原始 ADC / 偏转量 / 角度。
+                                * 诊断"摇杆乱摆"用（见 p1.txt）。注意代价：Serial.print
+                                * 浮点会把格式化层（约 1.5~2KB）链进来，而三功能全开的
+                                * Uno 实编只剩几百字节 —— 开这个开关请同时关掉一个功能，
+                                * 例如 -DWEARM_ENABLE_DRAW=0，否则一定超 flash。 */
 #define WEARM_HAVE_BUTTONS 0   /* 置 1 时启用板载摇杆按键（本套件板上无按键） */
 
 #if WEARM_DEBUG_SERIAL
@@ -3019,19 +2986,34 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 
 /* ---------- 配置：摇杆刻度 ---------- */
 #define JOY_CENTER     512  /* ADC 中位（10 位 ADC 的一半） */
-#define JOY_DEADZONE   15   /* 中性区：偏转小于此值视为没推杆 */
+/* 中性区：偏转小于此值视为没推杆。
+ * 15 太窄：真实摇杆的 ADC 噪声峰峰常见 ±5~±15 个计数，电位器温漂几十个计数也正常，
+ * 两者一叠加就越过 15 ⇒ 手不碰摇杆时每一路都被当成"轻轻推着"，
+ * 而旧曲线又让"刚出死区"对应最高速度，于是表现成机械臂自己一小格一小格地抽。
+ * 放宽到 40（约满行程的 8%）把噪声与温漂一次性关在门外；
+ * 真正的位移量从 JOY_DEADZONE 起算（readAxisAmp 扣掉死区），所以最小动作仍然细腻。 */
+#define JOY_DEADZONE   40
 #define JOY_FULL_SCALE 500  /* 满偏参考幅度，用于把偏转量归一到 0~1 */
 
 /* ---------- 配置：中位自标定 ---------- */
-/* 真实手柄的机械中位很少正好是 ADC 的 512：实测常见偏 20~60 个计数。
- * 偏 20 就已经超过死区（15），于是"手不碰摇杆"时每一路都被当成轻微推杆，
- * 机械臂会持续缓慢地自己乱走 —— 这正是"无故乱动"的软件侧根因。
+/* 真实手柄的机械中位很少正好是 ADC 的 512：实测常见偏 20~60 个计数，开机后还会温漂。
  * 所以开机时（joystickSetup）把四路各平均若干次，把静态偏差记下来，
  * 之后所有读数都先扣掉这个偏差，中位判据仍然只需要和 512 比。
+ * 平均次数从 8 提到 32：8 次平均后残余噪声还有 ±2~±5，32 次降到 ±1 量级，
+ * 一次采样多花约 100µs，setup() 里四路合计 ~14ms，可以忽略。
  * 上限 JOY_CAL_MAX_OFF 用来兜底：开机时若有人手压着摇杆，偏差会远超此值，
  * 那就判定"这次标定不可信"，退回到标准中位 512（偏差记 0）。 */
-#define JOY_CAL_SAMPLES  8  /* 每路标定取多少次 ADC 求平均 */
-#define JOY_CAL_MAX_OFF 64  /* 允许的静态偏差上限（计数） */
+#define JOY_CAL_SAMPLES  32 /* 每路标定取多少次 ADC 求平均 */
+#define JOY_CAL_MAX_OFF 80  /* 允许的静态偏差上限（计数）；同时是运行期跟踪的行程上限 */
+
+/* 关节每格的保底角度：偏转比例缩放后小于此值就按此值走。
+ * 否则刚出死区的一格会是 1°/500 ≈ 0.002°，肉眼看不见、白等一个间隔。 */
+#define JOY_STEP_MIN_DEG 0.1
+
+/* 施密特迟滞：起控门槛 = JOY_DEADZONE + JOY_HYST */
+#define JOY_HYST 25
+/* 中位跟踪的最小间隔（ms），避免高速循环里一轮挪 1 个计数 */
+#define JOY_TRACK_MS 20
 
 /* ---------- 配置：时序 ---------- */
 #define JOY_BTN_DEBOUNCE_MS 30  /* 按键消抖窗口（本套件默认无按键，保留供扩展） */
@@ -3083,6 +3065,10 @@ static unsigned long lastStepTime[JIDX_COUNT] = { 0, 0, 0, 0 };
  * 只在这里保存，扣减发生在 readAxisAmp() 内部，所以下面所有
  * "raw > JOY_CENTER" 的方向判断、以及死区计算都无需改动。 */
 static int s_centerOff[4] = { 0, 0, 0, 0 };
+
+/* 轴状态跟踪：施密特迟滞起控状态 + 中位跟踪时间戳 */
+static bool          s_axisHot[JIDX_COUNT] = { false, false, false, false };
+static unsigned long s_trackMs[JIDX_COUNT] = { 0, 0, 0, 0 };
 
 #if WEARM_DEBUG_SERIAL
 static unsigned long lastBlockLogTime = 0;  /* 上次打印被挡提示的时刻（限流） */
@@ -3154,12 +3140,39 @@ static void joyCalibrateAxis(uint8_t pin) {
  * 之所以扣掉死区，是为了让"离中位越远转得越快"的调速曲线从 0 平滑起步，
  * 而不是刚出中位就直接按死区边界算满速。
  * 读数先扣掉开机自标定的静态偏差：*raw 交出去的也是扣过的值，
- * 于是下游 "raw > JOY_CENTER" 的方向判断照旧成立（校正后的中位就是 512）。 */
+ * 于是下游 "raw > JOY_CENTER" 的方向判断照旧成立（校正后的中位就是 512）。
+ *
+ * 【施密特迟滞】已经起控的轴用窄门槛 (40) 保持，静止的轴要跨过宽门槛 (40+25=65) 才起控。
+ * 这样 41~64 计数这段静态残余偏差既不会步进，也不会被当成推杆；
+ * 人手推杆必须先推过 65，之后只要不退回 40 以内就一直跟随。
+ *
+ * 【中位跟踪】只在"没起控"时做，且每 JOY_TRACK_MS 才挪 1 个计数（时间门控，
+ * 否则 20kHz 的主循环十几毫秒就能把几十个计数的温漂"追"成假中位）。
+ * 电位器温漂（开机 30 秒后几十个计数）会被自动吸收，不必重新上电标定；
+ * 人手推杆时 |d| ≥ 死区，跟踪立即停止。偏差总量仍被 JOY_CAL_MAX_OFF 夹住。 */
 static int readAxisAmp(uint8_t pin, int *raw) {
-  int v = analogRead(pin) - s_centerOff[pin - A0];
+  int idx = pin - A0;
+  int v = analogRead(pin) - s_centerOff[idx];
   if (raw != NULL) *raw = v;
   int d = v - JOY_CENTER;
   int a = (d >= 0) ? d : -d;
+  /* 施密特迟滞：已经起控的轴用窄门槛 (40) 保持，静止的轴要跨过宽门槛 (40+25=65) 才起控。
+   * 这样 41~64 计数这段静态残余偏差既不会步进，也不会被当成推杆；
+   * 人手推杆必须先推过 65，之后只要不退回 40 以内就一直跟随。 */
+  int gate = s_axisHot[idx] ? JOY_DEADZONE : (JOY_DEADZONE + JOY_HYST);
+  if (a < gate) {
+    /* 中位跟踪：只在"没起控"时做，且每 JOY_TRACK_MS 才挪 1 个计数（时间门控，
+     * 否则 20kHz 的主循环十几毫秒就能把几十个计数的温漂"追"成假中位）。 */
+    unsigned long now = millis();
+    if ((unsigned long)(now - s_trackMs[idx]) >= (unsigned long)JOY_TRACK_MS) {
+      s_trackMs[idx] = now;
+      int next = s_centerOff[idx] + ((d > 0) ? 1 : ((d < 0) ? -1 : 0));
+      if (next >= -JOY_CAL_MAX_OFF && next <= JOY_CAL_MAX_OFF) { s_centerOff[idx] = next; }
+    }
+    s_axisHot[idx] = false;
+    return 0;
+  }
+  s_axisHot[idx] = true;
   a -= JOY_DEADZONE;
   return (a > 0) ? a : 0;
 }
@@ -3222,30 +3235,12 @@ int joystickRead(void) {
   return st.dir;
 }
 
-/* 本硬件 4 个关节同时可用，不做模式切换，恒返回 PLANE。 */
-int joystickGetMode(void) {
-  return JOY_MODE_PLANE;
-}
+/* 本硬件 4 个关节同时可用，不做模式切换。 */
 
 /* ---------- 速度时间门控 ---------- */
 
-/* 计算本次允许移动的最小间隔（ms）。
- * 映射规则：偏转幅度越小越接近 minDelayMs（连续快走），
- * 满偏时接近 fullDelayMs（慢而稳，最安全）。 */
-static int speedIntervalMs(int mag) {
-  int minDelay = speed.minDelayMs;
-  int fullDelay = speed.fullDelayMs;
-  if (fullDelay <= minDelay) return minDelay;
-
-  /* 原来是把 ratio 夹到 [0,1]（两次浮点比较 + __cmpsf2/__gesf2 调用），
-   * 现在改成夹 mag 这个整数：ratio = mag / JOY_FULL_SCALE，
-   * ratio < 0 <=> mag < 0，ratio > 1 <=> mag > JOY_FULL_SCALE —— 逐条等价，
-   * 对整数 mag 来说浮点除法的舍入不会改变这两个判断的结果。 */
-  if (mag < 0) mag = 0;
-  else if (mag > JOY_FULL_SCALE) mag = JOY_FULL_SCALE;
-
-  return minDelay + (int)((double)mag / (double)JOY_FULL_SCALE * (double)(fullDelay - minDelay));
-}
+/* 步间间隔现在就是 speed.stepDelayMs 这个固定值，不再随偏转变化。
+ * 旧版偏转越大间隔越短（推得越狠走得越快）的动态调速已被移除。 */
 
 /* ---------- 末端舵机 (angle4 / f) ---------- */
 
@@ -3366,7 +3361,7 @@ void joystickLoop(void) {
     for (int i = 0; i < JIDX_COUNT; i++) {
       if (amp[i] <= 0) continue;
 
-      int interval = speedIntervalMs(amp[i]);
+      int interval = speed.stepDelayMs;
       if (now - lastStepTime[i] < (unsigned long)interval) continue;
 
       int raw = rawp[JOY_RAWSLOT(i)];
@@ -3395,10 +3390,19 @@ void joystickLoop(void) {
           logBlocked(F("[joy] blocked: tool at servo limit"));
         }
       } else {
-                /* Joint step: moveJointStep clamps to servoLimit and refreshes Pos.rec */
+                /* Joint step: the per-step angle is scaled by the deflection, exactly like
+         * toolStep() above.  The old version always stepped by speed.stepSize, so a
+         * 10% push and a 100% push moved the same amount per step and speed came only
+         * from the (then inverted) interval - the "harder I push the slower it goes"
+         * feel reported in p1.txt.  moveJointStep() clamps to servoLimit and
+         * refreshes Pos.rec. */
         int dirNeg = JOY_DIRNEG(i);
         int dir = (raw > JOY_CENTER) ? (dirNeg + 1) : dirNeg;
-        int res = moveJointStep(dir, speed.stepSize);
+        int ampNow = amp[i];
+        if (ampNow > JOY_FULL_SCALE) ampNow = JOY_FULL_SCALE;
+        double step = speed.stepSize * ((double)ampNow / (double)JOY_FULL_SCALE);
+        if (step < JOY_STEP_MIN_DEG) step = JOY_STEP_MIN_DEG;
+        int res = moveJointStep(dir, step);
         if (res == MOVE_OK) {
           moved = true;
         } else if (res == MOVE_AT_LIMIT) {
@@ -3413,12 +3417,24 @@ void joystickLoop(void) {
   }
 
 #if WEARM_JOY_DEBUG
-  if (moved) {
+  /* 打印条件：本轮有动作，或距上次打印已过 500ms（心跳）。
+   * 心跳那一条是排查"乱摆"的关键：p1.txt 第 2 步要看的是"摇杆松开时的原始 ADC"，
+   * 而静止状态恰好 moved == false —— 只在 moved 时打印的话，最该看的那种情况什么都看不到。
+   * 每路还额外打印扣掉死区后的偏转量 amp，用来确认自己有没有越过 JOY_DEADZONE。 */
+  static unsigned long lastJoyDbgMs = 0;
+  unsigned long dbgNow = millis();
+  if (moved || (unsigned long)(dbgNow - lastJoyDbgMs) >= 500UL) {
+    lastJoyDbgMs = dbgNow;
     Serial.print(F("[joy] raw A0..A3="));
     Serial.print(st.sx); Serial.print(',');
     Serial.print(st.sy); Serial.print(',');
     Serial.print(st.tx); Serial.print(',');
     Serial.print(st.ty);
+    Serial.print(F("  amp b/r/c/f="));
+    Serial.print(st.base);     Serial.print('/');
+    Serial.print(st.shoulder); Serial.print('/');
+    Serial.print(st.elbow);    Serial.print('/');
+    Serial.print(st.tool);
     Serial.print(F("  b=")); Serial.print(Pos.ser.angle1);
     Serial.print(F(" r="));  Serial.print(Pos.ser.angle2);
     Serial.print(F(" c="));  Serial.print(Pos.ser.angle3);
@@ -3960,9 +3976,10 @@ double pickPlaceApproachDz(void) {
  * 【轨迹是怎么走的】
  *   轨迹在笛卡尔空间定义（折线 = 顶点连线，曲线 = 向心 Catmull-Rom 样条）。
  *   每个采样点交给 move.h 的 moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，
- *   串口的 x/y/z 指令用的是同一个函数）：反解、速率限制、写入 Pos 与正解刷新
+ *   取放序列与绘图内部都走它）：反解、速率限制、写入 Pos 与正解刷新
  *   都在那里，本文件只决定"下一步走到哪个坐标"。
- *   （与串口角度指令、pick_place 同一约定：坐标永远等于角度的真实结果。）
+ *   （与 pick_place 同一约定：坐标永远等于角度的真实结果；串口 x/y/z 指令
+ *   按题目要求直接写关节角，不经过这里。）
  *
  *   速度规划用"按剩余距离刹车"的经典做法，不需要预先算速度表：
  *       v 允许的最大值 = min( DRAW_V_MAX, sqrt(2a·已走距离), 当前速度 + a·dt )
@@ -4076,15 +4093,35 @@ struct drawVertex {
 static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
   { -1.0,  0.0 }, {  1.0,  0.0 }
 };
+/* 字母 N：左下 -> 左上 -> 右下 -> 右上（两个竖 + 一道斜） */
+static const struct drawVertex SHAPE_N[4] PROGMEM = {
+  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
+};
+/* 三角形：左下 -> 右下 -> 顶点 -> 回到左下（最后一点与第一点重合，闭合） */
+static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
+  { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
+};
+/* 字母 Z：左上 -> 右上 -> 左下 -> 右下（上横 + 斜 + 下横） */
+static const struct drawVertex SHAPE_Z[4] PROGMEM = {
+  { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
+};
 /* 字母 V：左上 -> 底尖 -> 右上 */
 static const struct drawVertex SHAPE_V[3] PROGMEM = {
   { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
 };
 
 /* 任务名（下标即 DRAW_TASK_*）。
- * 本分支只有 4 个任务：原来的 字母N / 三角形 / 字母Z 连表一起删掉了。 */
+ * 7 个任务：5 个内置图形 + 2 个五点示教。
+ * 【恢复记录】字母N / 三角形 / 字母Z 曾在 v1.6.1 为省 flash 删掉过，
+ * 现按题目"同组同学所选图形不得完全相同"恢复；编号见 draw_control.h。 */
 static const char *const DRAW_TASK_NAME[DRAW_TASK_COUNT] = {
-  "直线", "字母V", "五点折线", "五点曲线"
+  "直线", "字母N", "三角形", "字母Z", "字母V", "五点折线", "五点曲线"
+};
+
+/* ASCII 任务短标签（下标即 DRAW_TASK_*），供串口回报当前图形模式用：
+ * 终端和 ESP8266 都按单字节比较，所以这里不能用中文任务名。 */
+static const char *const DRAW_TASK_TAG[DRAW_TASK_COUNT] = {
+  "LINE", "N", "TRI", "Z", "V", "POLY", "CURVE"
 };
 
 /* 阶段名（下标即 DRAW_PHASE_*） */
@@ -4202,6 +4239,9 @@ static int shapeTable(int task, const struct drawVertex **tbl)
 {
   switch (task) {
     case DRAW_TASK_LINE:     *tbl = SHAPE_LINE;     return 2;
+    case DRAW_TASK_N:        *tbl = SHAPE_N;        return 4;
+    case DRAW_TASK_TRIANGLE: *tbl = SHAPE_TRIANGLE; return 4;
+    case DRAW_TASK_Z:        *tbl = SHAPE_Z;        return 4;
     case DRAW_TASK_V:        *tbl = SHAPE_V;        return 3;
     default:                 *tbl = NULL;           return 0;
   }
@@ -4455,7 +4495,7 @@ static double applyDtSec(void)
 }
 
 /* 反解 (x,y,z) 并按策略写进 Pos —— 本文件所有"点位移"都走这里，实现则是 move.h 的
- * moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，串口 x/y/z 指令用同一个函数）。
+ * moveToPoint()（"移动到指定 x,y,z 坐标"的公共核心，取放序列与绘图共用）。
  *
  * 原来本文件自己展开过两份（严格版 tryApplyPoint / 夹取版 applyPointClamped），
  * 每份都要重算 maxDps×dtSec、逐轴比较或夹取；现在这些算式只存在于 moveToPoint()
@@ -4742,20 +4782,8 @@ static void beginLiftToReturn(void)
 
 /* ==================== 示教 ==================== */
 
-/* 示教点动一步的步进间隔：与摇杆模块的 speedIntervalMs() 同一条约定 ——
- * 轻微偏转用最短间隔（连续细走），满偏用最长间隔（慢而稳、最安全）。
- * 注意方向：**偏转越大间隔越长**（旧版写反了：满偏用最短间隔，等于"推得越狠冲得越快"）。 */
-static int jogIntervalMs(int amp)
-{
-  int fast = speed.minDelayMs;
-  int slow = speed.fullDelayMs;
-  if (fast < 1) fast = 1;
-  if (slow < fast) slow = fast;
-  int span = slow - fast;
-  if (amp < 0) amp = 0;
-  else if (amp > DRAW_JOG_CENTER) amp = DRAW_JOG_CENTER;
-  return fast + (int)(((long)span * (long)amp) / (long)DRAW_JOG_CENTER);
-}
+/* 示教点动一步的步进间隔：现在使用固定间隔 speed.stepDelayMs，不再随偏转变化。
+ * 旧版偏转越大间隔越短（推得越狠走得越快）的动态调速已被移除。 */
 
 /* 示教点动：读摇杆 -> 一路一路按各自的计时门控动一点笔尖（笛卡尔点动）。
  * 三路坐标（A0→x、A1→y、A3→z）用"工作区单位"的步长与间隔，轻微偏转走小步、
@@ -4777,7 +4805,7 @@ static void teachJogTick(void)
     /* 夹爪里夹着笔：示教点动不响应 A2（右摇杆的左右推），免得一推带歪笔尖 */
     if (i == 3) continue;
 #endif
-    int interval = jogIntervalMs(amp[i]);
+    int interval = speed.stepDelayMs;
     if (now - s_jogLastMs[i] < (unsigned long)interval) continue;
     s_jogLastMs[i] = now;
 
@@ -4921,6 +4949,13 @@ const char *drawTaskName(int task)
 {
   if (task < 0 || task >= DRAW_TASK_COUNT) return "未知";
   return DRAW_TASK_NAME[task];
+}
+
+/* ASCII 短标签，供串口"当前图形模式"提示使用（终端/ESP8266 按字节比较，不能用中文） */
+const char *drawTaskTag(int task)
+{
+  if (task < 0 || task >= DRAW_TASK_COUNT) return "?";
+  return DRAW_TASK_TAG[task];
 }
 
 int drawStartTask(void)
@@ -6107,15 +6142,15 @@ const char *buttonStateName(void) {
 // ===== serial_protocol.cpp =====
 /*
 // serial_protocol.cpp
-// Serial command protocol: fixed commands + Cartesian end effector targets
-// (x/y/z, ground frame: origin under the shoulder joint, x = initial facing
-// direction, z = up, right handed - see serial_protocol.h).
+// Serial command protocol: fixed commands + the three-servo synchronous angle
+// command (x/y/z in degrees: x = base, y = shoulder, z = elbow - see
+// serial_protocol.h).
 // Also hosts the start entry of the A/B/C pick-and-place sequences (while a
 // sequence runs this layer holds back every other motion command), the serial
 // twins N/R/P/M of the four physical buttons (implementation lives in
 // button_control.cpp) and the drawing commands F/D/G/E/Q/U/W plus the paper
 // calibration commands p/n/o (implementation lives in draw_control.cpp).
-// Handles character input, line buffering, command parsing and moves.
+// Handles character input, line buffering, command parsing and joint writes.
 */
 
 
@@ -6148,8 +6183,9 @@ static unsigned long s_lastCharMs = 0;
  * single out-of-line copy anyway, and the whole dispatcher only exists once
  * because protoHandleLine() has no caller outside this file. */
 static void protoFlushLine(void);
-static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen);
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
+static void protoApplyAngles(const double angles[3], uint8_t seen);
 static int protoSpeedStep(int delta);
 static int protoHandleDrawCalib(const char *line, char cmd);
 #define PROTO_FEATURE_PICK   0x01u
@@ -6349,7 +6385,25 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno XYZ x,y,z ! !P !B !D";
+static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
+
+/* 'F' (pick drawing task) answers "OK F=<tag>": the tag is a short ASCII name
+ * ("LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE") so a serial-only host -
+ * a PC terminal or the ESP8266 board - can see which drawing mode is armed.
+ * The tag itself comes from draw_control.cpp (drawTaskTag). */
+__attribute__((noinline))
+static void protoReplyTaskTag(const char *tag)
+{
+  protoPut('O');
+  protoPut('K');
+  protoPut(' ');
+  protoPut('F');
+  protoPut('=');
+  while (*tag != '\0') {
+    protoPut(*tag++);
+  }
+  protoPut('\n');
+}
 
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
@@ -6372,6 +6426,7 @@ static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno XYZ
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
 #define R_FEATURE() do { } while (0)
+#define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
 #endif
 
 /* ========== command class bitmaps ========== */
@@ -6586,7 +6641,7 @@ int protoHandleLine(const char *line)
     if (!protoRuntimeEnabled(feature)) s_runtimeFeatures |= feature;
     else s_runtimeFeatures &= (uint8_t)~feature;
     R_FEATURE();
-    return PROTO_RES_SPEED_LEVEL;
+    return PROTO_RES_FEATURE;
   }
   if (cmd == '!' && single) {
     R_FEATURE();
@@ -6644,41 +6699,17 @@ int protoHandleLine(const char *line)
 
   /* single character commands */
   if (single) {
-    /* k/K are pulled out of the switch below: 'k' is the only case above 'W',
-     * so the emitted jump table stays 40 entries wide instead of 60. */
-    if (cmd == PROTO_CMD_TOOL_OPEN_STEP || cmd == PROTO_CMD_TOOL_CLOSE_STEP) {
-      if (cmd == PROTO_CMD_TOOL_OPEN_STEP) {
-        posToolOpen(PROTO_TOOL_STEP_DEG);
-      } else {
-        posToolClose(PROTO_TOOL_STEP_DEG);
-      }
-      DEBUG_PRINT(F("[tool] angle4 -> "));
-      DEBUG_PRINTLN(Pos.ser.angle4);
-      R_OKN();
-      return PROTO_RES_TOOL_STEP;
-    }
-
-    /* '0' (home) and '1'..'3' (speed presets) sit far below the high end of the
-     * switch, so they are handled here: the emitted jump table stays 23 entries
-     * wide instead of 40. */
+    /* '0' is the only command below the 'O'..'W' range, so it is pulled out of
+     * the if chain: the chain then only pays for the comparisons it needs. */
     if (cmd == PROTO_CMD_BTN_HOME_ALT) {
       int result = buttonHandleCommand(cmd);
       protoReplyButtonResult(result);
       return result < 0 ? PROTO_RES_UNKNOWN : result;
     }
-    if (cmd >= PROTO_CMD_SPEED_SLOW && cmd <= PROTO_CMD_SPEED_FAST) {
-      /* '1','2','3' are SPEED_SLOW..SPEED_FAST in that order */
-      int level = cmd - PROTO_CMD_SPEED_SLOW;
-      adjustSpeed(level);
-      DEBUG_PRINT(F("[speed] serial cmd -> "));
-      DEBUG_PRINTLN(speedLevelName(level));
-      R_OK();
-      return PROTO_RES_SPEED_LEVEL;
-    }
 
     /* An if chain instead of a switch on purpose: the case labels span 'O'..'W',
-     * but '0' and '1' keep the table's low bound, so switch emits a 64 entry
-     * jump table while the chain only pays for the comparisons it needs.
+     * so switch would emit a 64 entry jump table while the chain only pays for
+     * the comparisons it needs.
      * Measured on the real AVR build: -78 bytes for this whole dispatcher. */
     if (cmd == PROTO_CMD_GRIPPER_OPEN) {
         posSetAngle4(servoLimit.maxF);
@@ -6740,7 +6771,12 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      if (result == PROTO_RES_BUSY) R_BUSY();
+      /* 'F' is answered with the shape that is now selected ("OK F=V") instead
+       * of a bare "OK": the operator (and the ESP8266 board) has no other way
+       * to tell which of the seven drawing tasks is armed. */
+      if (result == PROTO_RES_DRAW_TASK_SELECTED) {
+        protoReplyTaskTag(drawTaskTag(drawGetTask()));
+      } else if (result == PROTO_RES_BUSY) R_BUSY();
       else if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
       else if (result < 0) R_ERR();
       else R_OK();
@@ -6764,52 +6800,31 @@ int protoHandleLine(const char *line)
     return result;
   }
 
-  /* x/y/z: the Cartesian point the end effector must move to. The frame is the
-   * ground frame documented in serial_protocol.h (origin under the shoulder,
-   * x = initial facing direction, z = up, right handed). */
+  /* x/y/z: the three-servo synchronous angle command (exam task 1.3).
+   * x -> base servo (angle1 = b), y -> shoulder servo (angle2 = r),
+   * z -> elbow servo (angle3 = c). Every axis the line mentions is written in
+   * one go and the forward kinematics runs once afterwards, so one line is one
+   * synchronized pose change - the same convention the rest of the firmware
+   * uses (Pos.ser is the truth, Pos.rec is derived from it). */
   if (protoAxisIndexFromChar(cmd) >= 0) {
-    double coords[3];
+    double angles[3];
     uint8_t seen = 0;
 
-    if (!protoParseAxisLine(p, coords, &seen)) {
+    if (!protoParseAxisLine(p, angles, &seen)) {
       DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
       R_ERR();
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    /* Landing the parsed point is delegated to move.h's moveToPoint() — the very
-     * same "move to a given x,y,z" core the drawing module calls.
-     *
-     * Frame (serial_protocol.h): origin O = the foot of the perpendicular dropped
-     * from the shoulder joint to the ground, x+ = the direction the arm faces in
-     * its initial pose, z+ = straight up, right handed. The firmware's internal
-     * frame has the same axes and only differs by where z counts from: its origin
-     * sits on the shoulder joint, so z_internal = z_coordinate - WEARM_SHOULDER_HEIGHT.
-     * Below the ground plane does not exist: the whole line is rejected.
-     *
-     * MOVE_XYZ_NOW is the instant, unlimited strategy, which is what this command
-     * always was: a strict move — a target the arm cannot stand at is rejected with
-     * nothing written at all, so a rejected command never leaves the arm half way
-     * to a pose nobody asked for. An axis the line did not mention keeps the value
-     * it already had (moveToPoint() handles that from the seen mask). */
-    if ((seen & (uint8_t)(1u << 2)) != 0u) {
-      if (coords[2] < 0.0) {
-        R_REJ();
-        DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
-        return PROTO_RES_COORDS_REJECTED;
-      }
-      coords[2] -= WEARM_SHOULDER_HEIGHT;
-    }
-
-    if (moveToPoint(coords, seen, 0.0, 0.0, MOVE_XYZ_NOW) != MOVE_XYZ_OK) {
-      /* unreachable, or out of joint travel: nothing was changed at all */
-      R_REJ();
-      DEBUG_PRINTLN(F("[proto] target rejected, arm not moved"));
-      return PROTO_RES_COORDS_REJECTED;
-    }
+    /* Out of travel is clamped rather than rejected: the limits come from
+     * servoLimit (the one shared truth, also used by the joystick and the
+     * drawing module), so "x200" lands on that joint's travel maximum instead of
+     * turning the whole command into a no-op. A line naming no axis at all never
+     * gets this far - protoParseAxisLine rejects it. */
+    protoApplyAngles(angles, seen);
 
 #if WEARM_DEBUG_SERIAL
-    Serial.print(F("[proto] move -> b="));
+    Serial.print(F("[proto] sync angles b="));
     Serial.print(Pos.ser.angle1);
     Serial.print(F(" r="));
     Serial.print(Pos.ser.angle2);
@@ -6821,7 +6836,7 @@ int protoHandleLine(const char *line)
   }
 
   /* Not an axis letter, but it contains a comma or starts with '=': it looks
-   * like a coordinate command that was mistyped. Everything else is unknown. */
+   * like an angle command that was mistyped. Everything else is unknown. */
   {
     const char *scan = p;
     while (*scan != '\0' && *scan != ',') {
@@ -6837,14 +6852,13 @@ int protoHandleLine(const char *line)
   return PROTO_RES_BAD_SYNTAX;
 }
 
-/* ========== coordinate parsing ========== */
-/* Parse a coordinate command: group (',' group)*, group = [blank] axis letter
- * [blank] [optional '='] [blank] value. The parsed numbers are Cartesian
- * coordinates in the ground frame (see serial_protocol.h), x/y/z in the order
- * protoAxisIndexFromChar() returns them. The whole line must parse; an axis
- * given twice keeps its last value. Anything that does not match the grammar
- * returns false and touches nothing but coords/seen. */
-static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen)
+/* ========== angle parsing ========== */
+/* Parse an angle command: group (',' group)*, group = [blank] axis letter
+ * [blank] [optional '='] [blank] value. The parsed numbers are servo angles in
+ * degrees, x/y/z in the order protoAxisIndexFromChar() returns them. The whole
+ * line must parse; an axis given twice keeps its last value. Anything that does
+ * not match the grammar returns false and touches nothing but angles/seen. */
+static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
 {
   const char *p = s;
   int groups = 0;
@@ -6868,7 +6882,7 @@ static bool protoParseAxisLine(const char *s, double coords[3], uint8_t *seen)
     }
 
     /* 5) the value (must really start with a digit) */
-    if (!protoParseNumber(&p, &coords[axis])) return false;
+    if (!protoParseNumber(&p, &angles[axis])) return false;
 
     /* 6) record it (an axis given twice keeps the last value) */
     *seen |= (uint8_t)(1u << axis);
@@ -6935,6 +6949,30 @@ static bool protoParseNumber(const char **pp, double *out)
   *out = neg ? -value : value;
   *pp = p;
   return true;
+}
+
+/* ========== angle application ========== */
+/* Write the axes the line mentioned into the three joints and refresh the
+ * forward kinematics once. Axis a is joint a+1: angle1 = b (base), angle2 = r
+ * (shoulder), angle3 = c (elbow) - that is exactly the x/y/z mapping the exam
+ * asks for, and it is also why the three joints can be written through one
+ * pointer walk instead of a switch.
+ *
+ * clampServoAngles() is the same clamp every other writer uses (joystick,
+ * drawing jog, pick & place), so a value outside the mechanical travel snaps to
+ * the travel limit and the command is still an OK - the host sees the arm move
+ * to the nearest legal pose instead of getting an error it cannot act on. */
+static void protoApplyAngles(const double angles[3], uint8_t seen)
+{
+  for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
+    if ((seen & (uint8_t)(1u << a)) == 0u) continue;
+    (&Pos.ser.angle1)[a] = angles[a];
+  }
+
+  clampServoAngles(&Pos.ser);
+  if (!recFromServo(&Pos.rec, &Pos.ser)) {
+    DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
+  }
 }
 
 /* ========== drawing parameter calibration ========== */
@@ -7040,31 +7078,26 @@ void serialProtocolBegin(void)
   DEBUG_PRINTLN(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
   DEBUG_PRINTLN(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
   DEBUG_PRINTLN(F("[proto] H / L        speed up / down one level"));
-  DEBUG_PRINTLN(F("[proto] x,y,z        end effector point, ground frame, e.g. x20,y0,z40"));
-  DEBUG_PRINTLN(F("[proto]              O = under the shoulder joint, x = initial facing"));
-  DEBUG_PRINTLN(F("[proto]              direction, z = up (right handed), z >= 0"));
+  DEBUG_PRINTLN(F("[proto] x,y,z        three servo angles in degrees, e.g. x10,y30,z20"));
+  DEBUG_PRINTLN(F("[proto]              x = base (angle1), y = shoulder (angle2), z = elbow (angle3)"));
+  DEBUG_PRINTLN(F("[proto]              one line = one synchronized write, out-of-travel is clamped"));
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     double lo, hi;
     if (!protoAxisGetLimit(a, &lo, &hi)) continue;
-    if (a == 2) {
-      /* the internal limits count z from the shoulder joint; the command counts
-       * it from the ground, so shift the window by the shoulder height */
-      lo = 0.0;
-      hi += WEARM_SHOULDER_HEIGHT;
-    }
     /* the axis letter is printed through a one character C string so it is not
-     * taken for a code value */
+     * taken for a code value; the joint letter comes from the mapping table */
     DEBUG_PRINT(F("[proto] "));
     DEBUG_PRINT(protoAxisChar[a]);
-    DEBUG_PRINT(F(" = "));
+    DEBUG_PRINT(F(" = angle"));
+    DEBUG_PRINT((char)('1' + a));
+    DEBUG_PRINT(F(" ("));
+    DEBUG_PRINT(protoAxisJoint[a]);
+    DEBUG_PRINT(F(") travel "));
     DEBUG_PRINTF(lo, 1);
     DEBUG_PRINT(F(" .. "));
     DEBUG_PRINTF(hi, 1);
     DEBUG_PRINTLN();
   }
-  DEBUG_PRINTLN(F("[proto] shoulder height (ground -> shoulder): "));
-  DEBUG_PRINTF(WEARM_SHOULDER_HEIGHT, 1);
-  DEBUG_PRINTLN();
   DEBUG_PRINTLN(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
   DEBUG_PRINTLN(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
   DEBUG_PRINTLN(F("[proto] ================================"));
@@ -7094,12 +7127,13 @@ void serialProtocolBegin(void)
 //   被控量: Pos.ser.angle1..angle4（b / r / c / f 四个关节角）—— 摇杆直接加减它们。
 //   派生量: Pos.rec.x/y/z —— 由正运动学 recFromServo() 实时算出，用于显示与工作空间
 //           校验，不是"用户设定的目标"。
-//   坐标输入只有两个入口，最终都落到上面这组关节角上:
-//     1) 串口 x/y/z 指令（见下，一次到位）；
-//     2) 绘图轨迹的每个采样点（draw_control.cpp）。
-//   两者调用的是**同一个函数** move.cpp 的 moveToPoint()——"移动到指定 x,y,z 坐标"
-//   在全工程只有这一份实现（内部 getAngleEx() 反解 → 写 Pos.ser → recFromServo()
-//   刷新 Pos.rec），所以"坐标 == 角度的真实结果"这条不变量在每个入口上都成立。
+//   角度/坐标输入一共有两条路，最终都落到上面这组关节角上:
+//     1) 串口 x/y/z 指令（见下）——按题目要求**直接写三个舵机的角度**（不做逆解）；
+//     2) 绘图轨迹的每个采样点（draw_control.cpp）——在笛卡尔空间插值后反解。
+//   第 2 条调用 move.cpp 的 moveToPoint()——"移动到指定 x,y,z 坐标"在全工程只有
+//   这一份实现（内部 getAngleEx() 反解 → 写 Pos.ser → recFromServo() 刷新 Pos.rec）；
+//   两条路都以 Pos.ser 为唯一真值、都做一次正解刷新，所以"坐标 == 角度的真实结果"
+//   这条不变量在每个入口上都成立。
 //   （v1.0.0 那种"把坐标当目标直接控制"的方式已废弃；坐标入口一律是**严格移动**：
 //     解不出来或超出关节速率上限的点整条拒绝、一个字节都不写，绝不会半路停在
 //     没人要的姿态上。旧坐标控制的代码已备份到工作区外。）
@@ -7118,18 +7152,16 @@ void serialProtocolBegin(void)
 //     发 S             爪子关闭（angle4 走到 f 行程下限）
 //     发 H             整体运行速度提升一档
 //     发 L             整体运行速度降低一档
-//     发 x坐标,y坐标,z坐标   末端**空间直角坐标**（例: x20,y0,z40），不是关节角度：
-//                      固件把这行交给 move.h 的 moveToPoint()（与绘图轨迹用的是同一个
-//                      核心）反解出 b/r/c 三个关节角并一次到位，夹爪角 f 保持不变；
-//                      可只写其中一部分（如 y10），没写到的轴沿用当前坐标。
-//                      原点 = 过肩关节的地面垂足，x+ 面朝方向、z+ 向上；
-//                      z 是离地高度，负值直接 REJECTED。
-//                      解不出来或超出关节行程的点整条拒绝（REJECTED），一个字节都不写。
-//                      【破坏性变更】v1.0.0 的 x/y/z 是"三个关节角度"，
-//                      同样一条 x10,y30,z20 现在表示一个坐标点。
+//     发 x角度,y角度,z角度   三个舵机的**角度**（例: x10,y30,z20），不做逆解：
+//                      x -> 基座 b=angle1、y -> 上臂 r=angle2、z -> 下臂 c=angle3；
+//                      一行里写到的轴在同一次正解刷新里同步写入，可只写其中一部分
+//                      （如 y30），没写到的关节保持不动；超出机械行程按 servoLimit
+//                      夹取（x200 最终写 180），不会因为数值大小被拒。
+//                      【破坏性变更】v1.3.0~v1.6.3 的 x/y/z 是"末端空间直角坐标"，
+//                      同样一条 x10,y30,z20 当时表示一个坐标点；老实现完整备份在
+//                      分支 backup/xyz-cartesian（= tag v1.6.3）与 dist/ 压缩包里。
 //     发 A / B / C     自动取放：夹起物体 A/B/C 放到各自的放置点（详见 pick_place.h）
-//                      序列执行期间摇杆与其它动作指令让位，只有 H/L/1/2/3 调速仍生效
-//                      （旧的 '1'/'2'/'3' 调速与 k/K 末端开合仍兼容）
+//                      序列执行期间摇杆与其它动作指令让位，只有 H/L 调速仍生效
 //     发 N / R / P / M 四个物理按键的等价命令（详见 button_control.h）：
 //                      N = 按键1 循环执行，R = 按键2 录制开/关，
 //                      P = 按键3 播放（若录制还没结束，P 会先帮你了结录制再播放），
@@ -7152,8 +7184,9 @@ void serialProtocolBegin(void)
 //
 //   绘图（铅笔固定在末端夹具上，详见 draw_control.h；实现只有 draw_control.cpp 一个文件。
 //   每个采样点都交给 move.h 的 moveToPoint()：反解、关节速率限制、写 Pos 与正解刷新都在
-//   那里，与上面 x/y/z 指令共用同一份实现，draw_control.cpp 只决定"下一步走到哪个坐标"）:
-//     发 F             切换绘制任务：直线 -> 字母V -> 五点折线 -> 五点曲线
+//   那里——注意串口的 x/y/z 指令不经过它（那条路直接写关节角），draw_control.cpp 只负责
+//   决定"下一步走到哪个坐标"）:
+//     发 F             切换绘制任务：直线 -> 字母N -> 三角形 -> 字母Z -> 字母V -> 五点折线 -> 五点曲线 -> 直线
 //     发 D             开始绘制（内置图形直接画；五点折线/五点曲线先进入五点示教）
 //     发 G / E         示教中记录 / 撤销一个示教点（等价于示教时按按键1 / 按键2）
 //     发 Q / U / W     暂停 / 继续 / 取消（等价于绘制时按按键1 / 按键2 / 按键3）
@@ -7218,7 +7251,8 @@ void serialProtocolBegin(void)
 //     SPEED_SLOW   慢速 (小步长 + 长间隔 ≈ 0.5°/步，精细操作)
 //     SPEED_NORMAL 中速 (默认，≈ 1°/步)
 //     SPEED_FAST   快速 (大步长 + 短间隔 ≈ 2°/步)
-//   或 setSpeed(stepSize, minDelayMs, fullDelayMs) 自定义（stepSize 单位现在是"度"）。
+//   或 setSpeed(stepSize, stepDelayMs) 自定义（stepSize 单位是"度"，
+//   stepDelayMs 是每个档位的固定间隔）。
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
 

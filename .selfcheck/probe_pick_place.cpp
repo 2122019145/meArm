@@ -259,9 +259,9 @@ int main(void) {
   rBusy = protoHandleLine("x45");
   snprintf(d, sizeof(d), "rc=%d", rBusy);
   check("忙时 x45 返回 PROTO_RES_BUSY", rBusy == PROTO_RES_BUSY, d);
-  rBusy = protoHandleLine("k");
+  rBusy = protoHandleLine("A");
   snprintf(d, sizeof(d), "rc=%d", rBusy);
-  check("忙时 k 返回 PROTO_RES_BUSY", rBusy == PROTO_RES_BUSY, d);
+  check("忙时 A（另起一段序列）返回 PROTO_RES_BUSY", rBusy == PROTO_RES_BUSY, d);
   check("被拒绝的指令一个字节都没改",
         sameSer(&serBefore, &Pos.ser) && sameRec(&recBefore, &Pos.rec),
         "Pos.ser 与 Pos.rec 均未变");

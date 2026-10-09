@@ -35,7 +35,11 @@
 /* 置 1: 打开调试串口输出（波特率由 serial_protocol 模块初始化）。
  * 需与 constant_and_positions.cpp 中的同名开关保持一致。 */
 #include "weArm_config.h"
-#define WEARM_JOY_DEBUG    0   /* 置 1 时每次移动都打印各轴与角度，调试用 */
+#define WEARM_JOY_DEBUG    0   /* 置 1：有动作或每 500ms 打印四路原始 ADC / 偏转量 / 角度。
+                                * 诊断"摇杆乱摆"用（见 p1.txt）。注意代价：Serial.print
+                                * 浮点会把格式化层（约 1.5~2KB）链进来，而三功能全开的
+                                * Uno 实编只剩几百字节 —— 开这个开关请同时关掉一个功能，
+                                * 例如 -DWEARM_ENABLE_DRAW=0，否则一定超 flash。 */
 #define WEARM_HAVE_BUTTONS 0   /* 置 1 时启用板载摇杆按键（本套件板上无按键） */
 
 #if WEARM_DEBUG_SERIAL
@@ -56,19 +60,34 @@
 
 /* ---------- 配置：摇杆刻度 ---------- */
 #define JOY_CENTER     512  /* ADC 中位（10 位 ADC 的一半） */
-#define JOY_DEADZONE   15   /* 中性区：偏转小于此值视为没推杆 */
+/* 中性区：偏转小于此值视为没推杆。
+ * 15 太窄：真实摇杆的 ADC 噪声峰峰常见 ±5~±15 个计数，电位器温漂几十个计数也正常，
+ * 两者一叠加就越过 15 ⇒ 手不碰摇杆时每一路都被当成"轻轻推着"，
+ * 而旧曲线又让"刚出死区"对应最高速度，于是表现成机械臂自己一小格一小格地抽。
+ * 放宽到 40（约满行程的 8%）把噪声与温漂一次性关在门外；
+ * 真正的位移量从 JOY_DEADZONE 起算（readAxisAmp 扣掉死区），所以最小动作仍然细腻。 */
+#define JOY_DEADZONE   40
 #define JOY_FULL_SCALE 500  /* 满偏参考幅度，用于把偏转量归一到 0~1 */
 
 /* ---------- 配置：中位自标定 ---------- */
-/* 真实手柄的机械中位很少正好是 ADC 的 512：实测常见偏 20~60 个计数。
- * 偏 20 就已经超过死区（15），于是"手不碰摇杆"时每一路都被当成轻微推杆，
- * 机械臂会持续缓慢地自己乱走 —— 这正是"无故乱动"的软件侧根因。
+/* 真实手柄的机械中位很少正好是 ADC 的 512：实测常见偏 20~60 个计数，开机后还会温漂。
  * 所以开机时（joystickSetup）把四路各平均若干次，把静态偏差记下来，
  * 之后所有读数都先扣掉这个偏差，中位判据仍然只需要和 512 比。
+ * 平均次数从 8 提到 32：8 次平均后残余噪声还有 ±2~±5，32 次降到 ±1 量级，
+ * 一次采样多花约 100µs，setup() 里四路合计 ~14ms，可以忽略。
  * 上限 JOY_CAL_MAX_OFF 用来兜底：开机时若有人手压着摇杆，偏差会远超此值，
  * 那就判定"这次标定不可信"，退回到标准中位 512（偏差记 0）。 */
-#define JOY_CAL_SAMPLES  8  /* 每路标定取多少次 ADC 求平均 */
-#define JOY_CAL_MAX_OFF 64  /* 允许的静态偏差上限（计数） */
+#define JOY_CAL_SAMPLES  32 /* 每路标定取多少次 ADC 求平均 */
+#define JOY_CAL_MAX_OFF 80  /* 允许的静态偏差上限（计数）；同时是运行期跟踪的行程上限 */
+
+/* 关节每格的保底角度：偏转比例缩放后小于此值就按此值走。
+ * 否则刚出死区的一格会是 1°/500 ≈ 0.002°，肉眼看不见、白等一个间隔。 */
+#define JOY_STEP_MIN_DEG 0.1
+
+/* 施密特迟滞：起控门槛 = JOY_DEADZONE + JOY_HYST */
+#define JOY_HYST 25
+/* 中位跟踪的最小间隔（ms），避免高速循环里一轮挪 1 个计数 */
+#define JOY_TRACK_MS 20
 
 /* ---------- 配置：时序 ---------- */
 #define JOY_BTN_DEBOUNCE_MS 30  /* 按键消抖窗口（本套件默认无按键，保留供扩展） */
@@ -120,6 +139,10 @@ static unsigned long lastStepTime[JIDX_COUNT] = { 0, 0, 0, 0 };
  * 只在这里保存，扣减发生在 readAxisAmp() 内部，所以下面所有
  * "raw > JOY_CENTER" 的方向判断、以及死区计算都无需改动。 */
 static int s_centerOff[4] = { 0, 0, 0, 0 };
+
+/* 轴状态跟踪：施密特迟滞起控状态 + 中位跟踪时间戳 */
+static bool          s_axisHot[JIDX_COUNT] = { false, false, false, false };
+static unsigned long s_trackMs[JIDX_COUNT] = { 0, 0, 0, 0 };
 
 #if WEARM_DEBUG_SERIAL
 static unsigned long lastBlockLogTime = 0;  /* 上次打印被挡提示的时刻（限流） */
@@ -191,12 +214,39 @@ static void joyCalibrateAxis(uint8_t pin) {
  * 之所以扣掉死区，是为了让"离中位越远转得越快"的调速曲线从 0 平滑起步，
  * 而不是刚出中位就直接按死区边界算满速。
  * 读数先扣掉开机自标定的静态偏差：*raw 交出去的也是扣过的值，
- * 于是下游 "raw > JOY_CENTER" 的方向判断照旧成立（校正后的中位就是 512）。 */
+ * 于是下游 "raw > JOY_CENTER" 的方向判断照旧成立（校正后的中位就是 512）。
+ *
+ * 【施密特迟滞】已经起控的轴用窄门槛 (40) 保持，静止的轴要跨过宽门槛 (40+25=65) 才起控。
+ * 这样 41~64 计数这段静态残余偏差既不会步进，也不会被当成推杆；
+ * 人手推杆必须先推过 65，之后只要不退回 40 以内就一直跟随。
+ *
+ * 【中位跟踪】只在"没起控"时做，且每 JOY_TRACK_MS 才挪 1 个计数（时间门控，
+ * 否则 20kHz 的主循环十几毫秒就能把几十个计数的温漂"追"成假中位）。
+ * 电位器温漂（开机 30 秒后几十个计数）会被自动吸收，不必重新上电标定；
+ * 人手推杆时 |d| ≥ 死区，跟踪立即停止。偏差总量仍被 JOY_CAL_MAX_OFF 夹住。 */
 static int readAxisAmp(uint8_t pin, int *raw) {
-  int v = analogRead(pin) - s_centerOff[pin - A0];
+  int idx = pin - A0;
+  int v = analogRead(pin) - s_centerOff[idx];
   if (raw != NULL) *raw = v;
   int d = v - JOY_CENTER;
   int a = (d >= 0) ? d : -d;
+  /* 施密特迟滞：已经起控的轴用窄门槛 (40) 保持，静止的轴要跨过宽门槛 (40+25=65) 才起控。
+   * 这样 41~64 计数这段静态残余偏差既不会步进，也不会被当成推杆；
+   * 人手推杆必须先推过 65，之后只要不退回 40 以内就一直跟随。 */
+  int gate = s_axisHot[idx] ? JOY_DEADZONE : (JOY_DEADZONE + JOY_HYST);
+  if (a < gate) {
+    /* 中位跟踪：只在"没起控"时做，且每 JOY_TRACK_MS 才挪 1 个计数（时间门控，
+     * 否则 20kHz 的主循环十几毫秒就能把几十个计数的温漂"追"成假中位）。 */
+    unsigned long now = millis();
+    if ((unsigned long)(now - s_trackMs[idx]) >= (unsigned long)JOY_TRACK_MS) {
+      s_trackMs[idx] = now;
+      int next = s_centerOff[idx] + ((d > 0) ? 1 : ((d < 0) ? -1 : 0));
+      if (next >= -JOY_CAL_MAX_OFF && next <= JOY_CAL_MAX_OFF) { s_centerOff[idx] = next; }
+    }
+    s_axisHot[idx] = false;
+    return 0;
+  }
+  s_axisHot[idx] = true;
   a -= JOY_DEADZONE;
   return (a > 0) ? a : 0;
 }
@@ -259,30 +309,12 @@ int joystickRead(void) {
   return st.dir;
 }
 
-/* 本硬件 4 个关节同时可用，不做模式切换，恒返回 PLANE。 */
-int joystickGetMode(void) {
-  return JOY_MODE_PLANE;
-}
+/* 本硬件 4 个关节同时可用，不做模式切换。 */
 
 /* ---------- 速度时间门控 ---------- */
 
-/* 计算本次允许移动的最小间隔（ms）。
- * 映射规则：偏转幅度越小越接近 minDelayMs（连续快走），
- * 满偏时接近 fullDelayMs（慢而稳，最安全）。 */
-static int speedIntervalMs(int mag) {
-  int minDelay = speed.minDelayMs;
-  int fullDelay = speed.fullDelayMs;
-  if (fullDelay <= minDelay) return minDelay;
-
-  /* 原来是把 ratio 夹到 [0,1]（两次浮点比较 + __cmpsf2/__gesf2 调用），
-   * 现在改成夹 mag 这个整数：ratio = mag / JOY_FULL_SCALE，
-   * ratio < 0 <=> mag < 0，ratio > 1 <=> mag > JOY_FULL_SCALE —— 逐条等价，
-   * 对整数 mag 来说浮点除法的舍入不会改变这两个判断的结果。 */
-  if (mag < 0) mag = 0;
-  else if (mag > JOY_FULL_SCALE) mag = JOY_FULL_SCALE;
-
-  return minDelay + (int)((double)mag / (double)JOY_FULL_SCALE * (double)(fullDelay - minDelay));
-}
+/* 步间间隔现在就是 speed.stepDelayMs 这个固定值，不再随偏转变化。
+ * 旧版偏转越大间隔越短（推得越狠走得越快）的动态调速已被移除。 */
 
 /* ---------- 末端舵机 (angle4 / f) ---------- */
 
@@ -403,7 +435,7 @@ void joystickLoop(void) {
     for (int i = 0; i < JIDX_COUNT; i++) {
       if (amp[i] <= 0) continue;
 
-      int interval = speedIntervalMs(amp[i]);
+      int interval = speed.stepDelayMs;
       if (now - lastStepTime[i] < (unsigned long)interval) continue;
 
       int raw = rawp[JOY_RAWSLOT(i)];
@@ -432,10 +464,19 @@ void joystickLoop(void) {
           logBlocked(F("[joy] blocked: tool at servo limit"));
         }
       } else {
-                /* Joint step: moveJointStep clamps to servoLimit and refreshes Pos.rec */
+                /* Joint step: the per-step angle is scaled by the deflection, exactly like
+         * toolStep() above.  The old version always stepped by speed.stepSize, so a
+         * 10% push and a 100% push moved the same amount per step and speed came only
+         * from the (then inverted) interval - the "harder I push the slower it goes"
+         * feel reported in p1.txt.  moveJointStep() clamps to servoLimit and
+         * refreshes Pos.rec. */
         int dirNeg = JOY_DIRNEG(i);
         int dir = (raw > JOY_CENTER) ? (dirNeg + 1) : dirNeg;
-        int res = moveJointStep(dir, speed.stepSize);
+        int ampNow = amp[i];
+        if (ampNow > JOY_FULL_SCALE) ampNow = JOY_FULL_SCALE;
+        double step = speed.stepSize * ((double)ampNow / (double)JOY_FULL_SCALE);
+        if (step < JOY_STEP_MIN_DEG) step = JOY_STEP_MIN_DEG;
+        int res = moveJointStep(dir, step);
         if (res == MOVE_OK) {
           moved = true;
         } else if (res == MOVE_AT_LIMIT) {
@@ -450,12 +491,24 @@ void joystickLoop(void) {
   }
 
 #if WEARM_JOY_DEBUG
-  if (moved) {
+  /* 打印条件：本轮有动作，或距上次打印已过 500ms（心跳）。
+   * 心跳那一条是排查"乱摆"的关键：p1.txt 第 2 步要看的是"摇杆松开时的原始 ADC"，
+   * 而静止状态恰好 moved == false —— 只在 moved 时打印的话，最该看的那种情况什么都看不到。
+   * 每路还额外打印扣掉死区后的偏转量 amp，用来确认自己有没有越过 JOY_DEADZONE。 */
+  static unsigned long lastJoyDbgMs = 0;
+  unsigned long dbgNow = millis();
+  if (moved || (unsigned long)(dbgNow - lastJoyDbgMs) >= 500UL) {
+    lastJoyDbgMs = dbgNow;
     Serial.print(F("[joy] raw A0..A3="));
     Serial.print(st.sx); Serial.print(',');
     Serial.print(st.sy); Serial.print(',');
     Serial.print(st.tx); Serial.print(',');
     Serial.print(st.ty);
+    Serial.print(F("  amp b/r/c/f="));
+    Serial.print(st.base);     Serial.print('/');
+    Serial.print(st.shoulder); Serial.print('/');
+    Serial.print(st.elbow);    Serial.print('/');
+    Serial.print(st.tool);
     Serial.print(F("  b=")); Serial.print(Pos.ser.angle1);
     Serial.print(F(" r="));  Serial.print(Pos.ser.angle2);
     Serial.print(F(" c="));  Serial.print(Pos.ser.angle3);

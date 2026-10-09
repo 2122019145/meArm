@@ -185,8 +185,8 @@ int main(void) {
   {
     resetInputs(); posInit();
     struct Joints j0 = snap();
-    /* JOY_DEADZONE 是 joystick_control.cpp 内部宏(=15)，探针用等价值 */
-    const int DZ = 15;
+    /* JOY_DEADZONE 是 joystick_control.cpp 内部宏(=40，v1.6.4 起；旧版 15)，探针用等价值 */
+    const int DZ = 40;
     g_mockAnalog[MOCK_AX] = 512 + DZ;                /* 刚好在死区边界 */
     g_mockAnalog[MOCK_AY] = 512 - DZ;
     g_mockAnalog[MOCK_TX] = 512 + DZ;
@@ -198,6 +198,35 @@ int main(void) {
     check("死区内的偏转不驱动任何关节",
           fabs(j1.b - j0.b) < 1e-9 && fabs(j1.r - j0.r) < 1e-9 &&
           fabs(j1.c - j0.c) < 1e-9 && fabs(j1.f - j0.f) < 1e-9, buf);
+
+    /* 新增：施密特迟滞起控门槛测试（41..64 计数段既不被中位跟踪吸收，也不会步进）
+     * 【必须先清掉上一段留下的状态】迟滞是"锁存"而不是"瞬时判据"：
+     * 上一段把摇杆推过 65 后 s_axisHot[] 已经是 true，门槛降到 40，此时再给 +50
+     * 就会被当成推杆；另外运行期中位跟踪还可能留下 ±20 计数级别的偏移，
+     * 让 +50 实际变成 +70。所以先回中、重新标定、再跑两轮把锁存清干净。 */
+    resetInputs(); posInit();
+    joystickSetup();   /* 四路都在 512：s_centerOff ≈ 0，抵消上一段的跟踪偏移 */
+    runLoop(2, 20);    /* |d| = 0 < 40 ⇒ 四路 s_axisHot 全部落回 false */
+    j0 = snap();
+    /* JOY_HYST = 25 */
+    /* 起控门槛 = 65 */
+    g_mockAnalog[MOCK_AX] = 512 + 50;  /* 落在死区 40 与起控门槛 65 之间 */
+    g_mockAnalog[MOCK_AY] = 512 + 50;
+    g_mockAnalog[MOCK_TX] = 512 + 50;
+    g_mockAnalog[MOCK_TY] = 512 + 50;
+    runLoop(200, 20);  /* 连续 200 轮，四个关节必须一动不动 */
+    struct Joints j2 = snap();
+    snprintf(buf, sizeof(buf), "死区与起控门槛之间(50计数) Δb=%.4f Δr=%.4f Δc=%.4f Δf=%.4f",
+             j2.b - j0.b, j2.r - j0.r, j2.c - j0.c, j2.f - j0.f);
+    check("施密特迟滞：死区与起控门槛之间的偏转不驱动任何关节",
+          fabs(j2.b - j0.b) < 1e-9 && fabs(j2.r - j0.r) < 1e-9 &&
+          fabs(j2.c - j0.c) < 1e-9 && fabs(j2.f - j0.f) < 1e-9, buf);
+
+    /* 接下来把该路设回 512 并多跑几十轮让中位回到中心 */
+    resetInputs();
+    g_mockMillis += 200 * 20;  /* 跳过中位跟踪时间 */
+    joystickLoop();  /* 让中位跟踪学掉这 50 个计数 */
+    runLoop(80, 20);  /* 再跑 80 轮让中位完全回到中心 */
   }
 
   printf("=== 6) 调速档位影响转角速度（同起点比较）===\n");
@@ -280,48 +309,48 @@ int main(void) {
 
   printf("=== 9) 摇杆中位自标定（修「无故乱动」）===\n");
   {
-    /* 9a) 机械中位偏 +40 计数（远死区 15）：标定后静止不动 */
+    /* 9a) 机械中位偏 +70 计数（超过死区 40、但在标定上限 80 内）：标定后静止不动 */
     adjustSpeed(SPEED_NORMAL);
     resetInputs();
-    g_mockAnalog[MOCK_AX] = 552;   /* 四路都偏 +40，模拟摇杆机械中位不在 512 */
-    g_mockAnalog[MOCK_AY] = 552;
-    g_mockAnalog[MOCK_TX] = 552;
-    g_mockAnalog[MOCK_TY] = 552;
+    g_mockAnalog[MOCK_AX] = 582;   /* 四路都偏 +70，模拟摇杆机械中位不在 512 */
+    g_mockAnalog[MOCK_AY] = 582;
+    g_mockAnalog[MOCK_TX] = 582;
+    g_mockAnalog[MOCK_TY] = 582;
     joystickSetup();               /* 自标定在这里采样 */
     posInit();
     struct Joints jc = snap();
-    runLoop(30, 30);               /* 静止握杆 900ms：旧版会持续步进 */
-    snprintf(buf, sizeof(buf), "偏 +40 静止 30 轮: b %.2f->%.2f r %.2f->%.2f c %.2f->%.2f f %.2f->%.2f",
+    runLoop(30, 40);               /* 静止握杆 1200ms：新版固定 40ms 间隔 */
+    snprintf(buf, sizeof(buf), "偏 +70 静止 30 轮: b %.2f->%.2f r %.2f->%.2f c %.2f->%.2f f %.2f->%.2f",
              jc.b, Pos.ser.angle1, jc.r, Pos.ser.angle2, jc.c, Pos.ser.angle3, jc.f, Pos.ser.angle4);
-    check("中位偏 +40：标定后静止不动（旧版会一直乱走）",
+    check("中位偏 +70：标定后静止不动（旧版会一直乱走）",
           fabs(Pos.ser.angle1 - jc.b) < 1e-9 && fabs(Pos.ser.angle2 - jc.r) < 1e-9 &&
           fabs(Pos.ser.angle3 - jc.c) < 1e-9 && fabs(Pos.ser.angle4 - jc.f) < 1e-9, buf);
 
     /* 9b) 同一个偏置下真正推杆：仍然按"越过 512"判方向 */
     resetInputs();
-    g_mockAnalog[MOCK_AX] = 552;   /* 保持偏置，让扣偏差后为 0 */
-    g_mockAnalog[MOCK_AY] = 552;
-    g_mockAnalog[MOCK_TX] = 552;
-    g_mockAnalog[MOCK_TY] = 552;
+    g_mockAnalog[MOCK_AX] = 582;   /* 保持偏置，让扣偏差后为 0 */
+    g_mockAnalog[MOCK_AY] = 582;
+    g_mockAnalog[MOCK_TX] = 582;
+    g_mockAnalog[MOCK_TY] = 582;
     joystickSetup();
     posInit();
     jc = snap();
-    g_mockAnalog[MOCK_AX] = 552 + 300;   /* 在偏置之上右推 300 */
+    g_mockAnalog[MOCK_AX] = 582 + 300;   /* 在偏置之上右推 300 */
     runLoop(6, 30);
-    snprintf(buf, sizeof(buf), "偏置 +40 之上右推 300: b %.2f->%.2f", jc.b, Pos.ser.angle1);
+    snprintf(buf, sizeof(buf), "偏置 +70 之上右推 300: b %.2f->%.2f", jc.b, Pos.ser.angle1);
     check("标定只扣偏差、不改方向判定（右推仍使 b 增大）",
           Pos.ser.angle1 > jc.b && onlyChanged(jc, snap(), 0), buf);
 
-    /* 9c) 偏置超过 JOY_CAL_MAX_OFF（64）视为"开机手压着摇杆"：偏差按 0 处理 */
+    /* 9c) 偏置超过 JOY_CAL_MAX_OFF（80）视为"开机手压着摇杆"：偏差按 0 处理 */
     resetInputs();
-    g_mockAnalog[MOCK_AX] = 512 + 100;   /* 偏 +100 > 64 */
+    g_mockAnalog[MOCK_AX] = 512 + 100;   /* 偏 +100 > 80 */
     joystickSetup();
     posInit();
     jc = snap();
-    runLoop(30, 30);               /* 不推杆，但偏置没被采纳 => 仍被当成推杆 */
+    runLoop(30, 40);               /* 不推杆，但偏置没被采纳 => 仍被当成推杆 */
     snprintf(buf, sizeof(buf), "偏 +100 静止: b %.2f->%.2f（期望被当成推杆而离开起点）",
              jc.b, Pos.ser.angle1);
-    check("偏置 >64 不采纳（防开机手压摇杆时把中位学歪）",
+    check("偏置 >80 不采纳（防开机手压摇杆时把中位学歪）",
           fabs(Pos.ser.angle1 - jc.b) > 1e-9, buf);
 
     /* 9d) 回到标准 512 中位：标定结果必须是 0，行为与历史版本一致 */
@@ -329,9 +358,49 @@ int main(void) {
     joystickSetup();
     posInit();
     jc = snap();
-    runLoop(30, 30);
+    runLoop(30, 40);
     snprintf(buf, sizeof(buf), "标准 512 中位静止: b %.2f->%.2f", jc.b, Pos.ser.angle1);
     check("标准 512 中位：标定后静止不动", fabs(Pos.ser.angle1 - jc.b) < 1e-9, buf);
+  }
+
+  printf("=== 10) 摇杆手感与漂移回归（v1.6.4：步长仍按偏转缩放 + 温漂自吸收，固定 40ms 间隔）===\n");
+  {
+    /* 10a) 同起点、同轮数、同毫秒：大幅偏转的位移必须大于小幅偏转。
+     *      步长仍按偏转缩放，所以大幅偏转产生更大位移。偏转必须 > 起控门槛 65 */
+    adjustSpeed(SPEED_NORMAL);
+    resetInputs(); posInit();
+    double b0 = Pos.ser.angle1;
+    g_mockAnalog[MOCK_AX] = 512 + 70;      /* 小幅偏转（必须 > 起控门槛 65） */
+    runLoop(24, 40);
+    double smallDb = Pos.ser.angle1 - b0;
+
+    resetInputs(); posInit();
+    b0 = Pos.ser.angle1;
+    g_mockAnalog[MOCK_AX] = 512 + 420;      /* 大幅偏转 */
+    runLoop(24, 40);
+    double bigDb = Pos.ser.angle1 - b0;
+
+    snprintf(buf, sizeof(buf), "小幅(+70) Δb=%.2f 度  大幅(+420) Δb=%.2f 度", smallDb, bigDb);
+    check("同样时间：大幅偏转位移 > 小幅偏转位移（步长按偏转缩放，起控门槛65）",
+          bigDb > smallDb && smallDb > 0, buf);
+
+    /* 10b) 中位缓慢漂移：输入每轮只挪 1 个计数，运行期中位跟踪应当把它全部吸收，
+     *      全程关节一动不动（老版本没有跟踪，一旦漂过死区就开始一格格挪）。 */
+    resetInputs();
+    joystickSetup();                 /* 在 512 处标定：偏差 0 */
+    posInit();
+    struct Joints jd = snap();
+    for (int i = 1; i <= 110; i++) {
+      g_mockAnalog[MOCK_AX] = 512 + i;   /* 累计漂移 +110 计数（远超死区 40） */
+      g_mockMillis += 40;
+      joystickLoop();
+    }
+    snprintf(buf, sizeof(buf), "每轮漂移 +1 共 +110 计数：Δb=%.4f Δr=%.4f Δc=%.4f Δf=%.4f",
+             Pos.ser.angle1 - jd.b, Pos.ser.angle2 - jd.r,
+             Pos.ser.angle3 - jd.c, Pos.ser.angle4 - jd.f);
+    check("中位缓慢漂移被跟踪吸收：关节一动不动（固定40ms间隔，JOY_TRACK_MS=20）",
+          fabs(Pos.ser.angle1 - jd.b) < 1e-9 && fabs(Pos.ser.angle2 - jd.r) < 1e-9 &&
+          fabs(Pos.ser.angle3 - jd.c) < 1e-9 && fabs(Pos.ser.angle4 - jd.f) < 1e-9, buf);
   }
 
   printf("\n>>> %s (失败 %d 项)\n", failures == 0 ? "ALL PASS" : "HAS FAILURES", failures);

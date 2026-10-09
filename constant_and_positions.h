@@ -8,7 +8,7 @@
 //      rangeLimit / speedCfg)
 //   3. 全局实例 (Pos / arm1 / limit / speed)
 //   4. 范围边界: 配置自检 rangeClampConfig() / 坐标钳制 clampToRange()
-//      / 边界判定 atRangeEdge() / 可达性 isReachable()
+//      / 可达性 isReachable()
 //   5. 反解算法 getAngle()（越界或不可达时拒绝写入并返回 false）
 //   6. 全局调速 setSpeed()、档位 adjustSpeed()、降档 speedStepDown()
 //
@@ -120,14 +120,14 @@ bool isServoInRange(const SER *ser);
 /* 把四个关节角吸附到 servoLimit 区间内，返回是否有角度被改动。 */
 bool clampServoAngles(SER *ser);
 
-/* 全局调速配置：所有移动源 (摇杆/步进/手动) 共用。
- * stepSize      —— 每次步进移动的坐标单位 (越大移动越快)
- * minDelayMs    —— 输入较弱时的最小步间间隔 (ms)，控制最高速度
- * fullDelayMs   —— 满偏时的步间间隔 (ms)，满偏最慢最安全 */
+/* 全局调速配置：所有移动源 (摇杆/示教点动/手动步进) 共用。
+ * stepSize      —— 摇杆满偏时每格的关节角 (度)，也是步进移动的坐标单位
+ * stepDelayMs   —— 每个档位固定的步间间隔 (ms)：不再随偏转变化。
+ * 手感：偏转越大只是"一步走得越远"（步长按偏转比例缩放），
+ * 节奏（每秒走几格）对任何偏转都一样，不存在"推得越狠走得越快"。 */
 struct speedCfg {
   double stepSize;
-  int    minDelayMs;
-  int    fullDelayMs;
+  int    stepDelayMs;
 };
 extern struct speedCfg speed;
 
@@ -138,10 +138,6 @@ bool clampToRange(pos *pos1);
 /* 校验并修正 limit 配置：对每个轴做 (min,max) 排序，并统计写反的轴数。
  * 返回写反（现已自动纠正）的轴数，0 表示配置本来就正确。 */
 int rangeClampConfig(void);
-
-/* 判断 pos1->rec 是否贴在范围边界上（容差 RANGE_EPS）。
- * *axis 非空时写入出界轴名 'x'/'y'/'z'，多轴同时贴边时取第一个。 */
-bool atRangeEdge(const pos *pos1, char *axis);
 
 /* 判断坐标 rec 是否在机械臂可达工作空间内（反解不会出现 acos 越域）。 */
 bool isReachable(const REC *rec);
@@ -180,7 +176,7 @@ bool getAngle(pos *pos1);
 /* getAngle 的扩展版：*clamped 回传"是否因关节硬限位被吸附"。
  * CLAMP 策略下可能出现"返回 true 但角度被改过"（clamped=true），
  * 此时末端实际到不了目标点。需要"精确到达"语义的调用方
- * （moveAxisStep 的每一步移动）应改用本函数并在 clamped 时回退坐标，
+ * （moveJointStep 的每一步移动）应改用本函数并在 clamped 时回退坐标，
  * 否则坐标系会与真实姿态越差越远。
  * clamped 传 NULL 时行为与 getAngle 完全一致。 */
 bool getAngleEx(pos *pos1, bool *clamped);
@@ -211,15 +207,10 @@ bool posGetHomeAngles(SER *ser);
  * 角度会被夹在 servoLimit 的 f 行程内；返回 true 表示确实发生了变化。 */
 bool posSetAngle4(double angleDeg);
 
-/* 末端张开 / 收回一步（默认步长 5 度，传入 >0 的值可自定义）。
- * 返回 true 表示角度确实变了；已在限位上则返回 false。 */
-bool posToolOpen(double stepDeg);
-bool posToolClose(double stepDeg);
-
 /* 设置全局调速参数 (带合法性校验)。
- * stepSize 必须 > 0；minDelay 必须为正且不超过 fullDelay。
+ * stepSize 必须 > 0；stepDelayMs 必须 > 0。
  * 不合法的项保持原值；只有参数确实被改动时才把档位标记为自定义 (-1)。 */
-void setSpeed(double stepSize, int minDelayMs, int fullDelayMs);
+void setSpeed(double stepSize, int stepDelayMs);
 
 /* 按档位调整速度:
  *   SPEED_SLOW   —— 慢速: 小步长 + 长间隔, 精细移动

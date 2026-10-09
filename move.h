@@ -43,7 +43,7 @@ void moveright(void);    /* x +1 右 */
 void moveforward(void);  /* y +1 前 */
 void movebackward(void); /* y -1 后 */
 
-/* 方向枚举，供 moveAxisStep 使用 */
+/* 方向枚举：JointDir 的数值基础，也是定长函数 moveup/movedown/... 的取值来源 */
 enum MoveDir {
   DIR_UP = 1, DIR_DOWN,
   DIR_LEFT, DIR_RIGHT,
@@ -62,7 +62,7 @@ enum JointDir {
   JOINT_R_BWD   = DIR_BWD     /* 上臂 r (angle2) 角度减小 */
 };
 
-/* moveAxisStep 的执行结果 */
+/* moveJointStep 的执行结果 */
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
@@ -89,21 +89,17 @@ enum MoveResult {
  *   返回 enum MoveResult；返回 MOVE_OK 以外的值时 Pos 完全不变。 */
 int moveJointStep(int dir, double stepSize);
 
-/* 与上面同一个实现，保留旧名字供"按方向轴理解"的调用方使用。
- * DIR_UP/DOWN -> 下臂 c，DIR_FWD/BWD -> 上臂 r，DIR_LEFT/RIGHT -> 基座 b。
- * 新代码请直接用 moveJointStep + JOINT_*，语义更清楚。 */
-int moveAxisStep(int dir, double stepSize);
-
-/* ==================== 移动到指定 x,y,z（绘图 / 串口共用） ====================
+/* ==================== 移动到指定 x,y,z（绘图 / 取放共用） ====================
  *
  * 「移动到指定坐标」在本工程只有这一份实现：反解目标点 -> 按关节速率上限把
  * b/r/c 朝解算结果推进一格。绘图的三处点位写入（直线平移 moveTick、轨迹跟随
- * pathAdvance、示教点动 teachJogTick）与串口的 x/y/z 指令全部调用这里，
- * 不再各自展开一份"反解 + 限速 + 写角度"的代码。
+ * pathAdvance、示教点动 teachJogTick）与取放模块都调用这里，不再各自展开一份
+ * "反解 + 限速 + 写角度"的代码。串口 x/y/z 按题目要求直接写关节角，不经过这里。
  *
  * 参数:
- *   goal[3]  目标点，与 Pos.rec 同一坐标系（肩关节为原点的内部坐标，
- *            z 从肩算起；串口的"地面坐标系"由串口层自己换算后再传进来）。
+ *   goal[3]  目标点，与 Pos.rec 同一坐标系（肩关节为原点的内部坐标，z 从肩算起）。
+ *            调用者：绘图模块（轨迹采样点）与取放模块；串口 x/y/z 指令按题目
+ *            要求直接写关节角，不再走这里。
  *   seen     位掩码：位 0/1/2 分别表示 x/y/z 被本次请求提及。**没被提及的轴
  *            沿用 Pos.rec 的当前值**（串口 "x10" 这类单轴命令就是这么处理的），
  *            传 0x07 表示三个轴都要走到 goal。

@@ -53,4 +53,8 @@ Add-Source $sketch
 # blob (WriteAllLines would have emitted CRLF on Windows and forced git to normalise).
 $text = [string]::Join("`n", $chunks) + "`n"
 [System.IO.File]::WriteAllText($outFile, $text, [System.Text.UTF8Encoding]::new($false))
-Write-Host ("generated {0} ({1} bytes, {2} lines)" -f $outFile, (Get-Item -LiteralPath $outFile).Length, $chunks.Count)
+# NOTE: $chunks.Count is NOT the line count: every banner chunk is "\n// ===== name =====" and
+# therefore expands to two lines (a blank line plus the banner). Count the written text instead,
+# otherwise this message drifts from the real file (and docs quote the line count in 表 1).
+$lineCount = $text.Split("`n").Length - 1
+Write-Host ("generated {0} ({1} bytes, {2} lines)" -f $outFile, (Get-Item -LiteralPath $outFile).Length, $lineCount)

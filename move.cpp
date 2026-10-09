@@ -125,11 +125,6 @@ int moveJointStep(int dir, double stepSize) {
   return MOVE_OK;
 }
 
-/* 旧名字：同一实现，历史上按"方向轴"理解调用方的兼容入口。 */
-int moveAxisStep(int dir, double stepSize) {
-  return moveJointStep(dir, stepSize);
-}
-
 /* 定长函数共用的封装：走一步并忽略结果（到限位时保持原位） */
 static void stepFixed(int dir) {
   (void) moveJointStep(dir, 1.0);

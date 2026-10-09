@@ -12,10 +12,8 @@
 /* 轴字符定义：x y z */
 const char protoAxisChar[PROTO_AXIS_COUNT] = { 'x', 'y', 'z' };
 
-/* 轴对应的舵机索引：1=angle1(b 基座) 2=angle2(r 上臂) 3=angle3(c 下臂) */
-const int protoAxisServoIndex[PROTO_AXIS_COUNT] = { 1, 2, 3 };
-
-/* 轴对应的关节字母，用于串口提示：b r c */
+/* 轴对应的关节字母，用于串口提示：b r c。
+ * 轴 a 写入的就是 angle(a+1)，所以这里不再单独维护一张舵机索引表。 */
 const char protoAxisJoint[PROTO_AXIS_COUNT] = { 'b', 'r', 'c' };
 
 /* 把 x/X/y/Y/z/Z 转成轴下标 0..2，其它字符返回 -1 */

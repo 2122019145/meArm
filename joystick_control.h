@@ -35,7 +35,7 @@
 //     串口发送 H / L          整体运行速度 提升 / 降低 一档  (波特率 115200)
 //     串口发送 x角度,y角度,z角度  同步设置三个舵机，例: x10,y30,z20
 //                             x -> angle1 基座、y -> angle2 上臂、z -> angle3 下臂
-//                             （旧的 '1'/'2'/'3' 调速与 k/K 末端开合仍兼容）
+//                             超出行程按 servoLimit 夹取，不会因为数值大小被拒
 //
 //   每个关节的行程由全局 servoLimit 限制（b 0~180 / r 0~180 / c 0~180 / f 60~150），
 //   推到行程尽头就停住（moveJointStep 返回 MOVE_AT_LIMIT），不会顶死舵机。
@@ -61,9 +61,21 @@
 //             theta = 90 - b  ->  x = x_planar cos theta, y = x_planar sin theta。
 //
 // 【调速参数】存在全局 speedCfg (speed) 中，所有移动源共用：
-//     speed.stepSize    每个控制周期转过的角度（度）
-//     speed.minDelayMs  输入较弱时的最小步间间隔（最高速度）
-//     speed.fullDelayMs 满偏时的步间间隔（最低速度，最安全）
+//     speed.stepSize    满偏（推到底）时每格的关节角（度）；实际每格 = stepSize × 偏转比例
+//     speed.stepDelayMs 每个档位固定的步间间隔（ms）：不再随偏转变化
+//   手感：偏转越大只是"一步走得越远"（步长按偏转比例缩放），
+//   节奏（每秒走几格）对任何偏转都一样，不存在"推得越狠走得越快"。
+//
+// 【防"无故乱摆】四层措施（v1.6.4 加三层，v1.6.5 加施密特迟滞）：
+//     1) 死区 JOY_DEADZONE = 40（旧版 15）：把 ADC 噪声峰峰与电位器温漂一次关在门外；
+//     2) 开机自标定 JOY_CAL_SAMPLES = 32（旧版 8）+ 上限 JOY_CAL_MAX_OFF = 80：
+//        手柄机械中位偏 512 几十个计数也不会被当成推杆；
+//     3) 运行期缓慢跟踪中位（readAxisAmp 内，只在死区内部挪 1 个计数）：
+//        开机 30 秒后的温漂自动吸收，不必重新上电；
+//     4) 施密特迟滞 JOY_HYST 25（起控门槛 65）+ 中位跟踪每 20ms 才挪 1 个计数：
+//        彻底解决"没人碰摇杆、大臂自己一小格一小格往前抽"的问题。
+//   排查时把本文件对应 .cpp 里的 WEARM_JOY_DEBUG 改 1（有动作或每 500ms 打印四路原始
+//   ADC / 偏转量 / 角度），注意它会把 Serial 浮点格式化层链进来，需同时关掉一个功能腾 flash。
 //
 // 【可选扩展】板载摇杆按键（把按键脚接到空闲数字口即可）：
 //   可在 joystickSetup() 里 pinMode(pin, INPUT_PULLUP)，
@@ -75,11 +87,6 @@
 #include "Arduino.h"
 #include "constant_and_positions.h"
 #include "move.h"
-
-/* 保留的兼容值：本硬件用不到模式切换，恒为 0 */
-#define JOY_MODE_PLANE  0
-#define JOY_MODE_VERT   1
-#define JOY_MODE_COUNT  2
 
 /* 摇杆一次采样的完整结果（按"被控关节"命名，便于直接使用） */
 struct joyState {
@@ -122,9 +129,6 @@ void joystickReadState(struct joyState *st);
 
 /* 读取本轮选中的方向编码（JOY_DIR_*；无动作返回 JOY_DIR_NONE） */
 int joystickRead(void);
-
-/* 兼容接口：本硬件不做模式切换，恒返回 JOY_MODE_PLANE */
-int joystickGetMode(void);
 
 /* 每轮 loop 调一次，非阻塞（内部不使用 delay）。
  * 内部依次处理：摇杆采样 -> 按全局调速参数步进 -> LED 指示。 */
