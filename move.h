@@ -5,9 +5,9 @@
 // 【本工程的控制方式】控制的是机械臂的四个关节角，不是末端坐标。
 //   被控量（状态量）: Pos.ser.angle1..angle3（b / r / c）与 angle4（f）
 //   派生量（显示量）: Pos.rec.x/y/z —— 由正运动学实时算出，不是目标值
-//   软件边界        : servoLimit（每个关节的机械行程）是最终防线；
-//                     rangeLimit 只是"这个角度算出来的位置跑出工作空间就挡住"
-//                     的额外保险，角度模式下坐标已不再是用户输入。
+//   软件边界        : b/r/c 三轴的物理行程 0~180（硬编码），
+//                     f 的 60~150（在 posSetAngle4() 内硬编码）；
+//                     本版本已删除可配置的 servoLimit 与笛卡尔坐标的 rangeLimit。
 //
 // 设计说明:
 //   - moveJointStep 是主接口：把某个关节角加减一个步长，返回三态结果，
@@ -21,11 +21,11 @@
 //   DIR_LEFT/RIGHT<-> 基座 b (angle1)
 //
 // 【边界行为】
-//   每一步都做两重校验，任一失败则整步回退，Pos 保持在上一次的有效位置：
-//     1) 关节限位：角度夹到 servoLimit 内；夹完与原来相同说明已到机械行程
+//   每一步都在 Pos 的副本上试算，失败路径一个字节都不写 Pos：
+//     1) 关节硬限位：b/r/c 三轴硬编码夹到 0~180；夹完与原来相同说明已到行程
 //        尽头 -> MOVE_AT_LIMIT。
-//     2) 位置边界：由新角度正解出的末端坐标必须仍在 rangeLimit 内，
-//        否则整步回退 -> MOVE_AT_LIMIT（避免臂跑到工作空间外）。
+//     2) 正运动学自检：由新角度算出的末端坐标必须是有限数，否则
+//        -> MOVE_UNREACHABLE（几何上不可达）。
 //
 #ifndef WEARM_MOVE_H
 #define WEARM_MOVE_H
@@ -36,12 +36,12 @@
 
 /* 固定 1 单位的六个方向步进（自动钳制 + 反解舵机角度）。
  * 越界或不可达时什么都不改，函数无返回值。 */
-void moveup(void);       /* z +1 上升 */
-void movedown(void);     /* z -1 下降 */
-void moveleft(void);     /* x -1 左 */
-void moveright(void);    /* x +1 右 */
-void moveforward(void);  /* y +1 前 */
-void movebackward(void); /* y -1 后 */
+void moveup(void);       /* 下臂 c +1 */
+void movedown(void);     /* 下臂 c -1 */
+void moveleft(void);     /* 基座 b -1 */
+void moveright(void);    /* 基座 b +1 */
+void moveforward(void);  /* 上臂 r +1 */
+void movebackward(void); /* 上臂 r -1 */
 
 /* 方向枚举：JointDir 的数值基础，也是定长函数 moveup/movedown/... 的取值来源 */
 enum MoveDir {
@@ -66,8 +66,8 @@ enum JointDir {
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
-  MOVE_AT_LIMIT    = 2,  /* 方向被范围边界挡住（已在边界上） */
-  MOVE_UNREACHABLE = 3   /* 目标点超出机械臂臂展，已整步回退 */
+  MOVE_AT_LIMIT    = 2,  /* 方向被关节硬限位挡住（b/r/c 的 0~180） */
+  MOVE_UNREACHABLE = 3   /* 目标姿态正运动学自检失败，已整步回退 */
 };
 
 /* 按指定步长移动一个关节角（【角度模式下的主接口】）。
@@ -76,13 +76,10 @@ enum MoveResult {
  * 见 joystick_control.h；本函数就是"把某一个关节角加/减 stepSize 度"的底层动作。
  *
  * 每步的动作流程（保证 Pos.ser 与 Pos.rec 永远自洽）:
- *   1. 先把关节角按 dir 加减 stepSize 度（坐标轴同时跟着试探前移/后退，
- *      这一步只是为了让 Pos.rec 有个落点，真正的坐标以第 4 步为准）；
- *   2. 关节角夹到 servoLimit 区间内 —— 夹完等于原值说明这个方向已到限位，
+ *   1. 先把关节角按 dir 加减 stepSize 度（在副本上试算）；
+ *   2. b/r/c 三轴硬编码夹到 0~180 —— 夹完等于原值说明这个方向已到限位，
  *      返回 MOVE_AT_LIMIT；
- *   3. 用正运动学 recFromServo() 重算末端坐标，并夹到 rangeLimit 内。
- *      坐标被夹回说明"这个角度在几何上跑出了位置边界"，整步回退，
- *      返回 MOVE_AT_LIMIT（摇杆表现为"推到头了"）；
+ *   3. 用正运动学 recFromServo() 重算末端坐标，失败返回 MOVE_UNREACHABLE；
  *   4. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
  *
  *   dir 取 JointDir 的值。stepSize 传 <= 0 时使用全局 speed.stepSize（随调速档位变化）。
@@ -128,10 +125,7 @@ enum MoveXyzResult {
  *   MOVE_XYZ_JOG   示教点动：超出上限的部分夹到上限（尽量走一点），被吸附
  *                  仍然算失败 —— 手动操作宁可到不了请求点，也绝不原地卡住。
  *   MOVE_XYZ_NOW   即时到位（串口 x/y/z）：不限速、一次调用直接落到目标姿态，
- *                  并允许硬限位吸附 —— 与串口原来的"严格移动"逐位相同。
- *                  【唯一差异】旧代码在 recFromServo() 失败时会打一句
- *                  WEARM_DEBUG_SERIAL 调试警告，这里不打了（返回值本来就被丢弃，
- *                  姿态、回包与结果码完全不变）。 */
+ *                  并允许硬限位吸附。 */
 #define MOVE_XYZ_TRACK 0
 #define MOVE_XYZ_JOG   1
 #define MOVE_XYZ_NOW   2

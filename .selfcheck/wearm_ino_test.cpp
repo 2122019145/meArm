@@ -41,10 +41,10 @@ static void check(const char *name, bool ok, const char *detail) {
  * 限位、反解、录制、绘图用的全都是逻辑角（见 weArm_config.h 第 3 节）。 */
 static unsigned physTicks(int ch, double logical) {
 #if WEARM_MIRROR_BASE
-  if (ch == 0) logical = (servoLimit.minB + servoLimit.maxB) - logical;
+  if (ch == 0) logical = 180.0 - logical;   /* 硬编码 (minB+maxB)=180 */
 #endif
 #if WEARM_MIRROR_TOOL
-  if (ch == 3) logical = (servoLimit.minF + servoLimit.maxF) - logical;
+  if (ch == 3) logical = 210.0 - logical;   /* 硬编码 (minF+maxF)=210 */
 #endif
   return servoDriveTicksForDeg(logical);
 }
@@ -127,7 +127,7 @@ int main(void) {
              fabs(Pos.ser.angle3 - 90.0) < 1e-6, NULL);
   /* 末端 f 的行程是 [60,150]，posInit() 取中位 105（不是 90）—— 这一条曾经把
    * "assert f == 90" 写错，是探针自己的错，固件行为才是对的。 */
-  const double wantF = (servoLimit.minF + servoLimit.maxF) / 2.0;
+    const double wantF = 105.0;   /* 硬编码 (60+150)/2 */
   snprintf(buf, sizeof buf, "末端上电取行程中位 f=%.1f (期望 %.1f)", Pos.ser.angle4, wantF);
   check(buf, fabs(Pos.ser.angle4 - wantF) < 1e-9, NULL);
   check("上电脉宽非 0° 脉宽（不会甩向原点）",
@@ -181,9 +181,8 @@ int main(void) {
   check("镜像确实改变了输出（b 30° 与 f 60° 都不是原值）",
         mir0 != servoDriveTicksForDeg(30.0) && mir3 != servoDriveTicksForDeg(60.0), NULL);
   /* 镜像落点仍在各自行程内：夹爪不可能被镜像推到行程外 */
-  check("镜像后物理角仍在 f 行程 [60,150] 内",
-        (servoLimit.minF + servoLimit.maxF - 60.0) >= servoLimit.minF &&
-        (servoLimit.minF + servoLimit.maxF - 60.0) <= servoLimit.maxF, NULL);
+    check("镜像后物理角仍在 f 行程 [60,150] 内",
+        (210.0 - 60.0) >= 60.0 && (210.0 - 60.0) <= 150.0, NULL);
   posInit();
   writeServo();
 #endif

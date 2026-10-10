@@ -59,8 +59,6 @@ static bool onlyChanged(const struct Joints &a, const struct Joints &b, int whic
 }
 
 int main(void) {
-  (void) servoSelfCheck();
-  (void) rangeClampConfig();
   resetInputs();
   g_mockMillis = 1000;
   joystickSetup();
@@ -156,17 +154,17 @@ int main(void) {
     double f0 = Pos.ser.angle4;
     g_mockAnalog[MOCK_TX] = 900;              /* 右推 -> 角度减小 */
     runLoop(400, 30);
-    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (下限 %.0f)", f0, Pos.ser.angle4, servoLimit.minF);
-    check("A2 右推 -> angle4 减到 servoLimit.minF 停住",
-          Pos.ser.angle4 < f0 && Pos.ser.angle4 >= servoLimit.minF - 1e-9, buf);
+    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (下限 60)", f0, Pos.ser.angle4);
+    check("A2 右推 -> angle4 减到 60 停住",
+          Pos.ser.angle4 < f0 && Pos.ser.angle4 >= 60.0 - 1e-9, buf);
 
     resetInputs(); posInit();
     f0 = Pos.ser.angle4;
     g_mockAnalog[MOCK_TX] = 200;              /* 左推 -> 角度增大 */
     runLoop(400, 30);
-    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (上限 %.0f)", f0, Pos.ser.angle4, servoLimit.maxF);
-    check("A2 左推 -> angle4 增到 servoLimit.maxF 停住",
-          Pos.ser.angle4 > f0 && Pos.ser.angle4 <= servoLimit.maxF + 1e-9, buf);
+        snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (上限 150)", f0, Pos.ser.angle4);
+    check("A2 左推 -> angle4 增到 150 停住",
+          Pos.ser.angle4 > f0 && Pos.ser.angle4 <= 150.0 + 1e-9, buf);
   }
 
   printf("=== 4) 斜推可以同时动多个关节（角度模式下逐轴独立） ===\n");
@@ -261,11 +259,11 @@ int main(void) {
     g_mockAnalog[MOCK_TX] = 900;   /* f 一直减 */
     runLoop(600, 30);
     struct Joints j1 = snap();
-    bool inRange = j1.b <= servoLimit.maxB + 1e-6 && j1.r >= servoLimit.minR - 1e-6 &&
-                   j1.c >= servoLimit.minC - 1e-6 && j1.f >= servoLimit.minF - 1e-6;
+    bool inRange = j1.b <= 180.0 + 1e-6 && j1.r >= 0.0 - 1e-6 &&
+                   j1.c >= 0.0 - 1e-6 && j1.f >= 60.0 - 1e-6;
     bool valid = (j1.b == j1.b) && (j1.r == j1.r) && (j1.c == j1.c) && (j1.f == j1.f);
-    snprintf(buf, sizeof(buf), "b=%.1f(max %.0f) r=%.1f(min %.0f) c=%.1f(min %.0f) f=%.1f",
-             j1.b, servoLimit.maxB, j1.r, servoLimit.minR, j1.c, servoLimit.minC, j1.f);
+        snprintf(buf, sizeof(buf), "b=%.1f(max 180) r=%.1f(min 0) c=%.1f(min 0) f=%.1f",
+             j1.b, j1.r, j1.c, j1.f);
     check("四路都推到头：角度全部落在 servoLimit 内且非 NaN", inRange && valid, buf);
   }
 
@@ -284,14 +282,10 @@ int main(void) {
       runLoop(1, 25);
 
       /* 角度必须全部在 servoLimit 内 */
-      if (Pos.ser.angle1 < servoLimit.minB - 1e-6 || Pos.ser.angle1 > servoLimit.maxB + 1e-6) bad++;
-      if (Pos.ser.angle2 < servoLimit.minR - 1e-6 || Pos.ser.angle2 > servoLimit.maxR + 1e-6) bad++;
-      if (Pos.ser.angle3 < servoLimit.minC - 1e-6 || Pos.ser.angle3 > servoLimit.maxC + 1e-6) bad++;
-      if (Pos.ser.angle4 < servoLimit.minF - 1e-6 || Pos.ser.angle4 > servoLimit.maxF + 1e-6) bad++;
-      /* 坐标必须全部在 rangeLimit 内 */
-      if (Pos.rec.x < limit.minX - 1e-6 || Pos.rec.x > limit.maxX + 1e-6) bad++;
-      if (Pos.rec.y < limit.minY - 1e-6 || Pos.rec.y > limit.maxY + 1e-6) bad++;
-      if (Pos.rec.z < limit.minZ - 1e-6 || Pos.rec.z > limit.maxZ + 1e-6) bad++;
+      if (Pos.ser.angle1 < 0.0 - 1e-6 || Pos.ser.angle1 > 180.0 + 1e-6) bad++;
+      if (Pos.ser.angle2 < 0.0 - 1e-6 || Pos.ser.angle2 > 180.0 + 1e-6) bad++;
+      if (Pos.ser.angle3 < 0.0 - 1e-6 || Pos.ser.angle3 > 180.0 + 1e-6) bad++;
+      if (Pos.ser.angle4 < 60.0 - 1e-6 || Pos.ser.angle4 > 150.0 + 1e-6) bad++;
       /* 不能出现 NaN */
       if (!(Pos.ser.angle1 == Pos.ser.angle1) || !(Pos.ser.angle2 == Pos.ser.angle2) ||
           !(Pos.ser.angle3 == Pos.ser.angle3) || !(Pos.ser.angle4 == Pos.ser.angle4)) bad++;

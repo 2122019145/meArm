@@ -1,0 +1,151 @@
+摇杆操作时"乱摆"的原因分析
+先明确回答你的问题：不是串口信号冲突
+从代码看，串口和摇杆在硬件上是完全隔离的：
+
+资源	占用
+串口	D0(RX) / D1(TX)，UART 外设
+摇杆	A0~A3，ADC 外设
+舵机	D6~D9，Timer1 PWM
+按键	D2~D5（默认还关掉了）
+LED	D13
+serialProtocolLoop() 是串口字节的唯一读者（代码注释里专门强调过这点），joystickLoop() 只调用 analogRead()。两者不共享任何寄存器、任何缓冲区，也不存在"抢数据"的可能。
+
+除非你用的摇杆是某种串口/USB 手柄（有些第三方手柄确实走串口协议），否则这条可以完全排除。
+
+真正的原因：几个问题叠加
+我把代码逐行看了一遍，"乱摆"最可能是下面几件事叠加。按我认为的可能性排序：
+
+① 摇杆自标定 + 死区太小，噪声被当成操作
+代码里：
+
+c
+#define JOY_DEADZONE   15   // 死区只有 15 个 ADC 计数
+#define JOY_CAL_SAMPLES  8  // 标定只平均 8 次
+joyCalibrateAxis() 只在 setup() 里跑一次，取 8 次平均就当作中位。问题在于：
+
+真实摇杆的 ADC 噪声通常在 ±5~±15 LSB 之间跳动；
+
+8 次平均后残余噪声还有 ±2~±5；
+
+电位器有温漂，开机 30 秒后中位就可能漂 10~20 个计数；
+
+死区只有 15，一旦漂移 + 噪声叠加超过 15，readAxisAmp() 就返回 > 0。
+
+然后 joystickLoop() 里：
+
+c
+if (amp[i] <= 0) continue;
+int interval = speedIntervalMs(amp[i]);
+只要 amp > 0，就会以最短的间隔（speed.minDelayMs）连续步进。所以你会看到机械臂在没人碰摇杆时，某个关节自己一小格一小格地抽动 —— 这就是"乱动"的第一大来源。
+
+② speedIntervalMs() 的规律与直觉相反 —— 这是"乱摆"的关键
+c
+static int speedIntervalMs(int mag) {
+  ...
+  return minDelay + (int)((double)mag / (double)JOY_FULL_SCALE * (double)(fullDelay - minDelay));
+}
+minDelay=10ms（快），fullDelay=40ms（慢）。偏转越小，间隔越接近 10ms（越快）；偏转越大，间隔越接近 40ms（越慢）。
+
+也就是说：
+
+摇杆偏转	步进间隔	实际角速度（中速档 stepSize=1°）
+刚出死区（amp≈1）	10 ms	100 °/s
+半推（amp≈250）	25 ms	40 °/s
+满推（amp≈500）	40 ms	25 °/s
+你轻轻碰一下摇杆，机械臂飞快地转；你用力推到底，它反而慢下来。 这跟所有人的操作直觉完全相反，非常容易被感知成"乱摆"、"不听话"。
+
+而且更要命的是：摇杆在死区边缘来回抖的时候，amp 会在 0 和 >0 之间跳，每一次 >0 都按 100°/s 的速度打一下 —— 表现就是"机械臂自己在抽"。
+
+③ 步长不随偏转缩放
+c
+int res = moveJointStep(dir, speed.stepSize);   // 固定步长，不缩放
+无论摇杆推 10% 还是 100%，每步都是 speed.stepSize（中速 1°）。速度只靠间隔区分，而间隔的规律又反了（见上），所以整体手感非常奇怪。
+
+④ 多轴 crosstalk
+joystickLoop() 每轮都读全部 4 路 ADC：
+
+c
+st->base     = readAxisAmp(JOY_LX_PIN, &st->sx);
+st->shoulder = readAxisAmp(JOY_LY_PIN, &st->sy);
+st->tool     = readAxisAmp(JOY_RX_PIN, &st->tx);
+st->elbow    = readAxisAmp(JOY_RY_PIN, &st->ty);
+如果摇杆模块本身的 X/Y 有串扰（推 X 时 Y 也变一点），或者某一路的 s_centerOff 标错了，你只推一个方向，可能两个关节同时在动 —— 视觉上就是"乱摆"。
+
+⑤ 电源不稳（如果你没接独立电源）
+摇杆 VCC 和舵机共用 Arduino 的 5V 时，舵机一动 5V 就跌，ADC 参考电压跟着跌，读出来的摇杆值就整体漂移。这是"抖动 + 乱动"的经典原因之一，和第 1 条会互相放大。
+
+怎么确认是哪一条
+推荐按这个顺序排查，每一步都能排除一类：
+
+第 1 步：把摇杆完全松开，看机械臂 10 秒。
+
+完全不动 → 排除 ① ④ ⑤，问题在操作手感（② ③）
+
+慢慢抽动 → ① 或 ⑤
+
+某个关节一直动 → 那一路的标定或接线问题
+
+第 2 步：临时打开调试打印，看 4 路 ADC 原始值。
+
+在 joystick_control.cpp 里把 WEARM_JOY_DEBUG 改成 1，重烧。这样每次移动都会打印：
+
+text
+[joy] raw A0..A3=...  b=... r=... c=... f=...
+摇杆松开时，看 A0~A3 是否稳定在中位附近；如果某一跳得特别厉害 → 那一路有问题
+
+只推 A0，看 A1/A3 是否也跟着变 → 有 crosstalk
+
+推 A1，看 r 是增大还是减小，是否与操作表一致 → 方向是否搞反
+
+第 3 步：单独验证 speedIntervalMs() 的手感。
+
+在 joystickLoop() 里临时把这一行：
+
+c
+int interval = speedIntervalMs(amp[i]);
+改成：
+
+c
+int interval = speed.minDelayMs;   // 固定用最短间隔
+重烧。如果机械臂变成"轻推慢转、重推快转"（符合直觉），那就确认是 ② 的设计反了。
+
+修复建议
+修 ①：加大死区 + 在线重标定
+c
+#define JOY_DEADZONE   40   // 15 -> 40，明显滤波
+#define JOY_CAL_SAMPLES  32  // 8 -> 32，标定更稳
+#define JOY_CAL_MAX_OFF 80  // 允许更大的静态偏差
+再加一个"运行期缓慢跟踪中位"的逻辑（可选，效果显著）：
+
+c
+// 在 readAxisAmp 里，当 |raw - 中位| < 死区时，把中位慢慢朝当前值挪
+// 这样温漂会被自动吸收
+修 ②：把 speedIntervalMs() 的规律反过来（关键）
+改成"偏转越大间隔越短"：
+
+c
+static int speedIntervalMs(int mag) {
+  int minDelay = speed.minDelayMs;
+  int fullDelay = speed.fullDelayMs;
+  if (fullDelay <= minDelay) return minDelay;
+
+  if (mag < 0) mag = 0;
+  else if (mag > JOY_FULL_SCALE) mag = JOY_FULL_SCALE;
+
+  // 偏转越大 -> 越接近 minDelay（快）
+  return fullDelay - (int)((double)mag / (double)JOY_FULL_SCALE * (double)(fullDelay - minDelay));
+}
+修 ③：步长按偏转缩放
+c
+double step = speed.stepSize * ((double)amp[i] / (double)JOY_FULL_SCALE);
+if (step < 0.1) step = 0.1;   // 保底
+int res = moveJointStep(dir, step);
+这样"轻推慢、重推快"，手感立刻正常。toolStep() 里已经是按比例缩放的了，只有关节这一步没有。
+
+修 ⑤：摇杆独立供电
+摇杆 VCC 不要接 Arduino 的 5V，改成从独立 5V（给舵机那个）接过来，并且共地。这样舵机拉电流时不会污染 ADC 参考。
+
+一句话总结
+不是串口冲突。摇杆"乱摆"最可能是三件事叠加：① 死区太小 + 标定只做一次，噪声被当成操作；② speedIntervalMs() 把"偏转越大间隔越长"写反了，导致轻推飞快、重推反而慢；③ 步长不按偏转缩放。修 ①②③ 三条，手感基本就正常了；如果摇杆松开时还慢慢抽，再查电源和 crosstalk。
+
+如果你把 WEARM_JOY_DEBUG 打开、重烧，把摇杆松开时的 4 路 ADC 值贴一段上来，我可以直接告诉你哪一路有问题、中位偏了多少。

@@ -40,10 +40,18 @@ static bool selfConsistent(void) {
          fabs(chk.z - Pos.rec.z) < 1e-9;
 }
 
+/* 坐标范围限制已从固件删除（去配置化版本）：恒返回 true。 */
 static bool recInLimit(const REC *r) {
-  return r->x >= limit.minX && r->x <= limit.maxX &&
-         r->y >= limit.minY && r->y <= limit.maxY &&
-         r->z >= limit.minZ && r->z <= limit.maxZ;
+  (void)r;
+  return true;
+}
+
+/* 本地版本的关节行程检查：b/r/c 硬编码 0~180、f 硬编码 60~150。 */
+static bool isServoInRange(const SER *ser) {
+  return ser->angle1 >= 0.0   && ser->angle1 <= 180.0 &&
+         ser->angle2 >= 0.0   && ser->angle2 <= 180.0 &&
+         ser->angle3 >= 0.0   && ser->angle3 <= 180.0 &&
+         ser->angle4 >= 60.0  && ser->angle4 <= 150.0;
 }
 
 static bool sameSer(const SER *a, const SER *b) {
@@ -220,8 +228,8 @@ int main(void) {
     snprintf(d, sizeof(d), "结束阶段=%s", pickPlaceStageName());
     check("结束阶段回到 idle", strcmp(pickPlaceStageName(), "idle") == 0, d);
 
-    snprintf(d, sizeof(d), "angle4=%.3f 期望 maxF=%.3f", Pos.ser.angle4, servoLimit.maxF);
-    check("末端张开到位（与串口 O 同角度）", fabs(Pos.ser.angle4 - servoLimit.maxF) < 1e-9, d);
+    snprintf(d, sizeof(d), "angle4=%.3f 期望 maxF=%.3f", Pos.ser.angle4, 150.0);
+    check("末端张开到位（与串口 O 同角度）", fabs(Pos.ser.angle4 - 150.0) < 1e-9, d);
 
     snprintf(d, sizeof(d), "final=(%.4f,%.4f,%.4f) 期望=(%.4f,%.4f,%.4f)",
              Pos.rec.x, Pos.rec.y, Pos.rec.z,

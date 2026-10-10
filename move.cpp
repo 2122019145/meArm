@@ -4,20 +4,16 @@
 //
 // 统一流程（每一步都保证 Pos.ser 与 Pos.rec 严格自洽）:
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
-//   -> 角度夹到 servoLimit：夹完与当前 Pos.ser 相同 => 已到机械行程尽头 => MOVE_AT_LIMIT
+//   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
-//   -> 坐标一越出 rangeLimit（工作空间）=> 直接返回 MOVE_AT_LIMIT
-//      （摇杆表现为"推到头了"）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
 //
 // 所有失败路径都一个字节都不写 Pos —— 这正是原来"备份 + 整步回退"的等价效果，
 // 但省掉了备份变量和两处回退代码。
 //
-// 注意: 只改角度、绝不动坐标。坐标永远由正运动学重算，
-// 因为 clampToRange() 是**原地修改** Pos.rec 的（返回"是否夹到过"），
-// 曾经为了给 Pos.rec 一个"临时落点"而顺手挪坐标轴，结果 clampToRange()
-// 把那个临时落点夹回了边界值，返回 false，整步回退被跳过 ——
-// 表现为末端坐标可以停在界外（x = -0.5 < limit.minX）。
+// 【本版本已删去】笛卡尔坐标范围检查（posOutOfRange）、可配置的关节限位
+// （clampServoAngles）。b/r/c 三轴的 0~180 物理行程改为在 moveJointStep()
+// 内部直接硬编码；angle4（f）由 posSetAngle4() 单独处理，不走本路径。
 //
 #include "move.h"
 #include "constant_and_positions.h"
@@ -34,7 +30,7 @@
  *
  * 关节下标与符号打包进同一字节（低 1 位 = 是否取负，其余位 = 关节下标），
  * 这样只有一次 pgm_read_byte、一套表基址，符号判断也变成一位测试；
- * 拆成两张表时那第二套“取表基址 + 加下标 + lpm”实测要多花十几字节。 */
+ * 拆成两张表时那第二套"取表基址 + 加下标 + lpm"实测要多花十几字节。 */
 static const unsigned char DIR_CODE[7] PROGMEM = {
   0,                        /* 0: 占位，非法方向不会走到这里 */
   (2 << 1) | 0,             /* JOINT_C_UP    -> c (angle3), 步进取正 */
@@ -61,24 +57,17 @@ static bool samePose(const SER *a, const SER *b) {
   return true;
 }
 
-/* 坐标是否越出 rangeLimit（只读判断，不改动 Pos）。
- * 与原来的 6 次展开比较逐条等价，只是改成 3 轴紧凑循环：
- *   limit 的内存布局是 {minX,maxX, minY,maxY, minZ,maxZ}，REC 是 {x,y,z}，
- *   两者都是连续的 double，所以按轴前进即可。
- *
- * 【实测记录】这里试过改成复用别人已经 out-of-line 的 clampToRange()
- * （把落点放进 pos 副本再靠它返回的"是否夹到过"当越界判据）：
- * move.cpp 自身确实从约 300 B 降到 206 B，但 LTO 的连锁反应让
- * draw_control.cpp 从 13966 B 涨到 14178 B，全程序净增 82 B，故回退。 */
-static bool posOutOfRange(const REC *r) {
-  const double *c = &r->x;
-  const double *l = &limit.minX;
-  for (unsigned char i = 0; i < 3; i++) {
-    if (*c < l[0] || *c > l[1]) return true;
-    c++;
-    l += 2;
-  }
-  return false;
+/* b/r/c 三轴硬编码 0~180 的物理行程夹取。
+ * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
+ * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 60~150。 */
+static void clampBCR(SER *s) {
+  if (s->angle1 < 0.0)   s->angle1 = 0.0;
+  if (s->angle1 > 180.0) s->angle1 = 180.0;
+  if (s->angle2 < 0.0)   s->angle2 = 0.0;
+  if (s->angle2 > 180.0) s->angle2 = 180.0;
+  if (s->angle3 < 0.0)   s->angle3 = 0.0;
+  if (s->angle3 > 180.0) s->angle3 = 180.0;
 }
 
 /* ---------- 单步关节移动 ---------- */
@@ -99,10 +88,11 @@ int moveJointStep(int dir, double stepSize) {
   if (code & 1) step = -step;
   *ap += step;
 
-  /* 2) 关节硬限位（最终防线）。夹完三个姿态角都等于原值 => 已到机械行程尽头。
+  /* 2) 关节硬限位：b/r/c 三轴硬编码 0~180（最终防线）。
+   *    夹完三个姿态角都等于原值 => 已到机械行程尽头。
    *    注意只比较 b/r/c：angle4 由末端专用接口控制，不走这条路径。
    *    直接返回即等价于原来的整步回退（Pos 未被改动）。 */
-  (void) clampServoAngles(&next);
+  clampBCR(&next);
   if (samePose(&next, &Pos.ser)) {
     return MOVE_AT_LIMIT;
   }
@@ -113,13 +103,9 @@ int moveJointStep(int dir, double stepSize) {
     return MOVE_UNREACHABLE;
   }
 
-  /* 4) 位置边界：这个角度把末端带出了 rangeLimit（工作空间）就整步回退。
-   *    角度模式下坐标是派生量，所以这不算"不可达"，而是"这个方向到头了"。 */
-  if (posOutOfRange(&nextRec)) {
-    return MOVE_AT_LIMIT;
-  }
-
-  /* 5) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。 */
+  /* 4) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。
+   *    【本版本已删除】笛卡尔坐标范围检查（posOutOfRange）；坐标范围限制
+   *    按需求一并移除，末端坐标只是由角度正解出来的派生量，不再作为软护栏。 */
   Pos.ser = next;
   Pos.rec = nextRec;
   return MOVE_OK;
@@ -164,10 +150,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 
   /* 2) 即时到位（串口 x/y/z）：不限速，一次调用直接落到解算结果上，并允许
    *    硬限位吸附 —— 与串口原来的"严格移动"逐位相同：反解不出来整条拒绝，
-   *    成功才写 Pos，写完立刻正解刷新坐标（Pos.ser 与 Pos.rec 始终自洽）。
-   *    【唯一差异】旧代码在 recFromServo() 返回 false 时会打一句
-   *    WEARM_DEBUG_SERIAL 调试警告；那边的返回值原本也只是被丢弃，这里不再打，
-   *    姿态、回包与结果码完全不变（详见 .selfcheck/README.md 本轮改动一节）。 */
+   *    成功才写 Pos，写完立刻正解刷新坐标（Pos.ser 与 Pos.rec 始终自洽）。 */
   if (mode == MOVE_XYZ_NOW) {
     Pos = target;
     (void) recFromServo(&Pos.rec, &Pos.ser);
@@ -215,4 +198,3 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
   pathCoreSetJoints(cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]);
   return MOVE_XYZ_OK;
 }
-

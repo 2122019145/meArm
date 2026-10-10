@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Repo = (Split-Path -Parent $PSScriptRoot),
   [string]$OutDir = $null
 )

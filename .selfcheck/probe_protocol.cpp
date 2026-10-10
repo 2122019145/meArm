@@ -44,12 +44,10 @@ static void check(const char *name, bool ok, const char *detail) {
 
 /* 把四路轴都回到中位，并清掉串口输入 */
 static void resetInputs(void) {
-  for (int i = 0; i < 4; i++) {
-    Pos.ser.angle1 = (servoLimit.minB + servoLimit.maxB) / 2;
-    Pos.ser.angle2 = (servoLimit.minR + servoLimit.maxR) / 2;
-    Pos.ser.angle3 = (servoLimit.minC + servoLimit.maxC) / 2;
-    Pos.ser.angle4 = (servoLimit.minF + servoLimit.maxF) / 2;
-  }
+  Pos.ser.angle1 = 90.0;
+  Pos.ser.angle2 = 90.0;
+  Pos.ser.angle3 = 90.0;
+  Pos.ser.angle4 = 105.0;
   mockSerialClear();
 }
 
@@ -73,11 +71,9 @@ static struct PosRecSnapshot snapRec(void) {
 /* 轴 a 的行程上下限（0=x->angle1/b，1=y->angle2/r，2=z->angle3/c）。
  * 期望值不写死，直接取固件自己的 servoLimit：标定改了探针跟着改。 */
 static void probeTravel(int axis, double *lo, double *hi) {
-  switch (axis) {
-    case 0:  *lo = servoLimit.minB; *hi = servoLimit.maxB; break;
-    case 1:  *lo = servoLimit.minR; *hi = servoLimit.maxR; break;
-    default: *lo = servoLimit.minC; *hi = servoLimit.maxC; break;
-  }
+  (void)axis;
+  *lo = 0.0;
+  *hi = 180.0;
 }
 
 /* 固件 protoApplyAngles() 的落地规则：写进去的度数按该关节的 servoLimit
@@ -118,8 +114,7 @@ static const double PROBE_RAND_HI = 220.0;
                                   /* 语法错的整行必须原封不动 */
 
 int main(void) {
-  (void) servoSelfCheck();
-  (void) rangeClampConfig();
+
   resetInputs();
   g_mockMillis = 1000;
   serialProtocolBegin();
@@ -136,20 +131,20 @@ int main(void) {
   printf("=== 1) 固定指令 O / S（绝对到位） ===\n");
   {
     resetInputs();
-    Pos.ser.angle4 = (servoLimit.minF + servoLimit.maxF) / 2;
+    Pos.ser.angle4 = (60.0 + 150.0) / 2;
     mockSerialFeed("O");
     serialProtocolLoop();
     snprintf(buf, sizeof(buf), "angle4=%.1f maxF=%.1f protoRes=%d",
-             Pos.ser.angle4, servoLimit.maxF, protoHandleLine("O"));
-    check("mockSerialFeed(\"O\") -> angle4==servoLimit.maxF 且 protoHandleLine(\"O\")返回PROTO_RES_GRIPPER_OPEN",
-          Pos.ser.angle4 == servoLimit.maxF && protoHandleLine("O") == PROTO_RES_GRIPPER_OPEN, buf);
+             Pos.ser.angle4, 150.0, protoHandleLine("O"));
+    check("mockSerialFeed(\"O\") -> angle4==150.0 且 protoHandleLine(\"O\")返回PROTO_RES_GRIPPER_OPEN",
+          Pos.ser.angle4 == 150.0 && protoHandleLine("O") == PROTO_RES_GRIPPER_OPEN, buf);
 
     mockSerialFeed("S");
     serialProtocolLoop();
     snprintf(buf, sizeof(buf), "angle4=%.1f minF=%.1f protoRes=%d",
-             Pos.ser.angle4, servoLimit.minF, protoHandleLine("S"));
-    check("mockSerialFeed(\"S\") -> angle4==servoLimit.minF 且 protoHandleLine(\"S\")返回PROTO_RES_GRIPPER_CLOSE",
-          Pos.ser.angle4 == servoLimit.minF && protoHandleLine("S") == PROTO_RES_GRIPPER_CLOSE, buf);
+             Pos.ser.angle4, 60.0, protoHandleLine("S"));
+    check("mockSerialFeed(\"S\") -> angle4==60.0 且 protoHandleLine(\"S\")返回PROTO_RES_GRIPPER_CLOSE",
+          Pos.ser.angle4 == 60.0 && protoHandleLine("S") == PROTO_RES_GRIPPER_CLOSE, buf);
   }
 
   printf("=== 3) H / L 档位升降与端点行为 ===\n");
@@ -182,25 +177,25 @@ int main(void) {
   printf("=== 4) O / S 到限不越界（重复执行幂等） ===\n");
   {
     resetInputs();
-    Pos.ser.angle4 = (servoLimit.minF + servoLimit.maxF) / 2;
+    Pos.ser.angle4 = (60.0 + 150.0) / 2;
 
     /* 连发 60 次 "O"（张开） */
     for (int i = 0; i < 60; i++) {
       protoHandleLine("O");
     }
     snprintf(buf, sizeof(buf), "60次\"O\"后 angle4=%.1f maxF=%.1f <= maxF",
-             Pos.ser.angle4, servoLimit.maxF);
-    check("连发60次\"O\" -> angle4==servoLimit.maxF且<=maxF",
-          Pos.ser.angle4 == servoLimit.maxF && Pos.ser.angle4 <= servoLimit.maxF, buf);
+             Pos.ser.angle4, 150.0);
+    check("连发60次\"O\" -> angle4==150.0且<=maxF",
+          Pos.ser.angle4 == 150.0 && Pos.ser.angle4 <= 150.0, buf);
 
     /* 连发 60 次 "S"（关闭） */
     for (int i = 0; i < 60; i++) {
       protoHandleLine("S");
     }
     snprintf(buf, sizeof(buf), "60次\"S\"后 angle4=%.1f minF=%.1f >= minF",
-             Pos.ser.angle4, servoLimit.minF);
-    check("连发60次\"S\" -> angle4==servoLimit.minF且>=minF",
-          Pos.ser.angle4 == servoLimit.minF && Pos.ser.angle4 >= servoLimit.minF, buf);
+             Pos.ser.angle4, 60.0);
+    check("连发60次\"S\" -> angle4==60.0且>=minF",
+          Pos.ser.angle4 == 60.0 && Pos.ser.angle4 >= 60.0, buf);
   }
 
   printf("=== 5) x/y/z 三舵机同步角度（本需求的核心） ===\n");
@@ -271,15 +266,15 @@ int main(void) {
           Pos.ser.angle1 == b0 && Pos.ser.angle3 == c0, buf);
 
     /* 角度指令只动三个关节：末端夹具角必须原样保留 */
-    Pos.ser.angle4 = servoLimit.minF;
+    Pos.ser.angle4 = 60.0;
     (void) recFromServo(&Pos.rec, &Pos.ser);
     mockSerialFeed("x20,y0,z40\n");
     serialProtocolLoop();
 
     snprintf(buf, sizeof(buf), "angle4=%.6f(指令前%.6f) 行程[%.1f,%.1f]",
-             Pos.ser.angle4, servoLimit.minF, servoLimit.minF, servoLimit.maxF);
+             Pos.ser.angle4, 60.0, 60.0, 150.0);
     check("角度指令不碰末端夹具角（angle4 保持指令前的值）",
-          Pos.ser.angle4 == servoLimit.minF, buf);
+          Pos.ser.angle4 == 60.0, buf);
   }
 
   printf("=== 7) 大小写与空白容忍 ===\n");
@@ -345,9 +340,9 @@ int main(void) {
       std::string o = Serial.getOutput();
 
       /* 该用例只提到哪些轴就只检查哪些轴，其余轴按中位保持 */
-      double mid1 = (servoLimit.minB + servoLimit.maxB) / 2;
-      double mid2 = (servoLimit.minR + servoLimit.maxR) / 2;
-      double mid3 = (servoLimit.minC + servoLimit.maxC) / 2;
+      double mid1 = (0.0 + 180.0) / 2;
+      double mid2 = (0.0 + 180.0) / 2;
+      double mid3 = (0.0 + 180.0) / 2;
       double want1 = mid1, want2 = mid2, want3 = mid3;
       if (strcmp(over[i], "x200,y0,z40") == 0)  { want1 = probeClampToTravel(0, 200.0); want2 = probeClampToTravel(1, 0.0); want3 = probeClampToTravel(2, 40.0); }
       if (strcmp(over[i], "x20,y-90,z40") == 0) { want1 = probeClampToTravel(0,  20.0); want2 = probeClampToTravel(1, -90.0); want3 = probeClampToTravel(2, 40.0); }
@@ -373,11 +368,11 @@ int main(void) {
     (void) protoHandleLine("y200");
     (void) protoHandleLine("z200");
     snprintf(buf, sizeof(buf), "b=%.6f(maxB=%.6f) r=%.6f(maxR=%.6f) c=%.6f(maxC=%.6f)",
-             Pos.ser.angle1, servoLimit.maxB, Pos.ser.angle2, servoLimit.maxR,
-             Pos.ser.angle3, servoLimit.maxC);
+             Pos.ser.angle1, 180.0, Pos.ser.angle2, 180.0,
+             Pos.ser.angle3, 180.0);
     check("x200/y200/z200 后三个关节都停在自己的行程上限",
-          Pos.ser.angle1 == servoLimit.maxB && Pos.ser.angle2 == servoLimit.maxR &&
-          Pos.ser.angle3 == servoLimit.maxC, buf);
+          Pos.ser.angle1 == 180.0 && Pos.ser.angle2 == 180.0 &&
+          Pos.ser.angle3 == 180.0, buf);
   }
 
   printf("=== 10) 错误输入不改变状态（**这是最重要的一段**） ===\n");
@@ -616,10 +611,10 @@ int main(void) {
                                   INV_A4_RANGE, INV_REC_OK, INV_REC_MATCH, INV_ANGLE_LAND };
     const char *invNames[8] = {
       "INV1 四个关节角都必须是有限数(非 NaN/Inf)",
-      "INV2 angle1(b 基座) 必须落在 servoLimit.minB..maxB 内",
-      "INV3 angle2(r 上臂) 必须落在 servoLimit.minR..maxR 内",
-      "INV4 angle3(c 下臂) 必须落在 servoLimit.minC..maxC 内",
-      "INV5 angle4(f 末端) 必须落在 servoLimit.minF..maxF 内",
+      "INV2 angle1(b 基座) 必须落在 0.0..maxB 内",
+      "INV3 angle2(r 上臂) 必须落在 0.0..maxR 内",
+      "INV4 angle3(c 下臂) 必须落在 0.0..maxC 内",
+      "INV5 angle4(f 末端) 必须落在 60.0..maxF 内",
       "INV6 recFromServo(&tmp,&Pos.ser) 必须成功返回 true",
       "INV7 Pos.rec 必须等于 recFromServo(&tmp,&Pos.ser)（逐分量差 < 1e-9）",
       "INV8 角度指令要么逐轴落地到（按 servoLimit 夹取）的结果、未提到的关节不动，要么被拒且原封不动"
@@ -727,10 +722,10 @@ int main(void) {
           !(after.c == after.c) || !(after.f == after.f)) {
         badFlags |= INV_FINITE;                       /* INV1 */
       }
-      if (after.b < servoLimit.minB - 1e-6 || after.b > servoLimit.maxB + 1e-6) badFlags |= INV_A1_RANGE;  /* INV2 */
-      if (after.r < servoLimit.minR - 1e-6 || after.r > servoLimit.maxR + 1e-6) badFlags |= INV_A2_RANGE;  /* INV3 */
-      if (after.c < servoLimit.minC - 1e-6 || after.c > servoLimit.maxC + 1e-6) badFlags |= INV_A3_RANGE;  /* INV4 */
-      if (after.f < servoLimit.minF - 1e-6 || after.f > servoLimit.maxF + 1e-6) badFlags |= INV_A4_RANGE;  /* INV5 */
+      if (after.b < 0.0 - 1e-6 || after.b > 180.0 + 1e-6) badFlags |= INV_A1_RANGE;  /* INV2 */
+      if (after.r < 0.0 - 1e-6 || after.r > 180.0 + 1e-6) badFlags |= INV_A2_RANGE;  /* INV3 */
+      if (after.c < 0.0 - 1e-6 || after.c > 180.0 + 1e-6) badFlags |= INV_A3_RANGE;  /* INV4 */
+      if (after.f < 60.0 - 1e-6 || after.f > 150.0 + 1e-6) badFlags |= INV_A4_RANGE;  /* INV5 */
 
       REC tmp;
       double recErr = -1.0;

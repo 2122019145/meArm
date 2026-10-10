@@ -101,10 +101,10 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
  * 直接用会让第一段开头猛跳一下，所以宁可拒绝启动。 */
 #define PICK_START_TOL_DEG 10.0
 
-/* 夹爪开 / 合的目标角度：与串口 O / S 完全一致，不在这里重复写死 60 / 150。
- * 如果某个物体夹不牢或夹太死，把这两个宏改成中间角度即可（例如两个的平均值）。 */
-#define PICK_TOOL_OPEN_ANGLE  (servoLimit.maxF)
-#define PICK_TOOL_CLOSE_ANGLE (servoLimit.minF)
+/* 夹爪开 / 合的目标角度：直接硬编码为 f 关节的物理行程上下限（150 / 60）。
+ * 与串口 O / S 命令的硬编码值保持一致，不再依赖已删除的 servoLimit 结构体。 */
+#define PICK_TOOL_OPEN_ANGLE  150.0
+#define PICK_TOOL_CLOSE_ANGLE 60.0
 
 /* ==================== 状态机 ==================== */
 
