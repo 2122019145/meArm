@@ -64,19 +64,20 @@
  * 把多个 -D 塞进一个带空格的字符串会被当成一个参数，报
  * "token "=" is not valid in preprocessor expressions"。
  *
- * 实测容量（Program / Data，**上一轮**"摇杆手感修正 / 偏转越大越快"后实编；百分比按 32768 / 2048 算）：
- *     取放 + 按键 + 绘图       : 32114 B (98.0%) / 1457 B (71.1%)  <- 出厂默认
- *     取放 + 绘图   + 按键关   : 28922 B (88.3%) /  540 B (26.4%)
- *     取放 + 按键   + 绘图关   : 19280 B (58.8%) / 1206 B (58.9%)
- *     绘图 + 按键   + 取放关   : 29240 B (89.2%) / 1423 B (69.5%)
- * 默认配置相对 Uno 可用 flash（32256 B）只剩 **142 B** 余量，改动前务必复测。
- * 【本轮未重新实编】删掉"偏转越大走得越快"的**动态步间间隔**：`speedIntervalMs()` 与
- * `jogIntervalMs()` 两个函数整段删除（原先各自带浮点乘除与区间夹取），
- * 改为所有移动源直接用固定的 `speed.stepDelayMs`（慢/中/快 = 80/40/20 ms）；
- * 同时给摇杆加施密特迟滞起控门槛（`JOY_HYST 25`，静止起控 65、已起控保持 40）
- * 与中位跟踪的时间门控（`JOY_TRACK_MS 20`）。**flash 方向是净省**（删掉的插值函数比
- * 新增的迟滞判断大得多），SRAM 多出 `s_axisHot[4]` + `s_trackMs[4]` = 24 B
- * （近似 Data 1481 B / 72.3%）；所以上面四行数字属于**保守偏大**的估计，复测只会更小。
+ * 实测容量（Program / Data，**v1.6.4 定版实编**；百分比按 32768 / 2048 算）：
+ *     取放 + 按键 + 绘图       : 32016 B (97.7%) / 1475 B (72.0%)  <- 出厂默认
+ *     取放 + 绘图   + 按键关   : 28814 B (87.9%) /  558 B (27.2%)
+ *     取放 + 按键   + 绘图关   : 19260 B (58.8%) / 1224 B (59.8%)
+ *     绘图 + 按键   + 取放关   : 29114 B (88.8%) / 1441 B (70.4%)
+ * 默认配置相对 Uno 可用 flash（32256 B）只剩 **240 B** 余量
+ * （单文件版 32028 B / 97.7%，余量 228 B；两者差 +12 B 是 LTO 内联顺序）。
+ * 本轮（删掉"偏转越大走得越快"的动态步间间隔 + 施密特迟滞 + 中位跟踪时间门控）相对上一轮
+ * 【四行为 32114 / 28922 / 19280 / 29240，Data 1457 / 540 / 1206 / 1423】分别
+ * **−98 / −108 / −20 / −126 B**，Data 四行 **+18 B**：删掉 `speedIntervalMs()` 与
+ * `jogIntervalMs()` 两个带浮点乘除与区间夹取的插值函数省下的，比新增的迟滞判断多；
+ * 改为所有移动源直接用固定的 `speed.stepDelayMs`（慢/中/快 = 80/40/20 ms），
+ * 摇杆新增 `JOY_HYST 25`（静止起控 65、已起控保持 40）与 `JOY_TRACK_MS 20`
+ * 时间门控，SRAM 多出 `s_axisHot[4]` + `s_trackMs[4]`（8 B，其余是布局对齐差）。
  * 上一轮（"偏转越大越快"版）四行分别 **+202 / +202 / +198 / +92 B**、Data 四行**全部不变**：
  * 花掉的是运行期中位跟踪（`readAxisAmp()` 里死区内每轮挪 1 个计数）、
  * `speedIntervalMs()` 的插值带来的乘除、以及关节步长按偏转缩放
@@ -250,33 +251,26 @@
 // ===== constant_and_positions.h =====
 //
 // constant_and_positions.h
-// 机械臂核心数据结构、运动学、范围边界与全局调速配置
+// 机械臂核心数据结构、运动学与全局调速配置（精简版）
 //
 // 内容:
-//   1. 常量 (RADtoDEG, PI, RANGE_EPS)
-//   2. 结构体 (arm / servoAngle / rectangularCoordinate / position /
-//      rangeLimit / speedCfg)
-//   3. 全局实例 (Pos / arm1 / limit / speed)
-//   4. 范围边界: 配置自检 rangeClampConfig() / 坐标钳制 clampToRange()
-//      / 可达性 isReachable()
-//   5. 反解算法 getAngle()（越界或不可达时拒绝写入并返回 false）
+//   1. 常量 (RADtoDEG, PI, ANGLE_EPS)
+//   2. 结构体 (arm / servoAngle / rectangularCoordinate / position / speedCfg)
+//   3. 全局实例 (Pos / arm1 / speed)
+//   4. 可达性 isReachable()（几何前提，不是范围限制）
+//   5. 反解算法 getAngle()（不可达时拒绝写入并返回 false）
 //   6. 全局调速 setSpeed()、档位 adjustSpeed()、降档 speedStepDown()
 //
 // 坐标轴约定（全工程统一）:
 //   x: 左右 (右为正)   y: 前后 (前为正)   z: 上下 (上为正)
 //
-// 【范围边界规则】
-//   所有会改变末端坐标的操作都必须遵守下面三条，缺一不可：
-//     (1) 先判断 limit 配置本身合法 (min 不大于 max)，见 rangeClampConfig()；
-//     (2) 每一步移动后调用 clampToRange() 把坐标夹回 [min,max] 区间，
-//         越界的方向会被"挡住"而不是继续往外走；
-//     (3) 钳制后的目标点还要能用运动学反解出有效角度、且角度不越关节硬限位，
-//         见 getAngleEx()；解不出来或角度被限位吸附(move.cpp 用的语义)就整步
-//         回退，绝不写入无效角度、也不让坐标系与真实姿态脱节。
-//
-//   实测真可达包络（肩在原点, L1=L2=20, 关节限位 b[0,180] r[0,180] c[0,180] f[60,150]）:
-//     x[-40.00, 40.00]  y[-40.00, 40.00]  z[-20.00, 40.00]
-//   当前 limit 完全覆盖包络，余量为 0（x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]）。
+// 【本版本删去的范围限制】
+//   - 笛卡尔坐标范围：struct rangeLimit / limit、rangeClampConfig()、
+//     clampToRange() 全部移除。末端 x/y/z 只是角度正解出来的派生量。
+//   - 可配置的关节硬限位：struct servoLimitCfg / servoLimit、servoSelfCheck()、
+//     isServoInRange()、clampServoAngles() 全部移除。
+//   - b/r/c 三轴的物理行程 0~180 与 f 的 60~150 分别在 moveJointStep()、
+//     posSetAngle4() 与 writeServo() 里硬编码。
 //
 #ifndef WEARM_CONSTANT_AND_POSITIONS_H
 #define WEARM_CONSTANT_AND_POSITIONS_H
@@ -289,10 +283,7 @@
 #ifndef PI
 #define PI 3.1415926535
 #endif
-/* 浮点边界比较容差：小于它视为"贴在边界上" */
-#define RANGE_EPS 1e-9
-/* 关节角容差（度）：小于它的微小负角（-1e-15 / -0.0）按 0 处理，
- * 避免在奇异点附近误判合法姿态为不可达 */
+/* 关节角容差（度）：小于它的微小负角按 0 处理 */
 #define ANGLE_EPS 1e-6
 
 /* 机械臂几何参数：上臂长、下臂长、臂高（单位与坐标一致） */
@@ -307,7 +298,7 @@ struct arm {
  *   angle2 = r  上臂(肩)俯仰
  *   angle3 = c  下臂(肘)俯仰
  *   angle4 = f  末端
- * 注意：这里存的是"解算出来的原始角度"，是否越限由 isServoInRange() 判断。 */
+ * 注意：这里存的是"解算出来的原始角度"，越界由各自的写入路径夹取。 */
 typedef struct servoAngle {
   double angle1;   /* b 水平回转舵机 */
   double angle2;   /* r 上臂俯仰舵机 */
@@ -331,155 +322,61 @@ typedef struct position {
 extern pos Pos;
 extern struct arm arm1;
 
-/* 末端位置的运动范围上下限（每个轴必须有 min <= max） */
-struct rangeLimit {
-  double minX, maxX;
-  double minY, maxY;
-  double minZ, maxZ;
-};
-extern struct rangeLimit limit;
-
-/* 每个舵机的机械允许角度区间（度）——【关节硬限位】
- * 这四个区间来自实测机械结构能安全到达的范围，是防止舵机顶死/连杆别死的
- * 最后一道防线。反解出的角度必须全部落在这里面，姿态才被接受。
- * 与 limit 的分工:
- *   limit         管"末端坐标"不许跑出工作空间（粗边界，挡得快）
- *   servoLimit    管"每个关节角"不许超出机械行程（细边界，最终防线） */
-struct servoLimitCfg {
-  double minB, maxB;   /* angle1 底部回转 */
-  double minR, maxR;   /* angle2 上臂俯仰 */
-  double minC, maxC;   /* angle3 下臂俯仰 */
-  double minF, maxF;   /* angle4 末端 */
-};
-extern struct servoLimitCfg servoLimit;
-
-/* 关节限位越界策略:
- *   SERVO_LIMIT_CLAMP  越界时把角度吸附到最近限位（动作到极限为止，不报错）
- *   SERVO_LIMIT_REJECT 越界时直接拒绝该姿态（末端停在原位，更保守） */
+/* 关节限位越界策略（当前仅对 f 生效；b/r/c 在反解阶段就被显式筛掉） */
 #define SERVO_LIMIT_CLAMP  0
 #define SERVO_LIMIT_REJECT 1
 extern int servoLimitMode;
 
-/* 校验并修正 servoLimit 配置（min<=max，且都落在舵机物理 0~180 内）。
- * 返回被修正的项数，0 表示配置本来就正确。 */
-int servoSelfCheck(void);
-
-/* 判断四个关节角是否都在 servoLimit 允许区间内（容差 ANGLE_EPS 度）。 */
-bool isServoInRange(const SER *ser);
-
-/* 把四个关节角吸附到 servoLimit 区间内，返回是否有角度被改动。 */
-bool clampServoAngles(SER *ser);
-
-/* 全局调速配置：所有移动源 (摇杆/示教点动/手动步进) 共用。
- * stepSize      —— 摇杆满偏时每格的关节角 (度)，也是步进移动的坐标单位
- * stepDelayMs   —— 每个档位固定的步间间隔 (ms)：不再随偏转变化。
- * 手感：偏转越大只是"一步走得越远"（步长按偏转比例缩放），
- * 节奏（每秒走几格）对任何偏转都一样，不存在"推得越狠走得越快"。 */
+/* 全局调速配置：所有移动源 (摇杆/示教点动/手动步进) 共用。 */
 struct speedCfg {
   double stepSize;
   int    stepDelayMs;
 };
 extern struct speedCfg speed;
 
-/* 将 pos1->rec 钳制到 [min,max] 范围内。若有轴被钳制则返回 true。
- * 内部对 min/max 做了交换保护，即使配置写反也不会把坐标推出范围。 */
-bool clampToRange(pos *pos1);
-
-/* 校验并修正 limit 配置：对每个轴做 (min,max) 排序，并统计写反的轴数。
- * 返回写反（现已自动纠正）的轴数，0 表示配置本来就正确。 */
-int rangeClampConfig(void);
-
-/* 判断坐标 rec 是否在机械臂可达工作空间内（反解不会出现 acos 越域）。 */
+/* 几何可达性：末端到肩的距离 R 必须落在 [|L1-L2|, L1+L2] 内，
+ * 否则 acos 会越域。这是反解的数学前提，不属于"范围限制"，保留。 */
 bool isReachable(const REC *rec);
 
-/* 由笛卡尔坐标 rec 反解出舵机角度 ser (逆运动学)。
- *
- * 【本机运动学模型】肩关节在原点，上臂 L1、下臂 L2，armheight = 0。
- *   舵机中立位 (90°) 的实测含义:
- *     angle1 (b) 90° -> 基座朝 +x（可达空间只占 x >= 0 一侧）
- *     angle2 (r) 90° -> 上臂竖直向上
- *     angle3 (c) 90° -> 下臂水平朝前（与上臂成 90°）
- *   平面内以 +x 为 0°、抬向 +z 为正，两个连杆的方向角为:
- *     上臂方向角 alpha = r          （r 直接就是上臂的绝对方向角）
- *     下臂方向角 beta  = r - c      （c 是下臂相对上臂往前转的折角）
- *   正运动学:
- *     x_planar = L1 cos alpha + L2 cos beta
- *     z        = L1 sin alpha + L2 sin beta + armheight
- *   标定校验（L1 = L2 = 20、armheight = 0，两处误差均为 0.00）:
- *     (r,c) = (90, 90) -> (20.00, 20.00)   初始位姿
- *     (r,c) = (90,105) -> (19.32, 14.82)   用户实测（c 增大末端往前+往下）
- *
- * 反解（闭式，无迭代）:
- *     angle1 = 90° - atan2(y, x)                    b=90 朝 +x，b<90 转向 +y
- *     cos(c) = (R² - L1² - L2²) / (2 L1 L2)         R = 末端到肩的距离
- *     alpha  = atan2(z - armheight, rho) + atan2(L2 sin c, L1 + L2 cos c)
- *   算完用正运动学回代自检，残差 > 0.05 就整组丢弃。
- *
+/* 由笛卡尔坐标 rec 反解出舵机角度 ser（逆运动学）。
  * 返回值:
- *   true  —— 运动学可解，且（按 servoLimitMode）关节角都落在 servoLimit 内
- *            （CLAMP 策略下越限的角度会被就地吸附到最近限位）
- *   false —— 目标点不可达、角度出现 NaN/Inf，或 REJECT 策略下有关节越限
+ *   true  —— 运动学可解，且 b/r/c 都落在硬编码的 0~180 内
+ *            （f 的越界按 servoLimitMode 处理）
+ *   false —— 目标点不可达、角度出现 NaN/Inf，或 REJECT 策略下 f 越限
  * 返回 false 时不修改 pos1->ser，调用方应保留上一次的有效角度。
  * angle4(末端 f) 不参与反解，保持调用前已有的值不变。 */
 bool getAngle(pos *pos1);
 
-/* getAngle 的扩展版：*clamped 回传"是否因关节硬限位被吸附"。
- * CLAMP 策略下可能出现"返回 true 但角度被改过"（clamped=true），
- * 此时末端实际到不了目标点。需要"精确到达"语义的调用方
- * （moveJointStep 的每一步移动）应改用本函数并在 clamped 时回退坐标，
- * 否则坐标系会与真实姿态越差越远。
+/* getAngle 的扩展版：*clamped 回传"是否因 f 越限被吸附"。
  * clamped 传 NULL 时行为与 getAngle 完全一致。 */
 bool getAngleEx(pos *pos1, bool *clamped);
 
 /* 正运动学：由四个舵机角度算出末端笛卡尔坐标，写入 *rec。
- * 【角度模式下的用途】现在被控量是关节角本身，末端 x/y/z 只是显示量，
- * 每次改完角度都要用它刷新 Pos.rec，让"坐标"永远等于"角度的真实结果"，
- * 而不是一个越用越偏的独立状态。
  * angle4(f) 是末端夹具的自转，不影响被控点位置，不参与本计算。
  * rec 与 ser 允许指向同一个 pos 结构体（内部先读后写）。
  * 返回 true 表示算出了有限数；参数为空时返回 false。 */
 bool recFromServo(REC *rec, const SER *ser);
 
-/* 把 Pos 复位到工作空间内的一个安全初始点，并解算一次舵机角度。
- * 应在 setup() 里 writeServo() 之前调用，避免开机时舵机角度为 0 乱动。 */
+/* 把 Pos 复位到工作空间内的一个安全初始点，并解算一次舵机角度。 */
 void posInit(void);
 
 /* 取"开机初始位姿"（POS_HOME）对应的关节角，写到 ser->angle1/2/3。
- * 角度真值来自 POS_HOME 的反解，所以别处不需要写死 90/90/90 —— 以后改了
- * POS_HOME 或关节限位，回中仍然会回到真正的初始位姿。
- * ser->angle4 不会被改动：末端开合不是坐标反解的自由度，调用者传什么就保持什么。
- * 返回 true 表示反解成功（此时 ser->angle1..3 已更新）。 */
+ * ser->angle4 不会被改动。返回 true 表示反解成功。 */
 bool posGetHomeAngles(SER *ser);
 
 /* 设置末端舵机 angle4 (f) 的角度（度）。
- * 反解不会改动 angle4，它只能由这些接口或直接写 Pos.ser.angle4 改变，
- * 一个坐标点里 angle4 与 x/y/z 是彼此独立的自由度。
- * 角度会被夹在 servoLimit 的 f 行程内；返回 true 表示确实发生了变化。 */
+ * 角度会被夹在硬编码的 60~150 内；返回 true 表示确实发生了变化。 */
 bool posSetAngle4(double angleDeg);
 
-/* 设置全局调速参数 (带合法性校验)。
- * stepSize 必须 > 0；stepDelayMs 必须 > 0。
- * 不合法的项保持原值；只有参数确实被改动时才把档位标记为自定义 (-1)。 */
+/* 全局调速 */
 void setSpeed(double stepSize, int stepDelayMs);
 
-/* 按档位调整速度:
- *   SPEED_SLOW   —— 慢速: 小步长 + 长间隔, 精细移动
- *   SPEED_NORMAL —— 中速: 默认参数
- *   SPEED_FAST   —— 快速: 大步长 + 短间隔, 高速移动
- * 也可直接 setSpeed(...) 自定义。
- * 返回生效的档位；level 非法时返回 -1 且不改动任何参数。 */
 #define SPEED_SLOW   0
 #define SPEED_NORMAL 1
 #define SPEED_FAST   2
 int  adjustSpeed(int level);
-
-/* 返回当前档位 (-1 表示自定义/被 setSpeed 覆盖过)。 */
 int  speedGetLevel(void);
-
-/* 档位名，用于串口提示："慢速"/"中速"/"快速"/"自定义"。 */
 const char *speedLevelName(int level);
-
-/* 在 慢→中→快→慢 之间循环降一档，返回生效的档位。 */
 int  speedStepDown(void);
 
 #endif /* WEARM_CONSTANT_AND_POSITIONS_H */
@@ -660,9 +557,9 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 // 【本工程的控制方式】控制的是机械臂的四个关节角，不是末端坐标。
 //   被控量（状态量）: Pos.ser.angle1..angle3（b / r / c）与 angle4（f）
 //   派生量（显示量）: Pos.rec.x/y/z —— 由正运动学实时算出，不是目标值
-//   软件边界        : servoLimit（每个关节的机械行程）是最终防线；
-//                     rangeLimit 只是"这个角度算出来的位置跑出工作空间就挡住"
-//                     的额外保险，角度模式下坐标已不再是用户输入。
+//   软件边界        : b/r/c 三轴的物理行程 0~180（硬编码），
+//                     f 的 60~150（在 posSetAngle4() 内硬编码）；
+//                     本版本已删除可配置的 servoLimit 与笛卡尔坐标的 rangeLimit。
 //
 // 设计说明:
 //   - moveJointStep 是主接口：把某个关节角加减一个步长，返回三态结果，
@@ -676,11 +573,11 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 //   DIR_LEFT/RIGHT<-> 基座 b (angle1)
 //
 // 【边界行为】
-//   每一步都做两重校验，任一失败则整步回退，Pos 保持在上一次的有效位置：
-//     1) 关节限位：角度夹到 servoLimit 内；夹完与原来相同说明已到机械行程
+//   每一步都在 Pos 的副本上试算，失败路径一个字节都不写 Pos：
+//     1) 关节硬限位：b/r/c 三轴硬编码夹到 0~180；夹完与原来相同说明已到行程
 //        尽头 -> MOVE_AT_LIMIT。
-//     2) 位置边界：由新角度正解出的末端坐标必须仍在 rangeLimit 内，
-//        否则整步回退 -> MOVE_AT_LIMIT（避免臂跑到工作空间外）。
+//     2) 正运动学自检：由新角度算出的末端坐标必须是有限数，否则
+//        -> MOVE_UNREACHABLE（几何上不可达）。
 //
 #ifndef WEARM_MOVE_H
 #define WEARM_MOVE_H
@@ -688,12 +585,12 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 
 /* 固定 1 单位的六个方向步进（自动钳制 + 反解舵机角度）。
  * 越界或不可达时什么都不改，函数无返回值。 */
-void moveup(void);       /* z +1 上升 */
-void movedown(void);     /* z -1 下降 */
-void moveleft(void);     /* x -1 左 */
-void moveright(void);    /* x +1 右 */
-void moveforward(void);  /* y +1 前 */
-void movebackward(void); /* y -1 后 */
+void moveup(void);       /* 下臂 c +1 */
+void movedown(void);     /* 下臂 c -1 */
+void moveleft(void);     /* 基座 b -1 */
+void moveright(void);    /* 基座 b +1 */
+void moveforward(void);  /* 上臂 r +1 */
+void movebackward(void); /* 上臂 r -1 */
 
 /* 方向枚举：JointDir 的数值基础，也是定长函数 moveup/movedown/... 的取值来源 */
 enum MoveDir {
@@ -718,8 +615,8 @@ enum JointDir {
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
-  MOVE_AT_LIMIT    = 2,  /* 方向被范围边界挡住（已在边界上） */
-  MOVE_UNREACHABLE = 3   /* 目标点超出机械臂臂展，已整步回退 */
+  MOVE_AT_LIMIT    = 2,  /* 方向被关节硬限位挡住（b/r/c 的 0~180） */
+  MOVE_UNREACHABLE = 3   /* 目标姿态正运动学自检失败，已整步回退 */
 };
 
 /* 按指定步长移动一个关节角（【角度模式下的主接口】）。
@@ -728,13 +625,10 @@ enum MoveResult {
  * 见 joystick_control.h；本函数就是"把某一个关节角加/减 stepSize 度"的底层动作。
  *
  * 每步的动作流程（保证 Pos.ser 与 Pos.rec 永远自洽）:
- *   1. 先把关节角按 dir 加减 stepSize 度（坐标轴同时跟着试探前移/后退，
- *      这一步只是为了让 Pos.rec 有个落点，真正的坐标以第 4 步为准）；
- *   2. 关节角夹到 servoLimit 区间内 —— 夹完等于原值说明这个方向已到限位，
+ *   1. 先把关节角按 dir 加减 stepSize 度（在副本上试算）；
+ *   2. b/r/c 三轴硬编码夹到 0~180 —— 夹完等于原值说明这个方向已到限位，
  *      返回 MOVE_AT_LIMIT；
- *   3. 用正运动学 recFromServo() 重算末端坐标，并夹到 rangeLimit 内。
- *      坐标被夹回说明"这个角度在几何上跑出了位置边界"，整步回退，
- *      返回 MOVE_AT_LIMIT（摇杆表现为"推到头了"）；
+ *   3. 用正运动学 recFromServo() 重算末端坐标，失败返回 MOVE_UNREACHABLE；
  *   4. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
  *
  *   dir 取 JointDir 的值。stepSize 传 <= 0 时使用全局 speed.stepSize（随调速档位变化）。
@@ -780,10 +674,7 @@ enum MoveXyzResult {
  *   MOVE_XYZ_JOG   示教点动：超出上限的部分夹到上限（尽量走一点），被吸附
  *                  仍然算失败 —— 手动操作宁可到不了请求点，也绝不原地卡住。
  *   MOVE_XYZ_NOW   即时到位（串口 x/y/z）：不限速、一次调用直接落到目标姿态，
- *                  并允许硬限位吸附 —— 与串口原来的"严格移动"逐位相同。
- *                  【唯一差异】旧代码在 recFromServo() 失败时会打一句
- *                  WEARM_DEBUG_SERIAL 调试警告，这里不打了（返回值本来就被丢弃，
- *                  姿态、回包与结果码完全不变）。 */
+ *                  并允许硬限位吸附。 */
 #define MOVE_XYZ_TRACK 0
 #define MOVE_XYZ_JOG   1
 #define MOVE_XYZ_NOW   2
@@ -1568,6 +1459,10 @@ void joystickLoop(void);
  * 所以每一个原调用点的结果都与原来逐位相同。
  *
  * 只有 C++11 裸机 AVR 代码；本文件不产生任何数据段，也不打印任何东西。
+ *
+ * 【本版本已删除】pathCorePointOk() 里的 limit 范围检查。笛卡尔坐标范围
+ * 限制（rangeLimit/limit）已按需求整体移除；b/r/c 的物理行程 0~180 在
+ * moveJointStep() 内硬编码，f 的 60~150 在 posSetAngle4() 内硬编码。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
@@ -1592,13 +1487,12 @@ inline bool pathCoreSolveJoint(double x, double y, double z,
   return true;
 }
 
-/* 这个工作区点能不能用：在 limit 内 + isReachable() + 反解成功且没被吸附。 */
+/* 这个工作区点能不能用：几何可达 + 反解成功且没被吸附。
+ * 【本版本已删除】原来的 limit 三轴范围检查。笛卡尔坐标范围限制已按需求
+ * 整体移除；剩下的几何可达性 isReachable() 属于反解的数学前提（acos 定义域），
+ * 不是"范围限制"，仍然保留。 */
 inline bool pathCorePointOk(double x, double y, double z,
                             double *b, double *r, double *c) {
-  if (x < limit.minX || x > limit.maxX) return false;
-  if (y < limit.minY || y > limit.maxY) return false;
-  if (z < limit.minZ || z > limit.maxZ) return false;
-
   REC rec;
   rec.x = x;
   rec.y = y;
@@ -1792,7 +1686,7 @@ ISR(TIMER1_COMPA_vect) {
 // ===== constant_and_positions.cpp =====
 //
 // constant_and_positions.cpp
-// 机械臂核心实现：运动学反解、范围边界、全局调速
+// 机械臂核心实现：运动学反解、几何可达性、全局调速（精简版）
 //
 
 /* ---------- 编译开关 ---------- */
@@ -1801,126 +1695,22 @@ ISR(TIMER1_COMPA_vect) {
 
 #if WEARM_DEBUG_SERIAL
   #define WEARM_LOG(msg)   Serial.println(F(msg))
-  #define WEARM_LOGN(val)  Serial.println(val)
 #else
   #define WEARM_LOG(msg)   ((void)0)
-  #define WEARM_LOGN(val)  ((void)0)
 #endif
 
-/* 复位目标点：选在工作空间内部，既不会触发钳制也保证可解算。
- * 选 (20,0,20) 的理由:
- *   ① 它正是用户标定的初始位姿 —— 舵机 (b,r,c)=(90,90,90,0) 时
- *      上臂竖直向上、下臂水平朝前，末端恰好落在这里；
- *   ② 该点离边界有余量（对当前 limit: 到 maxX 还有 20.0、到 maxZ 还有 20.0、
- *      到 minZ 还有 40.0），开机不会撞限位；
- *   ③ 避免了 x=0 的轴线退化点（rho=0 时回转角无法确定）。
- * 它同时作为 Pos 的初始坐标，避免开机时舵机角度为 0 乱动。 */
+/* 复位目标点：工作空间内部的安全点。
+ * 选 (20,0,20)：
+ *   ① 是用户标定的初始位姿 —— 舵机 (b,r,c)=(90,90,90) 时末端正好在这里；
+ *   ② 远离边界，开机不会撞限位；
+ *   ③ 避免 x=0 的轴线退化点（rho=0 时回转角无法确定）。 */
 static const REC POS_HOME = { 20, 0, 20 };
 
-/* ---------- 全局配置实例 ---------- */
-
-/* 机械臂几何参数，请根据实际硬件修改 (上臂长 / 下臂长 / 末端伸出量)。
- * armheight 在"平面两连杆"模型里表示末端/手爪沿下臂方向再伸出的长度。
- * 本机按实测标定为 0 —— 也就是"下臂末端"本身就是被控点：
- *   (r,c)=(90,90) 时上臂竖直向上、下臂水平朝前，末端正好落在 (20,0,20)。 */
+/* 机械臂几何参数（上臂长 / 下臂长 / 末端伸出量） */
 struct arm arm1 = { 20, 20, 0 };
 
-/* 全局位姿实例。
- * 注意: 头文件里 Pos 只是 extern 声明，真正的定义必须在这里，
- * 否则链接阶段会报 undefined reference to `Pos'。
- * 这里先用安全点初始化，posInit() 会再钳制并解算一次角度。 */
+/* 全局位姿实例（头文件里 Pos 是 extern 声明，定义必须放这里） */
 pos Pos = { { 0, 0, 0, 0 }, { POS_HOME.x, POS_HOME.y, POS_HOME.z } };
-
-/* 末端位置运动范围（单位与坐标一致）。
- * 该配置必须满足 min <= max，否则由 rangeClampConfig() 自动纠正并报警。
- *
- * 【本机实测可达空间】(肩关节在原点, L1=L2=20, armheight=0,
- *   关节限位见 servoLimit: b[0,180] r[0,180] c[0,180] f[60,150])
- *   用 probe_axes（**直接调用固件 recFromServo()**，不重写公式）
- *   对关节角全域 1° 步长扫描 5929741 个组合，实测:
- *     x[-40.00, 40.00]   y[-40.00, 40.00]   z[-20.00, 40.00]
- *   四个极端姿态（b=90° 时 θ=0，末端都落在 x-z 平面内）:
- *     x=+40  b=90 r=0   c=0     上臂、下臂一起水平朝前伸直
- *     x=-40  b=90 r=180 c=0     上臂、下臂一起水平朝后伸直
- *     z=+40  b=90 r=90  c=0     上臂竖直向上、下臂水平朝前
- *     z=-20  b=90 r=0   c=90    上臂水平朝前、下臂向下折 90°
- *   逐高度扫描（每 2° 一层，x/y 为该层上的完整可达区间）:
- *     z= -20.0: x[  0.00, 26.18]  y[-26.18, 26.18]
- *     z= -18.0: x[  0.00, 30.30]  y[-30.30, 30.30]
- *     z= -16.0: x[  0.00, 33.12]  y[-33.12, 33.12]
- *     z= -14.0: x[  0.00, 35.09]  y[-35.09, 35.09]
- *     z= -12.0: x[  0.00, 36.58]  y[-36.58, 36.58]
- *     z= -10.0: x[  0.00, 37.82]  y[-37.82, 37.82]
- *     z=  -8.0: x[  0.00, 38.67]  y[-38.67, 38.67]
- *     z=  -6.0: x[  0.00, 39.32]  y[-39.32, 39.32]
- *     z=  -4.0: x[  0.00, 39.75]  y[-39.75, 39.75]
- *     z=  -2.0: x[  0.00, 39.97]  y[-39.97, 39.97]
- *     z=   0.0: x[-40.00, 40.00]  y[-40.00, 40.00]   <- x/y 最远
- *     z=   2.0: x[-39.98, 39.98]  y[-39.98, 39.98]
- *     z=   4.0: x[-39.88, 39.88]  y[-39.88, 39.88]
- *     z=   6.0: x[-39.66, 39.66]  y[-39.66, 39.66]
- *     z=   8.0: x[-39.33, 39.33]  y[-39.33, 39.33]
- *     z=  10.0: x[-38.89, 38.89]  y[-38.89, 38.89]
- *     z=  12.0: x[-38.45, 38.45]  y[-38.45, 38.45]
- *     z=  14.0: x[-37.82, 37.82]  y[-37.82, 37.82]
- *     z=  16.0: x[-36.95, 36.95]  y[-36.95, 36.95]
- *     z=  18.0: x[-36.10, 36.10]  y[-36.10, 36.10]
- *     z=  20.0: x[-35.15, 35.15]  y[-35.15, 35.15]
- *     z=  22.0: x[-33.92, 33.92]  y[-33.92, 33.92]
- *     z=  24.0: x[-32.56, 32.56]  y[-32.56, 32.56]
- *     z=  26.0: x[-31.09, 31.09]  y[-31.09, 31.09]
- *     z=  28.0: x[-29.49, 29.49]  y[-29.49, 29.49]
- *     z=  30.0: x[-27.53, 27.53]  y[-27.53, 27.53]
- *     z=  32.0: x[-25.17, 25.17]  y[-25.17, 25.17]
- *     z=  34.0: x[-22.37, 22.37]  y[-22.37, 22.37]
- *     z=  36.0: x[-19.09, 19.09]  y[-19.09, 19.09]
- *     z=  38.0: x[-14.98, 14.98]  y[-14.98, 14.98]
- *     z=  40.0: x[ -8.66,  8.66]  y[ -8.66,  8.66]
- *   注 1：每一层是 |z - 层高| <= 1 的**一层**，不是"z 恰好等于层高"的精确平面。
- *   所以 z=40.0 那一层并不是"仅直立一点"，它还含了 z=39.05 的姿态
- *   （r=103,c=1 给 x=-8.66；r=78,c=1 给 x=+8.66）。真正的 z=40 只有
- *   (r,c)=(90,0) 一个姿态，此时 x=y=0。
- *   注 2：负 x 来自 ρ = 20cos(r) + 20cos(r-c) 变成负值的"朝后伸直/反折"
- *   姿态（例如 r=180、c=0 时 ρ=-40，b=90° 就落在 x=-40），不是坐标算错。
- *
- * 【limit 怎么定的】按用户选择"完全按包络，向外取整到 0.5"：
- *     minX = -40.0 (包络 -40.00)            maxX = 40.0 (包络 40.00)
- *     minY = -40.0 (包络 -40.00)            maxY = 40.0 (包络 40.00)
- *     minZ = -20.0 (包络 -20.00)            maxZ = 40.0 (包络 40.00)
- *   注意：这次包络的六个端值恰好都落在 0.5 的整数倍上，所以"向外取整到 0.5"
- *   之后余量是 0（不是上一个行程时的 0.5）。余量 0 仍然安全，因为包络本身
- *   是解析可证的（|20cos(r)+20cos(r-c)| <= 40、-20 <= 20sin(r)+20sin(r-c) <= 40
- *   在 r,c ∈ [0,180] 时恒成立），1° 步长扫描没有漏掉极端值 —— probe_axes
- *   实测"落在 limit 外的采样点 0 / 5929741 = 0.0%"，且三路关节都能走满行程。
- *   为什么不沿用更小的方盒子: 角度模式下被控量是**关节角**，坐标只是
- *   正运动学算出来的派生量。limit 在这里的作用是"别让机械臂进到没标定的
- *   区域"，而不是"帮用户规划路径"。如果 limit 比真实包络小，那么关节角
- *   明明还有行程、摇杆却会突然停住（表现为"推到头了"），反而更难用。
- *   limit 因此按包络取，四路关节都能走满 servoLimit 行程。
- *
- * 【代价 / 注意】做到这一点后 limit 只是"软护栏"：
- *   - 基座可以摆到 x<0 的后方（上臂 r 与下臂角 (r-c) 一起朝后伸直的姿态）；
- *   - 末端最低到 z≈-20.00，比桌面低，存在撞台面的可能。
- *   真正的最后防线仍然是 servoLimit（每个关节的机械行程）。
- *   上机请先在慢速档、空载、抬离台面的情况下单步试。
- *
- *   落地时 run_axes 自查（probe_axes [3] 段）:
- *     b 基座: 向小端/大端都能走满行程
- *     r 上臂: 向小端/大端都能走满行程（新行程 0~180）
- *     c 下臂: 向小端/大端都能走满行程
- *
- * 为什么 minX = -40.0 而不是 0: 基座舵机 b 的行程是 0~180°，而 b=90° 朝 +x，
- *   所以 x 的正负由平面半径 ρ = 20cos(r) + 20cos(r-c) 决定。r 与 (r-c) 各自
- *   都能到 180°（两节臂一起朝后伸直），此时 ρ 最小是 -40（r=180、c=0），
- *   只要 b=90°（θ=0）末端就落在 x=-40。旧行程 r∈[45,105] 时 ρ 最小只到
- *   -10.35（r=105、c=0），那一侧很窄，所以当时 minX 才敢取到 -10.5。
- *   r 放开到 0~180 之后这一侧明显扩大，limit 必须相应扩展，
- *   否则四路关节走不满行程（会被软护栏拦腰截住）。 */
-struct rangeLimit limit = {
-  .minX = -40.0, .maxX = 40.0,
-  .minY = -40.0, .maxY = 40.0,
-  .minZ = -20.0, .maxZ = 40.0
-};
 
 /* 全局调速默认值：中速（1.0 度/格、固定 40ms 一格 = 25°/s） */
 struct speedCfg speed = {
@@ -1928,55 +1718,20 @@ struct speedCfg speed = {
   .stepDelayMs = 40
 };
 
-/* 【关节硬限位】四个舵机的机械允许行程（度）
- *   b = angle1 底部回转   c = angle3 下臂俯仰
- *   r = angle2 上臂俯仰   f = angle4 末端
- * 按实测机械结构填写；反解结果超出这里会被夹住或拒绝（见 servoLimitMode）。 */
-struct servoLimitCfg servoLimit = {
-  .minB = 0,   .maxB = 180,
-  .minR = 0,   .maxR = 180,
-  /* r（上臂）按用户要求放开到 0~180：r=0 上臂水平朝前，r=180 上臂朝后水平。
-   * 与 c 组合后末端最低可到肩关节以下约 20，上机请先在慢速档、空载、
-   * 抬离台面的情况下单步试。 */
-  /* c（下臂）按用户要求放开到 0~180。注意 c 接近 180° 时下臂会往后折回、
-   * 末端重新向前伸，存在下臂与上臂/底座干涉的风险 —— 这是机械行程的理论
-   * 上限，不是"保证不撞"的区间，上机请先用慢速档单步试。
-   * 因为关节角现在是直接被控量（角度模式），这条限位就是唯一的软件边界。 */
-  .minC = 0,   .maxC = 180,
-  .minF = 60,  .maxF = 150
-};
-
-/* 关节越界策略：吸附到最近限位（动作到极限为止，不会突然停住） */
+/* 关节越界策略：吸附到最近限位（当前仅对 f 生效） */
 int servoLimitMode = SERVO_LIMIT_CLAMP;
 
-/* 关节越界提示的限流时间戳（避免持续越限把串口刷爆）。
- * 这条提示只在 WEARM_DEBUG_SERIAL 打开时才有意义，所以连变量一起裁掉，
- * 免得关掉调试后它变成"定义了但没人用"的告警源。 */
-#if WEARM_DEBUG_SERIAL
-static unsigned long lastServoLogTime = 0;
-#endif
-
-/* 当前档位。-1 = 自定义(由 setSpeed 直接写入)，否则为 SPEED_* 之一 */
+/* 当前档位。-1 = 自定义，否则为 SPEED_* 之一 */
 static int speedLevel = SPEED_NORMAL;
 
 /* ---------- 内部小工具 ---------- */
 
-/* True for every finite value (NaN and +-Inf rejected).
- * "v - v == 0" is bit-exact equivalent to "!isnan(v) && !isinf(v)": a finite
- * value minus itself is +0.0, while NaN/Inf minus itself is NaN, which compares
- * unequal to 0.0. The build uses -Os -flto without -ffast-math /
- * -ffinite-math-only, so the compiler may not fold v - v away.
- * Kept out-of-line on purpose: inlining it at all ~13 call sites costs more
- * flash than one tiny shared function plus a call. */
+/* True for every finite value (NaN / ±Inf rejected)。 */
 static bool __attribute__((noinline)) isFiniteNum(double v) {
   return (v - v) == 0.0;
 }
 
-/* 把一个 double 限定到 [lo, hi]，且 lo/hi 写反时自动交换。
- * Kept out-of-line on purpose: it is used by three different loops
- * (clampServoAngles / clampToRange / posSetAngle4) and inlining the
- * "swap the bounds, then two comparisons" sequence in each of them costs
- * more flash than one shared copy plus a call. */
+/* 把一个 double 限定到 [lo, hi]，且 lo/hi 写反时自动交换。 */
 static double __attribute__((noinline)) clampDouble(double v, double lo, double hi) {
   if (lo > hi) { double t = lo; lo = hi; hi = t; }
   if (v < lo) return lo;
@@ -1984,138 +1739,10 @@ static double __attribute__((noinline)) clampDouble(double v, double lo, double 
   return v;
 }
 
-/* ---------- 关节硬限位 ---------- */
-
-/* The four joints are stored as eight consecutive doubles inside servoLimitCfg
- * (minB,maxB,minR,maxR,minC,maxC,minF,maxF). All members have the same type and
- * alignment, so the struct has no padding and the four (min,max) pairs can be
- * walked with one pointer instead of a four-entry mapping table.
- *
- * This is also why the old jointMin[]/jointMax[] mirror tables are gone: reading
- * servoLimit directly yields exactly the values those mirrors were refreshed to
- * (servoSelfCheck normalizes servoLimit in place and nothing else writes it),
- * while the mirrors cost 72 bytes of RAM plus a refresh loop in every call. */
-#define JOINT_PAIR(i) (&servoLimit.minB + 2 * (i))
-
-/* 单字符关节名，仅用于串口提示（调试关闭时整块被裁掉） */
-#if WEARM_DEBUG_SERIAL
-static const char jointName[4] PROGMEM = { 'b', 'r', 'c', 'f' };
-#endif
-
-/* 修正写反或超出 0~180 的关节限位，返回被修正的项数。
- * 舵机物理行程只有 0~180°，所以越界的限位本身也是配置错误。
- * Sorting and clamping each joint in turn gives exactly the same final values
- * and the same corrected-item count as the old "sort all four, then clamp all
- * four" two-pass version, because the four joints are independent. */
-int servoSelfCheck(void) {
-  int bad = 0;
-  double *p = &servoLimit.minB;
-  for (int i = 0; i < 4; i++, p += 2) {
-    if (p[0] > p[1]) { double t = p[0]; p[0] = p[1]; p[1] = t; bad++; }
-    if (p[0] < 0.0)   { p[0] = 0.0;   bad++; }
-    if (p[1] > 180.0) { p[1] = 180.0; bad++; }
-  }
-  if (bad > 0) {
-    WEARM_LOG("[servo] ERROR: joint limit config invalid, auto-corrected");
-  }
-  return bad;
-}
-
-/* The four SER angle fields are also consecutive doubles (angle1..angle4), so a
- * single pointer walks them in joint order -- the old serAnglePtr() switch and
- * the jointOk() wrapper are gone; the explicit NULL checks on the result could
- * never fire because the switch always returned a valid member. */
-
-/* 判断四个关节角是否都在限位内（容差 ANGLE_EPS 度）。 */
-/* Kept out-of-line: several modules call it, and duplicating the 4-joint scan
- * in every caller costs more flash than one shared copy plus a call. */
-bool __attribute__((noinline)) isServoInRange(const SER *ser) {
-  if (ser == NULL) return false;
-  const double *ap  = &ser->angle1;
-  const double *lim = JOINT_PAIR(0);
-  for (int i = 0; i < 4; i++, ap++, lim += 2) {
-    if (!(*ap >= lim[0] - ANGLE_EPS && *ap <= lim[1] + ANGLE_EPS)) return false;
-  }
-  return true;
-}
-
-/* 【为什么把两个钳制循环合成一份实现】
- * clampServoAngles（四个关节，走 servoLimit 的 8 个连续 double）和
- * clampToRange（三个轴，走 limit 的 6 个连续 double）原本各写了一遍
- * "取一对 (min,max) -> clampDouble -> 变了才写回"的循环，两份机器码几乎逐字相同，
- * 只差循环次数。这里把循环体收进 clampPairRun()，两个对外函数的
- * 顺序（关节 b,r,c,f / 轴 x,y,z）、容差、返回语义完全不变。 */
-static bool __attribute__((noinline)) clampPairRun(double *v, const double *lim, int n) {
-  bool changed = false;
-  for (int i = 0; i < n; i++, v++, lim += 2) {
-    double c = clampDouble(*v, lim[0], lim[1]);
-    if (c != *v) { *v = c; changed = true; }
-  }
-  return changed;
-}
-
-bool clampServoAngles(SER *ser) {
-  if (ser == NULL) return false;
-  return clampPairRun(&ser->angle1, JOINT_PAIR(0), 4);
-}
-
-/* 【applyJointLimits 为什么被删掉】
- * 原来这里有一个 static applyJointLimits(ser, clamped)：逐个扫描四个关节，
- * 命中第一个越限关节后按 servoLimitMode 决定"拒绝"还是"四关节一起吸附"。
- * 它唯一的调用点在 getAngleEx 的末尾（全固件没有第二个调用点）。
- *
- * 但反解在调用它之前，已经用**逐字相同**的容差表达式
- *     rDeg >= minR - EPS  && rDeg <= maxR + EPS      （EPS = 1e-9）
- * 把 angle1..angle3 筛进了 [min - 1e-9, max + 1e-9]（c 同理），随后那三个角
- * 只多了一次"微小负角归零"，而归零只会把值推向区间**内部**：
- *   能让负角通过 rDeg >= minR - 1e-9 的只可能是 minR < 1e-9，
- *   此时归零后的 0 仍然 >= minR - 1e-9；
- *   上界方向 maxR >= minR > 原值，0 更不可能越界。
- * 所以那个四关节扫描在这一步**只可能命中 angle4** —— 一个从反解里原样带过来、
- * 本函数从不修改的关节。这段扫描是纯冗余：删掉后
- *   · REJECT 策略：只有 f 越限才返回 false，与"扫到第一个越限关节"等价；
- *   · CLAMP 策略：f 越限时照样调用 clampServoAngles()，
- *     它**仍然是四个关节一起吸附**，所以端点上的 b/r/c 该被吸附的依旧被吸附。
- * （那段 500ms 限流的串口提示也一并搬到 getAngleEx 里，文本逐字不变，
- *  只是关节名固定是 jointName[3]='f'、限位固定取 minF/maxF。） */
-/* ---------- 范围边界 ---------- */
-
-/* 对每个轴做 (min,max) 排序，返回原来写反了的轴数 */
-int rangeClampConfig(void) {
-  int bad = 0;
-  if (limit.minX > limit.maxX) { double t = limit.minX; limit.minX = limit.maxX; limit.maxX = t; bad++; }
-  if (limit.minY > limit.maxY) { double t = limit.minY; limit.minY = limit.maxY; limit.maxY = t; bad++; }
-  if (limit.minZ > limit.maxZ) { double t = limit.minZ; limit.minZ = limit.maxZ; limit.maxZ = t; bad++; }
-  if (bad > 0) {
-    WEARM_LOG("[limit] ERROR: range min>max, auto-corrected:");
-    WEARM_LOG("[limit]   X/Y/Z = [min,max] -> check constant_and_positions.cpp");
-    WEARM_LOGN(bad);
-  }
-  return bad;
-}
-
-/* 将位置钳制到配置的范围内，若有轴越界则返回 true。
- * 三个轴各自独立钳制，不会因为一个轴越界而影响其它轴。 */
-bool clampToRange(pos *pos1) {
-  if (pos1 == NULL) return false;
-  /* rec 的 x/y/z 与 limit 的 (min,max) 对都是连续存放的，一个指针就能走完三个轴。
-   * 处理顺序仍是 x -> y -> z，每个轴独立钳制、独立比较。 */
-  return clampPairRun(&pos1->rec.x, &limit.minX, 3);
-}
-
 /* ---------- 运动学 ---------- */
 
-/* 可达性检查：判断反解时会不会出现 acos 越域或 0/0。
- *
- * 本机械臂是"肩关节在原点、两杆各 20"的平面两连杆结构：
- *   肩关节轴心 = 基座回转轴上的 (0,0,0)，末端坐标 z 以它为原点。
- *   末端与肩关节的距离 R 必须落在 [|L1-L2|, L1+L2] 内；
- *   R = |L1-L2| 只有在两杆完全折回（c = 180°，本机 c 上限已放开到 180）
- *   时才取到，此时末端落回肩关节轴线上（rho = 0）。rho 极小时回转角
- *   atan2(y,x) 在数学上不可确定，由 getAngleEx 取默认中立位 90°，
- *   是否真的可达交给关节限位与正解残差判定。
- * 关节行程（servoLimit）的最终把关在 getAngle() 里做，
- * 这里只挡掉"根本没有几何解"的目标点。 */
+/* 几何可达性：末端到肩的距离 R 必须落在 [|L1-L2|, L1+L2] 内，
+ * 否则 acos 会越域。这是反解的前提，不是用户可配的"范围限制"。 */
 bool isReachable(const REC *rec) {
   if (rec == NULL) return false;
   if (!isFiniteNum(rec->x) || !isFiniteNum(rec->y) || !isFiniteNum(rec->z)) return false;
@@ -2127,41 +1754,15 @@ bool isReachable(const REC *rec) {
   double L2 = arm1.armLength2;
   if (L1 <= 0 || L2 <= 0) return false;
 
-  /* 条件 1: 上臂/下臂/空间半径能构成三角形。
-   * 【必须带容差】两杆完全伸直时 R 在数学上恰好等于 L1+L2，但浮点算出来
-   * 常是 L1+L2 再大最后一位（例如 40.000000000000004 > 40），
-   * 严格比较会把"全伸直"这一整类姿态（c=0 时的所有 r）判成不可达 ——
-   * 实测有 19 组 rho=16.905、z=36.252 的目标因此反解失败。
-   * 1e-9 的容差远小于机构精度，不会把真正够不着的点放进来。 */
   const double GEOM_EPS = 1e-9;
   if (R > L1 + L2 + GEOM_EPS || R < fabs(L1 - L2) - GEOM_EPS) return false;
-  /* 允许末端正好落在基座轴线上（r = 0）: 此时回转角不可确定，
-   * 由 getAngleEx 取默认朝 +x，并由关节限位/残差校验决定是否真的可达。 */
   return true;
 }
 
-/* 正运动学：四个舵机角度 -> 末端笛卡尔坐标。
- *
- * 【为什么需要它】角度模式下被控量直接是关节角，Pos.rec 不再是"用户设的目标"，
- * 而是"当前角度算出来的真实位置"。每次改角度后都调一次，让坐标永远与角度自洽。
- * 四个关节角就是四个自由度：b（回转）决定末端绕基座轴的方位，
- * r/c（上臂/下臂）决定平面内的半径与高度，f 只转末端夹具、不影响被控点。
- * 与 getAngleEx 里的正解保持严格一致（同一组公式）：
- *   alpha = r, beta = r - c
- *   x_planar = L1 cos alpha + L2 cos beta
- *   z        = L1 sin alpha + L2 sin beta + armheight
- *   theta    = (90 - b)  ->  x = x_planar cos theta,  y = x_planar sin theta */
-/* 【为什么把平面正解抽成一份 noinline 实现】
- * 同一组公式（x = L1·cosα + L2·cosβ，z = L1·sinα + L2·sinβ）在本文件里出现了两次：
- *   · recFromServo：由四个舵机角算末端坐标（alpha = r/RADtoDEG, beta = (r-c)/RADtoDEG）；
- *   · getAngleEx 内联的 ikBranch：由反解出的 alpha/beta 回代核对残差。
- * 两次各是"4 次 cos/sin + 4 次乘法 + 2 次加法"共约 160 字节机器码，且逐字相同。
- * 合成这一份后两个调用点共用同一段代码：
- *   · 表达式与求值顺序逐字不变（同一组乘加，舍入结果完全一致）；
- *   · L1/L2 每次现读 arm1（与两处原来的读法一致，调用期间没人会改 arm1）；
- *   · 出参走指针，调用方仍先落到自己的局部变量再写回结构体，
- *     所以 rec 与 ser 指向同一结构体（pos）时也照旧安全。
- * noinline 是刻意的：被内联回两处就退化成原来那两份重复机器码了。 */
+/* 平面正解（两杆模型）：
+ *   x = L1·cos(alpha) + L2·cos(beta)
+ *   z = L1·sin(alpha) + L2·sin(beta)
+ * 与反解残差回代共用。 */
 static void __attribute__((noinline)) fkPlanar(double alpha, double beta,
                                                double *outX, double *outZ) {
   const double L1 = arm1.armLength1;
@@ -2170,6 +1771,10 @@ static void __attribute__((noinline)) fkPlanar(double alpha, double beta,
   *outZ = L1 * sin(alpha) + L2 * sin(beta);
 }
 
+/* 正运动学：四个舵机角度 -> 末端笛卡尔坐标。
+ *   alpha = r, beta = r - c
+ *   theta = 90 - b
+ * f 只转末端夹具，不影响被控点。 */
 bool recFromServo(REC *rec, const SER *ser) {
   if (rec == NULL || ser == NULL) return false;
 
@@ -2178,15 +1783,14 @@ bool recFromServo(REC *rec, const SER *ser) {
   double c = ser->angle3;
   if (!isFiniteNum(b) || !isFiniteNum(r) || !isFiniteNum(c)) return false;
 
-  double alpha = r / RADtoDEG;          /* 上臂方向角（弧度） */
-  double beta  = (r - c) / RADtoDEG;    /* 下臂方向角 = r - c */
+  double alpha = r / RADtoDEG;
+  double beta  = (r - c) / RADtoDEG;
   double xPlanar;
   double z;
-  fkPlanar(alpha, beta, &xPlanar, &z);  /* 与反解里的回代共用同一份正解 */
+  fkPlanar(alpha, beta, &xPlanar, &z);
   z += arm1.armheight;
 
-  double theta = (90.0 - b) / RADtoDEG; /* b=90 朝 +x；b<90 转向 +y */
-  /* 先算到局部变量再写回，允许 rec 与 ser 指向同一个 pos 结构体 */
+  double theta = (90.0 - b) / RADtoDEG;
   double x = xPlanar * cos(theta);
   double y = xPlanar * sin(theta);
   if (!isFiniteNum(x) || !isFiniteNum(y) || !isFiniteNum(z)) return false;
@@ -2197,109 +1801,22 @@ bool recFromServo(REC *rec, const SER *ser) {
   return true;
 }
 
-/* 由笛卡尔坐标反解舵机角度，不可达时拒绝写入。
- *
- * 【本机运动学模型】—— 以用户实测标定为准
- *   肩关节轴心在坐标原点 (0,0,0)；末端坐标 z 以肩关节轴为原点。
- *   上臂 L1 = 20，下臂 L2 = 20；armheight 表示末端/手爪沿下臂方向再伸出的
- *   长度（本机标定为 0，即"下臂末端"就是控制点）。
- *
- *   舵机中立位（90°）的实测含义：
- *     angle1 (b) 90° -> 基座朝 +x 方向（可达空间只占 x >= 0 那一侧）
- *     angle2 (r) 90° -> 上臂竖直向上 (0, +z)
- *     angle3 (c) 90° -> 下臂水平朝前 (+x)，即与上臂成 90°
- *
- *   设平面内以 +x 为 0°、抬向 +z 为正，两个连杆的方向角为:
- *     上臂方向角   alpha = r          （r 就是上臂的绝对方向角）
- *     下臂方向角   beta  = r - c      （c 是下臂相对上臂往前转的折角）
- *   正运动学:
- *     x_planar = L1 cos alpha + L2 cos beta
- *     z        = L1 sin alpha + L2 sin beta + armheight
- *   标定校验（armheight = 0, L1 = L2 = 20，两处误差均为 0.00）:
- *     (r,c) = (90, 90) -> alpha=90°, beta=  0° -> 末端 (20.00, 20.00)  ← 初始位姿
- *     (r,c) = (90,105) -> alpha=90°, beta=-15° -> 末端 (19.32, 14.82)  用户实测
- *     (r,c) = (45, 90) -> alpha=45°, beta=-45° -> 末端 (28.28,  0.00)  水平朝前
- *     (r,c) = (45,  0) -> alpha=45°, beta= 45° -> 末端 (28.28, 28.28)  斜举伸直
- *   r 增大 = 上臂抬高；c 增大 = 折角收小、末端"往前 + 往下"，
- *   与用户实测（c 从 90 加到 105 下臂往前转）一致。
- *
- *   反解（闭式，无迭代）:
- *     angle1 = 90° - atan2(y, x)                    （b=90 朝 +x，b<90 转向 +y）
- *     R²     = rho² + (z - armheight)²              末端到肩的距离，只与 c 有关
- *       cos(c) = (R² - L1² - L2²) / (2 L1 L2)        c ∈ [0,180°] 唯一候选
- *     由 P = e^{i·alpha}·W(c)、W(c) = L1 + L2·e^{-i·c} 得
- *       alpha  = atan2(zv, rho) + atan2(L2 sin c, L1 + L2 cos c)
- *     再由 (alpha, c) 回代正运动学校验残差，超差整组丢弃。
- *
- *   平面分支: 上面用的是 rhoP = +rho（末端朝平面 +x）。
- *     当 rhoP = -rho 时得到 "下臂反折" 的另一个姿态（alpha、beta 各差 180°），
- *     对应的回转角是 90° - atan2(-y, -x)。c 放开到 180° 后
- *     20cos(r) + 20cos(r-c) 可能为负，可达点会落到 x<0 一侧，
- *     此时只有反向分支能给出落在 [0,180] 内的回转角 —— 见 getAngleEx 里
- *     "选平面分支" 一段的注释。两个分支都不合法时返回 false。
- *
- * 返回值:
- *   true  —— 运动学可解，且（按 servoLimitMode）关节角都落在 servoLimit 内
- *            （CLAMP 策略下越限的角度会被就地吸附到最近限位）
- *   false —— 目标点不可达、角度出现 NaN/Inf，或 REJECT 策略下有关节越限
- * 返回 false 时不修改 pos1->ser，调用方应保留上一次的有效角度。
- * angle4(末端 f) 不参与反解，保持调用前已有的值不变。 */
-bool getAngle(pos *pos1) {
-  return getAngleEx(pos1, NULL);
-}
-
-/* getAngle 的扩展版：额外回传"是否因关节限位被吸附"。
- * 需要区分"精确到达目标"与"被限位挡住"的调用方（moveToPoint / 绘图轨迹校验）用这个版本。 */
-/* getAngleEx 内部用的分支求解。
- *
- * 【为什么不能用 alpha + beta 凑】
- * 曾试过令 s = alpha + beta、由 L1·e^{iα} = (rhoP + i·zv) - L2·e^{iβ} 解出 s，
- * 结果整表反解失败（1425/1425）—— 那个式子是硬凑的，把 e^{iβ} 的模与幅角混在一起了。
- * 正确做法是把向量方程两边乘 e^{-iβ}：
- *     L1·e^{i(α-β)} + L2 = (rhoP + i·zv)·e^{-iβ}
- * 于是 e^{-iβ} 的幅角关系直接给出 beta，不需要任何"和角"技巧。
- *
- * 【固件运动学模型（两处实测标定核对，误差 0.00）】
- *   alpha = r / RADtoDEG = 上臂绝对方向角（弧度）
- *   beta  = (r - c) / RADtoDEG = 下臂绝对方向角
- *   x_planar = L1·cos(alpha) + L2·cos(beta)
- *   z        = L1·sin(alpha) + L2·sin(beta) + armheight
- * 注意 **舵机角 c = alpha - beta（弧度）**，它才是被 servoLimit 限位的量。
- *
- * 【反解分支】
- * 令 delta = alpha - beta（即舵机角，弧度），P = rhoP + i·zv：
- *     e^{i·beta} = P / (L1 + L2·e^{-i·delta})
- *     beta  = atan2(zv, rhoP) - atan2(L2·sin(delta), L1 + L2·cos(delta))
- *     alpha = beta + delta
- * 其中 |L1 + L2·e^{-iδ}|² = L1² + L2² + 2·L1·L2·cos(delta) = R²，
- * 所以 delta 的大小由余弦定理定：|delta| = acos((R²-L1²-L2²)/(2·L1·L2))，
- * 而正负号 k = ±1 对应肘部在上/在下的两个镜像姿态：
- *   k = +1 → delta = +|c|（常见姿态）
- *   k = -1 → delta = -|c|（镜像姿态）
- * 两个都必须试：镜像姿态里常常只有一个满足机械行程。 */
-/* 平面分支的正解残差。
- * delta 本身就是舵机角 c（弧度），所以调用者只需要 beta（下臂绝对方向角）与
- * 残差：alpha 仍按 beta + delta 现算，而 *alpha / *cServo 两个出参原来回传的
- * 都是调用者手里已经有的值（alpha = beta + delta，cServo = delta）。 */
+/* 反解一个平面分支并计算残差。
+ * delta 本身就是舵机角 c（弧度）。 */
 static void ikBranch(double rhoP, double zv, double delta, double L1, double L2,
                      double *beta, double *err) {
-  double phiBase = atan2(zv, rhoP);                  /* 末端在平面内的方向角 */
+  double phiBase = atan2(zv, rhoP);
   double argW    = atan2(L2 * sin(delta), L1 + L2 * cos(delta));
   *beta = phiBase - argW;
   double alpha = *beta + delta;
   double fx, fz;
-  fkPlanar(alpha, *beta, &fx, &fz);                  /* 与 recFromServo 共用同一份正解 */
+  fkPlanar(alpha, *beta, &fx, &fz);
   double dx = fx - rhoP, dz = fz - zv;
-  *err = sqrt(dx * dx + dz * dz);                    /* 原来是 pow(dx,2)+pow(dz,2) */
+  *err = sqrt(dx * dx + dz * dz);
 }
 
-/* 【回转角归一化】90 - RADtoDEG*atan2() 的值域是 [-90,270]，但两种浮点精度各有一个
- * 收尾的坑，所以三句都要留着：
- *   · 32 位 float（固件）：-1e-10 + 360 会被舍入成整 360.0，靠 >= 360 那句折回 0；
- *   · 64 位 double（PC 端自检）：同样算出来是 359.9999999998，>= 360 命中不了，
- *     靠最后那句 360-1e-6 折回 0（实测 (0,20,20) 的目标正好踩这个坑）。
- * 原来 bFwd/bRev 各写了一遍这三句，这里合成一份 noinline 实现给两个值共用，
- * 表达式、顺序、常量逐字不变。 */
+/* 回转角归一化：90 - RADtoDEG*atan2() 值域 [-90,270]，
+ * 需要把贴 360 的值折回 0。 */
 static double __attribute__((noinline)) normRevAngle(double b) {
   if (b < 0.0)    b += 360.0;
   if (b >= 360.0) b -= 360.0;
@@ -2307,15 +1824,13 @@ static double __attribute__((noinline)) normRevAngle(double b) {
   return b;
 }
 
+bool getAngle(pos *pos1) {
+  return getAngleEx(pos1, NULL);
+}
+
 bool getAngleEx(pos *pos1, bool *clamped) {
   if (clamped != NULL) *clamped = false;
   if (pos1 == NULL) return false;
-
-  /* 必须先把关节限位刷成配置里的值再选分支 —— 选分支要用 b 的行程
-   * 判断回转角是否可行。漏掉这一句的话，开机时（限位还是 0）会把所有分支
-   * 都判成不可行，然后 applyJointLimits 又把角度全部吸附到 0，
-   * 表现为"反解永远返回 (0,0,0) 且 clamped 恒为 true"。 */
-  (void) servoSelfCheck();
 
   if (!isReachable(&pos1->rec)) {
     WEARM_LOG("[kin] reject: target out of reachable workspace");
@@ -2325,91 +1840,54 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   const double L1 = arm1.armLength1;
   const double L2 = arm1.armLength2;
 
-  /* 平面半径 rho 与"肩->末端"距离 R（末端竖直方向等于坐标 z，由 armheight 标定） */
   double rho = sqrt(pos1->rec.x * pos1->rec.x + pos1->rec.y * pos1->rec.y);
   double zv  = pos1->rec.z - arm1.armheight;
   double R2  = rho * rho + zv * zv;
 
-  /* ---------- 运动学模型（已用两个实测标定点校准）----------
-   * 平面内以 +x 为 0°、抬向 +z 为正，两杆各 L1 / L2：
-   *     alpha = 上臂方向角 = r            （r 就是上臂的绝对方向角）
-   *     beta  = 下臂方向角 = r - c        （c 增大 = 下臂往前/往下转）
-   *     x = L1·cos(alpha) + L2·cos(beta)
-   *     z = L1·sin(alpha) + L2·sin(beta) + armheight
-   * 标定校验（armheight = 0, L1 = L2 = 20，两处误差均为 0.00）：
-   *     (r=90, c=90)  -> alpha=90°, beta=  0°  -> 末端 (20.00, 20.00)  ✔ 初始位姿
-   *     (r=90, c=105) -> alpha=90°, beta=-15°  -> 末端 (19.32, 14.82)  ✔ 用户实测
-   * 因此 beta = r - c。注意另两个候选 r+c-180 与 r+c 都只能命中其中一个点
-   * （r+c-180 在 c=105 给 (19.32,25.18)，r+c 连初始位姿的符号都反了）。
-   * 由 d4.cpp 对三个候选逐个代入两处实测标定后唯一命中 A。
-   * ---------------------------------------------------------- */
-
-  /* ---------- 四个平面候选 ----------
-   * 反解在平面内是"两杆构成三角形"的标准问题：肘角大小 |c| 由余弦定理唯一确定，
-   * 但有两个独立的二值自由度：
-   *   ① 肘部在上 / 在下  →  delta = ±|c|（两个镜像姿态）
-   *   ② 平面朝前 / 反折  →  rhoP  = +rho 或 -rho
-   * ② 为什么必要：回转角 b = 90 - atan2(y,x)。目标落在 x<0 一侧时
-   * atan2(y,x) 在 (90°,270°)，b 会算出 190°~270°，超出 b 的行程 [0,180]，
-   * 被 CLAMP 静默吸附到 180° 并丢掉最多 5.4 个单位的坐标精度
-   * （dbg_rt 证据：tgt=(-0.61,-3.43,39.85) rawB=190.000 -> retB=180.000 err=0.6077）。
-   * 改用反向平面 rhoP = -rho 后，回转角变成 b = 90 - atan2(-y,-x)，
-   * 对 x<0 恰好落回 [0,180]。两个平面分支都要试。
-   * 选出候选后仍要用正解回代核对残差（见下面 errs[] 的用法）。 */
+  /* 肘角 |c| 由余弦定理唯一确定 */
   double cosC = (R2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
   if (cosC >  1.0) cosC =  1.0;
   if (cosC < -1.0) cosC = -1.0;
-  double cAbs = acos(cosC);                          /* |c|，0~180° */
+  double cAbs = acos(cosC);
 
-  /* 容差 1e-9 度：远小于舵机可分辨的 0.1°，只用来吸收 acos/atan2 的舍入噪声。
-   * 原来分成 BASE_EPS / JOINT_EPS 两个同名常量，值相同，合并成一个即可。 */
   const double EPS = 1e-9;
 
-  /* 限位值取一次：servoLimit 在本函数内不会被改动 */
-  double minB = servoLimit.minB, maxB = servoLimit.maxB;
-  double minR = servoLimit.minR, maxR = servoLimit.maxR;
-  double minC = servoLimit.minC, maxC = servoLimit.maxC;
+  /* 【硬编码的关节行程】b/r/c 三轴物理行程都是 0~180。
+   * 原版本从 servoLimit 结构体读取；本版本已删除该结构体，改为本地常量。
+   * f 的 60~150 在下面 f 越限处理与 posSetAngle4() 里单独硬编码。 */
+  const double minB = 0.0, maxB = 180.0;
+  const double minR = 0.0, maxR = 180.0;
+  const double minC = 0.0, maxC = 180.0;
 
-  double bestB = 0.0, bestR = 0.0, bestC = 0.0, bestErr = 1e30;
-  int pick = -1;
-
-  /* 回转角只跟"平面朝前/反折"有关，跟肘部镜像无关，所以两个分支各算一次即可
-   * （原来在循环里对四个分支各算一次，其中两个是重复的）。
-   * 表达式与原来逐字相同，结果逐位一致。
-   * 正向平面用 (x,y)，反向平面用 (-x,-y)；rho 极小时方向无意义，取中立位 90°。
-   * 90 - RADtoDEG*atan2() 的值域是 [-90,270]，所以 +=/-= 360 各最多发生一次。 */
+  /* 回转角只跟"平面朝前/反折"有关，两个平面各算一次 */
   double bFwd = 90.0, bRev = 90.0;
   if (rho > 1e-9) {
     bFwd = 90.0 - RADtoDEG * atan2( pos1->rec.y,  pos1->rec.x);
     bRev = 90.0 - RADtoDEG * atan2(-pos1->rec.y, -pos1->rec.x);
   }
-  /* 两个值走同一套归一化；rho 极小时给的默认 90.0 经过它原样返回 */
   bFwd = normRevAngle(bFwd);
   bRev = normRevAngle(bRev);
 
+  double bestB = 0.0, bestR = 0.0, bestC = 0.0, bestErr = 1e30;
+  int pick = -1;
+
+  /* 四个候选分支：正/反平面 × 肘上/肘下 */
   for (int i = 0; i < 4; i++) {
-    const bool reversePlane = (i >= 2);              /* ② 平面朝前 / 反折 */
-    const double k = ((i & 1) == 0) ? 1.0 : -1.0;    /* ① 肘部在上 / 在下 */
+    const bool reversePlane = (i >= 2);
+    const double k = ((i & 1) == 0) ? 1.0 : -1.0;
     const double rhoP  = reversePlane ? -rho : rho;
-    const double delta = k * cAbs;                   /* = 舵机角 c（弧度） */
-    /* 【归一化后的回折】90 - RADtoDEG*atan2() 的浮点误差会把"正好 0°"算成
-     * -2.4e-10，上面那句 += 360 于是把它变成 359.9999999998，
-     * 再和 maxB = 180 一比就把这个分支丢掉了 ——
-     * 实测 (x=0,y=20,z=20) 的正确回转角恰好是 0°（b=0 朝 +y），就踩在这个坑里，
-     * 表现为反解返回 false 且 Pos.ser 停在 (0,0,0)。
-     * 因此把"贴着 360°"的值折回 0°，容差远大于浮点噪声、远小于 1° 步进。 */
+    const double delta = k * cAbs;
     const double b = reversePlane ? bRev : bFwd;
-    
+
+    /* 舵机 b 硬限位 0~180 */
     if (b < minB - EPS || b > maxB + EPS) continue;
 
     double beta, err;
     ikBranch(rhoP, zv, delta, L1, L2, &beta, &err);
-    /* rDeg 按 beta + delta 现算，与原 alpha = beta + delta 逐位一致。
-     * alpha/beta 的"是否有限"检查由下面的正向区间判断覆盖：NaN/Inf 一样 continue。 */
     double rDeg = RADtoDEG * (beta + delta);
     double cDeg = RADtoDEG * delta;
-    /* r、c 必须落在各自行程内 —— 必须在进 applyJointLimits 之前显式筛掉，
-     * 否则 CLAMP 会把越限的候选静默吸附成"看起来能用"的解。 */
+
+    /* 舵机 r、c 硬限位 0~180 */
     if (!(rDeg >= minR - EPS && rDeg <= maxR + EPS)) continue;
     if (!(cDeg >= minC - EPS && cDeg <= maxC + EPS)) continue;
     if (!isFiniteNum(err)) continue;
@@ -2425,117 +1903,67 @@ bool getAngleEx(pos *pos1, bool *clamped) {
     return false;
   }
 
-  /* 正运动学回代自检：选中的分支必须真的落在目标点上，否则整组丢弃 */
+  /* 正解回代自检 */
   if (!(bestErr <= 0.05)) {
     WEARM_LOG("[kin] reject: residual too large, no valid solution");
     return false;
   }
 
-  /* 到这里 angle1/2/3 必然都是有限数：bestB 来自 atan2（有限），
-   * bestR/bestC 已通过上面的区间判断。原来这里还有一次 isFiniteNum 兜底，
-   * 那是不可能走到的死代码（与调试开关无关），删掉不改变可观察行为。 */
   double angle1 = bestB;
-  double angle2 = bestR;                             /* r = 上臂绝对方向角 */
-  double angle3 = bestC;                             /* c = alpha - beta（舵机角） */
+  double angle2 = bestR;
+  double angle3 = bestC;
 
-  /* 容差内的微小负角归零，避免 -0.0 这种值被 (int) 截断后传给舵机。
-   * 【为什么只归零 r 和 c】b 在赋值前已经过归一化：
-   *   b < 0        -> b += 360   （落到 [270,360)）
-   *   b >= 360     -> b -= 360   （把 360-1e-10 这种恰好在 32 位浮点上
-   *                               取整成 360 的值折回 0）
-   *   b > 360-1e-6 -> b = 0      （64 位 double 下 +=360 保留的小尾巴）
-   * 走完这三步的 b 只可能落在 [0, 270] ∪ (269.x, 360) ∪ {0}，
-   * 永远不可能落在 (-1e-6, 0) —— 原来那句 angle1 归零是不可能命中的死代码。 */
+  /* 容差内的微小负角归零，避免 -0.0 传给舵机 */
   if (angle2 > -ANGLE_EPS && angle2 < 0) angle2 = 0;
   if (angle3 > -ANGLE_EPS && angle3 < 0) angle3 = 0;
 
-  /* 【先判 f 再写回】本函数的契约是"返回 false 时不修改 pos1->ser，
-   * 调用方保留上一个有效姿态"。原来的写法是先把 angle1..3 写进 ser，
-   * 再交给 applyJointLimits（见上面的说明，它只可能命中 f），
-   * 一旦 REJECT 就得把四个角全部回滚 —— 老代码就踩过这个坑：
-   * 一个反解失败的目标点会把 Pos.ser 留成 (0,0,0)，上电时机械臂直接甩向原点。
-   * 把 f 的判定提到写回之前，失败路径一个字节都不碰 ser，
-   * 备份/回滚那 4 个 double 也就不用存在了，语义完全相同。 */
+  /* 【先判 f 再写回】本函数契约：返回 false 时不修改 pos1->ser */
   const double LIM_EPS = 1e-9;
   const double a4 = pos1->ser.angle4;
-  const bool toolBad = (a4 < servoLimit.minF - LIM_EPS ||
-                        a4 > servoLimit.maxF + LIM_EPS);
+  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
+  const double minF = 60.0, maxF = 150.0;
+  const bool toolBad = (a4 < minF - LIM_EPS || a4 > maxF + LIM_EPS);
 
   if (toolBad && servoLimitMode == SERVO_LIMIT_REJECT) {
-    /* 越限提示：500ms 限流，避免持续越限把串口刷爆。
-     * 整块（含 now/时间戳读写）都放在调试开关里：Serial.print(double) 会把
-     * avr-libc 的浮点格式化整段链进固件（实测约 0.5KB flash），Uno 上不划算。
-     * 容差 1e-9 的道理见文件开头：反解在限位端点上会有 -1e-14 量级的舍入误差，
-     * 按 1e-6 判会让"正好停在行程端点"的姿态被误报成越限。 */
-#if WEARM_DEBUG_SERIAL
-    unsigned long now = millis();
-    if (now - lastServoLogTime >= 500) {
-      lastServoLogTime = now;
-      Serial.print(F("[servo] reject joint "));
-      Serial.print((char)pgm_read_byte(&jointName[3]));
-      Serial.print(F(" = "));
-      Serial.print(a4);
-      Serial.print(F(" (allow "));
-      Serial.print(servoLimit.minF);
-      Serial.print('-');
-      Serial.print(servoLimit.maxF);
-      Serial.println(F(")"));
-    }
-#endif
+    WEARM_LOG("[servo] reject joint f out of tool range");
     return false;
   }
 
   pos1->ser.angle1 = angle1;
   pos1->ser.angle2 = angle2;
   pos1->ser.angle3 = angle3;
-  /* angle4(末端 f) 不由反解决定，保持调用前已有的值不动 */
+  /* angle4(f) 不由反解决定，保持调用前已有的值不动 */
 
   bool limClamped = false;
   if (toolBad) {
-    /* CLAMP 策略：四个关节一起吸附到最近限位（与原来调用的同一个函数） */
-    clampServoAngles(&pos1->ser);
+    /* CLAMP 策略：只对 f 吸附到最近限位（b/r/c 已被上面的区间判断筛过） */
+    double v = a4;
+    if (v < minF) v = minF;
+    if (v > maxF) v = maxF;
+    pos1->ser.angle4 = v;
     limClamped = true;
-#if WEARM_DEBUG_SERIAL
-    unsigned long now = millis();
-    if (now - lastServoLogTime >= 500) {
-      lastServoLogTime = now;
-      Serial.print(F("[servo] clamp joint "));
-      Serial.print((char)pgm_read_byte(&jointName[3]));
-      Serial.print(F(" = "));
-      Serial.print(a4);
-      Serial.print(F(" -> "));
-      Serial.println(clampDouble(a4, servoLimit.minF, servoLimit.maxF));
-    }
-#endif
   }
   if (clamped != NULL) *clamped = limClamped;
   return true;
 }
 
 /* 复位到工作空间内的安全初始点。
- * 顺带自检 rangeLimit / servoLimit 配置，避免错误配置一直潜伏。 */
+ * 【本版本已删除】rangeClampConfig()、servoSelfCheck()、clampToRange() 的调用：
+ * 三个函数都随 rangeLimit / servoLimit 配置一起被移除。
+ * POS_HOME 本身就在工作空间内部，直接写入即可。 */
 void posInit(void) {
-  (void) rangeClampConfig();   /* 修正写反的 min/max，并在串口报警 */
-  (void) servoSelfCheck();     /* 修正非法的关节限位，并刷新限位映射表 */
-
   Pos.rec.x = POS_HOME.x;
   Pos.rec.y = POS_HOME.y;
   Pos.rec.z = POS_HOME.z;
-  clampToRange(&Pos);          /* 即使 POS_HOME 被改动越界也能拉回来 */
 
-  /* 末端舵机取行程中位，避免开机时停在极限位置 */
-  Pos.ser.angle4 = (servoLimit.minF + servoLimit.maxF) * 0.5;
+  /* 末端舵机取行程中位（f 硬编码 60~150，中位 = 105），
+   * 避免开机时停在极限位置 */
+  Pos.ser.angle4 = (60.0 + 150.0) * 0.5;
 
   if (!getAngle(&Pos)) {
-    WEARM_LOG("[pos] ERROR: POS_HOME unreachable or out of joint limits");
+    WEARM_LOG("[pos] ERROR: POS_HOME unreachable");
   }
 #if WEARM_DEBUG_SERIAL
-  /* 开机自检输出: 直接调用固件的正解，把"反解出的角度"再正解回坐标，
-   * 与 POS_HOME 比较 —— 上机时一眼就能确认标定是否正确。
-   *
-   * 【教训】这里曾经自己重写公式并写成 beta = r + c（正确是 r - c），
-   * 属于会骗人的自检：公式错了照样打印一串"看起来很合理"的数字。
-   * 现在统一走 recFromServo()，固件只有一处运动学实现，改一处不会漏另一处。 */
   {
     REC chk;
     if (recFromServo(&chk, &Pos.ser)) {
@@ -2560,9 +1988,8 @@ void posInit(void) {
 }
 
 /* 取"开机初始位姿"对应的关节角，写给按键4 回中用。
- * 角度真值由 POS_HOME 反解得到，不在别处写死 90/90/90 —— 以后改了 POS_HOME
- * 或关节限位，回中仍然会回到真正的初始位姿。
- * angle4（末端开合）不是坐标反解的自由度：传进来什么就保持什么，这里不动它。 */
+ * 【本版本已删除 clampToRange() 调用】：坐标范围限制已整体移除，
+ * POS_HOME 本身就在工作空间内部，直接反解即可。 */
 bool posGetHomeAngles(SER *ser) {
   if (ser == NULL) return false;
 
@@ -2571,7 +1998,6 @@ bool posGetHomeAngles(SER *ser) {
   p.rec.x = POS_HOME.x;
   p.rec.y = POS_HOME.y;
   p.rec.z = POS_HOME.z;
-  (void) clampToRange(&p);      /* 即使 POS_HOME 被改到界外也能拉回来 */
   if (!getAngle(&p)) return false;
 
   ser->angle1 = p.ser.angle1;
@@ -2581,9 +2007,7 @@ bool posGetHomeAngles(SER *ser) {
 }
 
 /* ---------- 全局调速 ---------- */
-/* 设置全局调速参数 (带合法性校验)
- * 校验规则: stepSize > 0；stepDelayMs > 0。
- * 不合法的项保持原值，只有确实改动了参数才把档位标记为自定义。-1。 */
+
 void setSpeed(double stepSize, int stepDelayMs) {
   bool changed = false;
   if (stepSize > 0 && stepSize != speed.stepSize) {
@@ -2592,22 +2016,13 @@ void setSpeed(double stepSize, int stepDelayMs) {
   if (stepDelayMs > 0 && stepDelayMs != speed.stepDelayMs) {
     speed.stepDelayMs = stepDelayMs; changed = true;
   }
-  /* 参数被手动改动后，当前档位名已不再代表实际参数 */
   if (changed) speedLevel = -1;
 }
 
-/* 按档位调整速度，返回生效档位 (-1 表示档位非法)
- * 三档参数本来就有 2 的幂倍数关系：步长 0.5/1/2 度、固定间隔 80/40/20 ms（慢/中/快），
- * 全部可以由档位精确算出（0.5·2^level 在二进制浮点里是精确的，
- * 整数右移也是精确的），于是三份 setSpeed 调用点收成一份。
- * SPEED_SLOW/NORMAL/FAST 就是 0/1/2，所以 speedLevel = level、return level
- * 与原 switch 里逐条赋值逐位相同。
- * 【实测】逐档 switch 写法整机 Program = 34970 B，本写法 34932 B，
- * 所以即使 adjustSpeed 自身的符号从 112 B 涨到 246 B，整机仍净省 38 B。 */
+/* 慢/中/快 → 步长 0.5/1/2 度、固定间隔 80/40/20 ms */
 int adjustSpeed(int level) {
   if (level < SPEED_SLOW || level > SPEED_FAST) return -1;
   setSpeed(0.5 * (1 << level), 80 >> level);
-  /* 慢/中/快 → 步长 0.5/1/2 度、固定间隔 80/40/20 ms */
   speedLevel = level;
   return level;
 }
@@ -2616,8 +2031,6 @@ int speedGetLevel(void) {
   return speedLevel;
 }
 
-/* Kept out-of-line: it is called from several modules, and an inlined copy would
- * carry its own duplicate of the four name literals (flash and RAM). */
 const char * __attribute__((noinline)) speedLevelName(int level) {
   switch (level) {
     case SPEED_SLOW:   return "慢速";
@@ -2630,22 +2043,17 @@ const char * __attribute__((noinline)) speedLevelName(int level) {
 /* 慢 → 中 → 快 → 慢 循环降一档 */
 int speedStepDown(void) {
   int cur = speedLevel;
-  /* 自定义档位时从慢速重新开始，保证按键一定能看到变化 */
   if (cur < SPEED_SLOW || cur > SPEED_FAST) cur = SPEED_FAST;
   return adjustSpeed((cur + 1) % 3);
 }
 
 /* ---------- 末端舵机 (angle4 / f) ---------- */
 
-/* 设置末端舵机角度。
- * 反解 getAngle() 不会改动 angle4，所以它只能由这里（或直接改 Pos.ser.angle4）
- * 单独设置。这里会把角度夹在 servoLimit 的 f 行程内，保证机械不顶死。
- * 返回 true 表示角度确实变了（调用方据此决定是否发串口提示、是否刷新时间门控）。 */
 bool posSetAngle4(double angleDeg) {
-  /* wasnan/isinf pair -> one shared helper (same rejection set). */
   if (!isFiniteNum(angleDeg)) return false;
 
-  double v = clampDouble(angleDeg, servoLimit.minF, servoLimit.maxF);
+  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
+  double v = clampDouble(angleDeg, 60.0, 150.0);
   if (v == Pos.ser.angle4) return false;
   Pos.ser.angle4 = v;
   return true;
@@ -2686,6 +2094,9 @@ int protoAxisIndexFromChar(int c)
 
 /* 取第 axis 个轴（0..2）的关节行程上下限，直接转发 servoLimit。
  * axis 越界或指针为空时返回 false。 */
+/* 取第 axis 个轴（0..2）的关节行程上下限。
+ * 【本版本】已删除 servoLimit 配置，统一硬编码为舵机物理行程 0~180 度。
+ * axis 越界或指针为空时返回 false。 */
 bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
 {
   /* 检查参数有效性 */
@@ -2693,23 +2104,9 @@ bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
     return false;
   }
 
-  /* 根据轴索引映射到对应的舵机行程限制 */
-  switch (axis) {
-    case 0:  /* x -> angle1 = b 基座回转 */
-      *minAngle = servoLimit.minB;
-      *maxAngle = servoLimit.maxB;
-      break;
-    case 1:  /* y -> angle2 = r 上臂俯仰 */
-      *minAngle = servoLimit.minR;
-      *maxAngle = servoLimit.maxR;
-      break;
-    case 2:  /* z -> angle3 = c 下臂俯仰 */
-      *minAngle = servoLimit.minC;
-      *maxAngle = servoLimit.maxC;
-      break;
-    default:
-      return false;  /* 理论上不会执行到这里 */
-  }
+  /* b/r/c 三轴行程均为 0~180 度（硬编码，无需 switch 分支） */
+  *minAngle = 0.0;
+  *maxAngle = 180.0;
 
   return true;
 }
@@ -2721,20 +2118,16 @@ bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
 //
 // 统一流程（每一步都保证 Pos.ser 与 Pos.rec 严格自洽）:
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
-//   -> 角度夹到 servoLimit：夹完与当前 Pos.ser 相同 => 已到机械行程尽头 => MOVE_AT_LIMIT
+//   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
-//   -> 坐标一越出 rangeLimit（工作空间）=> 直接返回 MOVE_AT_LIMIT
-//      （摇杆表现为"推到头了"）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
 //
 // 所有失败路径都一个字节都不写 Pos —— 这正是原来"备份 + 整步回退"的等价效果，
 // 但省掉了备份变量和两处回退代码。
 //
-// 注意: 只改角度、绝不动坐标。坐标永远由正运动学重算，
-// 因为 clampToRange() 是**原地修改** Pos.rec 的（返回"是否夹到过"），
-// 曾经为了给 Pos.rec 一个"临时落点"而顺手挪坐标轴，结果 clampToRange()
-// 把那个临时落点夹回了边界值，返回 false，整步回退被跳过 ——
-// 表现为末端坐标可以停在界外（x = -0.5 < limit.minX）。
+// 【本版本已删去】笛卡尔坐标范围检查（posOutOfRange）、可配置的关节限位
+// （clampServoAngles）。b/r/c 三轴的 0~180 物理行程改为在 moveJointStep()
+// 内部直接硬编码；angle4（f）由 posSetAngle4() 单独处理，不走本路径。
 //
 
 /* ---------- 内部: 方向码 -> 目标关节 / 步进符号 ---------- */
@@ -2748,7 +2141,7 @@ bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
  *
  * 关节下标与符号打包进同一字节（低 1 位 = 是否取负，其余位 = 关节下标），
  * 这样只有一次 pgm_read_byte、一套表基址，符号判断也变成一位测试；
- * 拆成两张表时那第二套“取表基址 + 加下标 + lpm”实测要多花十几字节。 */
+ * 拆成两张表时那第二套"取表基址 + 加下标 + lpm"实测要多花十几字节。 */
 static const unsigned char DIR_CODE[7] PROGMEM = {
   0,                        /* 0: 占位，非法方向不会走到这里 */
   (2 << 1) | 0,             /* JOINT_C_UP    -> c (angle3), 步进取正 */
@@ -2775,24 +2168,17 @@ static bool samePose(const SER *a, const SER *b) {
   return true;
 }
 
-/* 坐标是否越出 rangeLimit（只读判断，不改动 Pos）。
- * 与原来的 6 次展开比较逐条等价，只是改成 3 轴紧凑循环：
- *   limit 的内存布局是 {minX,maxX, minY,maxY, minZ,maxZ}，REC 是 {x,y,z}，
- *   两者都是连续的 double，所以按轴前进即可。
- *
- * 【实测记录】这里试过改成复用别人已经 out-of-line 的 clampToRange()
- * （把落点放进 pos 副本再靠它返回的"是否夹到过"当越界判据）：
- * move.cpp 自身确实从约 300 B 降到 206 B，但 LTO 的连锁反应让
- * draw_control.cpp 从 13966 B 涨到 14178 B，全程序净增 82 B，故回退。 */
-static bool posOutOfRange(const REC *r) {
-  const double *c = &r->x;
-  const double *l = &limit.minX;
-  for (unsigned char i = 0; i < 3; i++) {
-    if (*c < l[0] || *c > l[1]) return true;
-    c++;
-    l += 2;
-  }
-  return false;
+/* b/r/c 三轴硬编码 0~180 的物理行程夹取。
+ * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
+ * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 60~150。 */
+static void clampBCR(SER *s) {
+  if (s->angle1 < 0.0)   s->angle1 = 0.0;
+  if (s->angle1 > 180.0) s->angle1 = 180.0;
+  if (s->angle2 < 0.0)   s->angle2 = 0.0;
+  if (s->angle2 > 180.0) s->angle2 = 180.0;
+  if (s->angle3 < 0.0)   s->angle3 = 0.0;
+  if (s->angle3 > 180.0) s->angle3 = 180.0;
 }
 
 /* ---------- 单步关节移动 ---------- */
@@ -2813,10 +2199,11 @@ int moveJointStep(int dir, double stepSize) {
   if (code & 1) step = -step;
   *ap += step;
 
-  /* 2) 关节硬限位（最终防线）。夹完三个姿态角都等于原值 => 已到机械行程尽头。
+  /* 2) 关节硬限位：b/r/c 三轴硬编码 0~180（最终防线）。
+   *    夹完三个姿态角都等于原值 => 已到机械行程尽头。
    *    注意只比较 b/r/c：angle4 由末端专用接口控制，不走这条路径。
    *    直接返回即等价于原来的整步回退（Pos 未被改动）。 */
-  (void) clampServoAngles(&next);
+  clampBCR(&next);
   if (samePose(&next, &Pos.ser)) {
     return MOVE_AT_LIMIT;
   }
@@ -2827,13 +2214,9 @@ int moveJointStep(int dir, double stepSize) {
     return MOVE_UNREACHABLE;
   }
 
-  /* 4) 位置边界：这个角度把末端带出了 rangeLimit（工作空间）就整步回退。
-   *    角度模式下坐标是派生量，所以这不算"不可达"，而是"这个方向到头了"。 */
-  if (posOutOfRange(&nextRec)) {
-    return MOVE_AT_LIMIT;
-  }
-
-  /* 5) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。 */
+  /* 4) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。
+   *    【本版本已删除】笛卡尔坐标范围检查（posOutOfRange）；坐标范围限制
+   *    按需求一并移除，末端坐标只是由角度正解出来的派生量，不再作为软护栏。 */
   Pos.ser = next;
   Pos.rec = nextRec;
   return MOVE_OK;
@@ -2878,10 +2261,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 
   /* 2) 即时到位（串口 x/y/z）：不限速，一次调用直接落到解算结果上，并允许
    *    硬限位吸附 —— 与串口原来的"严格移动"逐位相同：反解不出来整条拒绝，
-   *    成功才写 Pos，写完立刻正解刷新坐标（Pos.ser 与 Pos.rec 始终自洽）。
-   *    【唯一差异】旧代码在 recFromServo() 返回 false 时会打一句
-   *    WEARM_DEBUG_SERIAL 调试警告；那边的返回值原本也只是被丢弃，这里不再打，
-   *    姿态、回包与结果码完全不变（详见 .selfcheck/README.md 本轮改动一节）。 */
+   *    成功才写 Pos，写完立刻正解刷新坐标（Pos.ser 与 Pos.rec 始终自洽）。 */
   if (mode == MOVE_XYZ_NOW) {
     Pos = target;
     (void) recFromServo(&Pos.rec, &Pos.ser);
@@ -2929,7 +2309,6 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
   pathCoreSetJoints(cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]);
   return MOVE_XYZ_OK;
 }
-
 
 // ===== joystick_control.cpp =====
 //
@@ -3554,10 +2933,10 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
  * 直接用会让第一段开头猛跳一下，所以宁可拒绝启动。 */
 #define PICK_START_TOL_DEG 10.0
 
-/* 夹爪开 / 合的目标角度：与串口 O / S 完全一致，不在这里重复写死 60 / 150。
- * 如果某个物体夹不牢或夹太死，把这两个宏改成中间角度即可（例如两个的平均值）。 */
-#define PICK_TOOL_OPEN_ANGLE  (servoLimit.maxF)
-#define PICK_TOOL_CLOSE_ANGLE (servoLimit.minF)
+/* 夹爪开 / 合的目标角度：直接硬编码为 f 关节的物理行程上下限（150 / 60）。
+ * 与串口 O / S 命令的硬编码值保持一致，不再依赖已删除的 servoLimit 结构体。 */
+#define PICK_TOOL_OPEN_ANGLE  150.0
+#define PICK_TOOL_CLOSE_ANGLE 60.0
 
 /* ==================== 状态机 ==================== */
 
@@ -5522,7 +4901,17 @@ static double *btnAngle(int joint) {
  * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
-  (void) clampServoAngles(&tmp);
+  /* b/r/c 三轴硬编码 0~180、f 硬编码 60~150（原 clampServoAngles 已随
+   * servoLimit 结构体一起删除）。录制/回放/回中的角度理论上都落在合法区间
+   * 内，此夹取只是一道保险。 */
+  if (tmp.angle1 < 0.0)   tmp.angle1 = 0.0;
+  if (tmp.angle1 > 180.0) tmp.angle1 = 180.0;
+  if (tmp.angle2 < 0.0)   tmp.angle2 = 0.0;
+  if (tmp.angle2 > 180.0) tmp.angle2 = 180.0;
+  if (tmp.angle3 < 0.0)   tmp.angle3 = 0.0;
+  if (tmp.angle3 > 180.0) tmp.angle3 = 180.0;
+  if (tmp.angle4 < 60.0)  tmp.angle4 = 60.0;
+  if (tmp.angle4 > 150.0) tmp.angle4 = 150.0;
   Pos.ser = tmp;
   (void) recFromServo(&Pos.rec, &Pos.ser);
 }
@@ -6142,46 +5531,26 @@ const char *buttonStateName(void) {
 // ===== serial_protocol.cpp =====
 /*
 // serial_protocol.cpp
-// Serial command protocol: fixed commands + the three-servo synchronous angle
-// command (x/y/z in degrees: x = base, y = shoulder, z = elbow - see
-// serial_protocol.h).
-// Also hosts the start entry of the A/B/C pick-and-place sequences (while a
-// sequence runs this layer holds back every other motion command), the serial
-// twins N/R/P/M of the four physical buttons (implementation lives in
-// button_control.cpp) and the drawing commands F/D/G/E/Q/U/W plus the paper
-// calibration commands p/n/o (implementation lives in draw_control.cpp).
-// Handles character input, line buffering, command parsing and joint writes.
+// 串口命令协议：固定指令 + 三舵机同步角度指令（x/y/z，单位度：
+// x = 基座、y = 上臂、z = 下臂，详见 serial_protocol.h）。
+// 同时托管 A/B/C 取放序列的启动入口（序列运行期间本层挡住所有其它运动指令）、
+// 四个物理按键的串口孪生命令 N/R/P/M（实现位于 button_control.cpp）
+// 以及绘图命令 F/D/G/E/Q/U/W 和纸面标定命令 p/n/o（实现位于 draw_control.cpp）。
+// 负责字符输入、行缓冲、命令解析与关节写入。
 */
 
 
-/* Verbose per-step traces (off by default). Leaving them off is what keeps the
- * whole Arduino print/float formatting layer out of the image. */
-#ifndef WEARM_DEBUG_SERIAL
-#define WEARM_DEBUG_SERIAL 0
-#endif
-
-#if !WEARM_DEBUG_SERIAL
-#define DEBUG_PRINT(x)
-#define DEBUG_PRINTLN(x)
-#define DEBUG_PRINTF(x, y)
-#else
-#define DEBUG_PRINT(x) Serial.print(x)
-#define DEBUG_PRINTLN(x) Serial.println(x)
-#define DEBUG_PRINTF(x, y) Serial.print(x, y)
-#endif
-
-/* ---------- line buffer and state ---------- */
+/* ---------- 行缓冲与状态 ---------- */
 static char s_line[PROTO_LINE_BUF_SIZE];
 static int  s_len = 0;
-static bool s_pending = false;          /* characters buffered but not dispatched yet */
-static bool s_dropUntilEol = false;     /* this line is too long, drop up to the EOL */
+static bool s_pending = false;          /* 有已缓冲但还没派发的字符 */
+static bool s_dropUntilEol = false;     /* 本行太长，一直丢弃到行尾 */
 static unsigned long s_lastCharMs = 0;
 
-/* ---------- helper declarations ---------- */
-/* No noinline here on purpose: measured on the real AVR build, the attribute is
- * a no-op. serialProtocolLoop() reaches this from three places, but gcc keeps a
- * single out-of-line copy anyway, and the whole dispatcher only exists once
- * because protoHandleLine() has no caller outside this file. */
+/* ---------- 辅助函数前置声明 ---------- */
+/* 刻意不加 noinline：在真实 AVR 构建上实测这个属性是无效的。
+ * serialProtocolLoop() 从三处到达这里，但 gcc 仍只会保留一份 out-of-line 副本；
+ * 整个派发器只会存在一份，因为 protoHandleLine() 在本文件外没有调用者。 */
 static void protoFlushLine(void);
 static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen);
 static bool protoParseNumber(const char **pp, double *out);
@@ -6199,10 +5568,9 @@ static uint8_t s_runtimeFeatures =
     (WEARM_ENABLE_BUTTONS ? PROTO_FEATURE_BUTTON : 0u) |
     (WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u);
 
-/* Skip blanks (space / tab) and return the first significant character.
- * Out of line on purpose: a dozen call sites share this one copy. Measured:
- * forcing always_inline here costs +40 bytes, the call is cheaper than the
- * expanded loop. */
+/* 跳过空白（空格 / 制表符）并返回第一个有效字符。
+ * 刻意 out-of-line：十几处调用点共用这一份代码。实测强制 always_inline
+ * 要多花 40 字节，一次函数调用比展开的循环更便宜。 */
 static const char *protoSkipBlanks(const char *p)
 {
   while (*p == ' ' || *p == '\t') {
@@ -6211,10 +5579,10 @@ static const char *protoSkipBlanks(const char *p)
   return p;
 }
 
-/* Skip blanks in place */
+/* 原地跳过空白 */
 #define PROTO_SKIP_BLANKS(p) do { (p) = protoSkipBlanks(p); } while (0)
 
-/* The PC self-check mock has no pgmspace.h; the AVR core defines both of these. */
+/* PC 端自检 mock 没有 pgmspace.h；AVR 核心两个宏都有。 */
 #ifndef PSTR
 #define PSTR(s) (s)
 #endif
@@ -6225,26 +5593,25 @@ static const char *protoSkipBlanks(const char *p)
 #define PROGMEM
 #endif
 
-/* ========== serial backend ========== */
-/* The release build on the real Uno drives the ATmega328P USART registers
- * directly instead of going through the Arduino Serial object.
+/* ========== 串口后端 ========== */
+/* 真实 Uno 上的 release 构建直接驱动 ATmega328P 的 USART 寄存器，
+ * 而不是走 Arduino 的 Serial 对象。
  *
- * Why: the protocol only needs "send one byte" and "is there a byte". Linking
- * *any* of HardwareSerial keeps its vtable alive, and the vtable keeps every
- * virtual member (write / flush / available / read / peek / availableForWrite)
- * plus both USART interrupt vectors and the 64+64 byte ring buffers - measured
- * about 1.2 KB of flash and 600 bytes of SRAM on the all-features build, i.e.
- * more than the whole remaining budget.
+ * 原因：协议只需要"发一个字节"和"有没有字节可读"。只要还链接 *任何* 一处
+ * HardwareSerial，它的 vtable 就会保持存活，而 vtable 会把所有虚成员
+ * （write / flush / available / read / peek / availableForWrite）
+ * 以及两个 USART 中断向量和 64+64 字节环形缓冲一起拖进来 ——
+ * 在全功能构建上实测约 1.2 KB flash 和 600 字节 SRAM，
+ * 比整个剩余预算还多。
  *
- * WEARM_DEBUG_SERIAL=1 (debug traces then share one ordered stream) or
- * -DWEARM_SERIAL_ARDUINO=1 (escape hatch) keep the Arduino Serial object for
- * both directions. The PC self-check mock has no UCSR0A/UDR0, so every host
- * build - and therefore every probe - uses the same Serial branch. */
+ * -DWEARM_SERIAL_ARDUINO=1（逃生开关）会保留 Arduino Serial 对象做双向收发。
+ * PC 端自检 mock 没有 UCSR0A/UDR0，所以所有 host 构建（以及所有探针）
+ * 都走同一套 Serial 分支。 */
 #ifndef WEARM_SERIAL_ARDUINO
 #define WEARM_SERIAL_ARDUINO 0
 #endif
 
-#if defined(__AVR__) && !WEARM_DEBUG_SERIAL && !WEARM_SERIAL_ARDUINO
+#if defined(__AVR__) && !WEARM_SERIAL_ARDUINO
 #define WEARM_UART_RAW 1
 #else
 #define WEARM_UART_RAW 0
@@ -6253,16 +5620,15 @@ static const char *protoSkipBlanks(const char *p)
 #if WEARM_UART_RAW
 #include <avr/interrupt.h>
 
-/* Receive ring buffer with the same shape as the one in the Arduino core: the
- * mask works because the size is a power of two, and a full buffer drops the
- * newest byte instead of destroying unread data. */
+/* 接收环形缓冲，形状与 Arduino 核心里的那个一致：掩码能工作是因为
+ * 缓冲区大小是 2 的幂；缓冲满时丢弃最新字节，而不是破坏还没读走的数据。 */
 #define PROTO_RX_BUF_MASK 63u
 static volatile uint8_t s_rxBuf[PROTO_RX_BUF_MASK + 1u];
 static volatile uint8_t s_rxHead = 0;
 static volatile uint8_t s_rxTail = 0;
 
-/* Plain function on purpose: the "full buffer drops the byte" rule then lives
- * in one statement instead of inside the interrupt routine. */
+/* 刻意写成普通函数："缓冲满就丢字节"这条规则因此只存在于一句语句里，
+ * 而不是塞进中断例程内部。 */
 static void protoRxStore(uint8_t b)
 {
   uint8_t next = (uint8_t)((s_rxHead + 1u) & PROTO_RX_BUF_MASK);
@@ -6278,8 +5644,8 @@ ISR(USART_RX_vect)
   protoRxStore(UDR0);
 }
 
-/* One byte out. Waiting for UDRE0 costs at most 87 us per character at
- * 115200 baud and replies are at most a dozen bytes long. */
+/* 输出一个字节。115200 波特率下等 UDRE0 最多 87 µs，
+ * 而回复最长也就十几个字节。 */
 static void protoPut(char c)
 {
   while ((UCSR0A & (1u << UDRE0)) == 0u) {
@@ -6287,7 +5653,7 @@ static void protoPut(char c)
   UDR0 = (uint8_t)c;
 }
 
-/* Received byte, or -1 when the buffer is empty. */
+/* 读一个已收到的字节；缓冲区空时返回 -1。 */
 static int protoRxTake(void)
 {
   uint8_t b;
@@ -6300,9 +5666,9 @@ static int protoRxTake(void)
   return (int)b;
 }
 
-/* UART setup, mirrored from the Arduino core: double speed (U2X0), the same
- * UBRR, 8N1, receiver + transmitter + receive interrupt. F_CPU and PROTO_BAUD
- * are compile time constants, so UBRR is folded here. */
+/* UART 初始化，照 Arduino 核心抄：双倍速（U2X0）、相同的 UBRR、8N1、
+ * 收发器 + 接收中断。F_CPU 与 PROTO_BAUD 都是编译期常量，所以 UBRR
+ * 会在这里被折叠成常数。 */
 static void protoSerialBegin(void)
 {
   uint16_t ubrr = (uint16_t)((F_CPU / 4UL / (unsigned long)PROTO_BAUD - 1UL) / 2UL);
@@ -6310,11 +5676,11 @@ static void protoSerialBegin(void)
   UCSR0A = (uint8_t)(1u << U2X0);
   UBRR0H = (uint8_t)(ubrr >> 8);
   UBRR0L = (uint8_t)ubrr;
-  UCSR0C = (uint8_t)((1u << UCSZ01) | (1u << UCSZ00));   /* 8 data bits, no parity, 1 stop */
+  UCSR0C = (uint8_t)((1u << UCSZ01) | (1u << UCSZ00));   /* 8 数据位、无校验、1 停止位 */
   UCSR0B = (uint8_t)((1u << RXEN0) | (1u << TXEN0) | (1u << RXCIE0));
 }
 #else
-/* Arduino Serial: debug build, forced fallback, or the PC self-check mock */
+/* Arduino Serial：强制回退或 PC 端自检 mock */
 static void protoPut(char c)
 {
   Serial.print(c);
@@ -6334,11 +5700,10 @@ static void protoSerialBegin(void)
 }
 #endif
 
-/* ========== response layer (WEARM_SERIAL_RESPONSES) ========== */
+/* ========== 响应层（WEARM_SERIAL_RESPONSES） ========== */
 #if WEARM_SERIAL_RESPONSES
 
-/* Gripper echo: angle4 is clamped into servoLimit f, i.e. 0..999, so a plain
- * three digit printer is enough. */
+/* 夹爪回显：angle4 被夹在 60..150，所以普通的三位十进制打印机就够用。 */
 static void protoWriteInt(int v)
 {
   if (v >= 100) {
@@ -6350,10 +5715,10 @@ static void protoWriteInt(int v)
   protoPut((char)('0' + v % 10));
 }
 
-/* Walk <text> straight out of flash and send it; every reply ends with a
- * newline and a '#' becomes the clamped gripper angle in decimal. Kept out of
- * line on purpose: with -flto gcc otherwise clones this loop into every reply
- * site, where the per site argument setup costs more than the call. */
+/* 从 flash 里逐字节走出 <text> 并发送；每条回复以换行结尾，
+ * 而 '#' 会被替换成夹爪角度的十进制值。刻意 out-of-line：
+ * 在 -flto 下 gcc 会把这个循环克隆到每个回复点，而每个点的参数准备
+ * 比一次调用还要贵。 */
 __attribute__((noinline, noclone))
 static void protoReply(const char *text)
 {
@@ -6369,28 +5734,28 @@ static void protoReply(const char *text)
   protoPut('\n');
 }
 
-/* One flash copy per reply text. Naming the arrays keeps gcc from emitting a
- * separate copy (plus alignment padding) for every call site. */
+/* 每条回复文本一份 flash 副本。给数组起名是为了让 gcc 不要为每个调用点
+ * 各生成一份单独的副本（外加对齐填充）。 */
 static const char s_rOk[] PROGMEM = "OK";
 static const char s_rErr[] PROGMEM = "ERR";
 static const char s_rRej[] PROGMEM = "REJECTED";
 static const char s_rOkN[] PROGMEM = "OK #";
-/* The three "understood, but did not run" answers the button family used to
- * collapse into REJECTED. Telling them apart is what makes a serial-only host
- * able to act: BUSY = the arm is moving, DISCARD = the recording was thrown
- * away (too short / no travel / buffer full), EMPTY = P with nothing stored.
- * OFF = the firmware has the module but the user switched it off with !P/!B/!D,
- * as opposed to REJECTED meaning it was never compiled in. */
+/* 三种"看懂了但没执行"的回复，按键族以前都合并成 REJECTED。
+ * 把它们区分开是让纯串口主机能做出反应的关键：BUSY = 机械臂在动，
+ * DISCARD = 录制被丢弃（位移不够 / 没有动作 / 缓冲满），
+ * EMPTY = P 时没有任何录制数据。
+ * OFF = 固件里有该模块，但用户用 !P/!B/!D 关掉了它；
+ * 而 REJECTED 则表示该模块从未被编译进来。 */
 static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
 static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
 
-/* 'F' (pick drawing task) answers "OK F=<tag>": the tag is a short ASCII name
- * ("LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE") so a serial-only host -
- * a PC terminal or the ESP8266 board - can see which drawing mode is armed.
- * The tag itself comes from draw_control.cpp (drawTaskTag). */
+/* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
+ * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
+ * 让纯串口主机（PC 终端或 ESP8266 板子）知道当前选中的是哪种绘图模式。
+ * tag 本身由 draw_control.cpp 提供（drawTaskTag）。 */
 __attribute__((noinline))
 static void protoReplyTaskTag(const char *tag)
 {
@@ -6429,12 +5794,11 @@ static void protoReplyTaskTag(const char *tag)
 #define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
 #endif
 
-/* ========== command class bitmaps ========== */
-/* Index i = cmd - '0' spans '0'(0x30) .. 'p'(0x70), which covers every command
- * character; anything else falls off the end and is rejected.
- * s_liveBits: the command is still accepted while a module is busy.
- * s_fastBits: the command runs as soon as its single character arrives, i.e.
- * without waiting for the end of the line. */
+/* ========== 命令分类位图 ========== */
+/* 下标 i = cmd - '0' 覆盖 '0'(0x30) .. 'p'(0x70)，包括所有命令字符；
+ * 其它字符会越出表尾并被拒绝。
+ * s_liveBits：模块忙时该命令仍然被接受。
+ * s_fastBits：命令只要单字符一到就立即执行，不必等行尾。 */
 static const uint8_t s_liveBits[9] PROGMEM = { 0x0F, 0x00, 0xF0, 0x71, 0xA7, 0x00, 0x00, 0xC0, 0x01 };
 static const uint8_t s_fastBits[9] PROGMEM = { 0x0E, 0x00, 0x0E, 0x99, 0x08, 0x00, 0x00, 0x08, 0x00 };
 
@@ -6448,34 +5812,33 @@ __attribute__((noinline)) static bool protoCmdBit(const uint8_t *bits, char cmd)
   return (pgm_read_byte(bits + (i >> 3)) & (uint8_t)(1u << (i & 7u))) != 0;
 }
 
-/* Which feature module a command character needs: two bits per character,
- * indexed exactly like the maps above (i = cmd - '0'). 0 = the command is not
- * gated by any module, 1 = pick & place, 2 = buttons, 3 = drawing.
+/* 一个命令字符需要哪个功能模块：每个字符 2 位，
+ * 下标与上面的位图完全一样（i = cmd - '0'）。
+ * 0 = 命令不受模块门控，1 = 取放，2 = 按键，3 = 绘图。
  *
- * This replaces the three if chains in the dispatcher (3 + 5 + 10 = 18 character
- * comparisons, all with their own WEARM_ENABLE_* and runtime tests).
+ * 这张表替代了派发器里的三条 if 链（3 + 5 + 10 = 18 次字符比较，
+ * 每次还要带自己的 WEARM_ENABLE_* 与运行时检查）。
  *
- * Measured on the real Uno build (all features on): the dispatcher itself shrank
- * from 2192 to 2134 bytes, but the table plus the lookup add about the same
- * amount back, so the whole image ended up 10 bytes *larger* (32710 -> 32720).
- * Kept because it is the clearer way to say "which module owns this command"
- * and the all-features build fits with room to spare - not because it saves
- * anything. Revert to the explicit chains if every last byte is needed.
+ * 真实 Uno 构建实测（全功能）：派发器本身从 2192 字节减到 2134 字节，
+ * 但加上表与查表开销，整镜像反而大了 10 字节（32710 -> 32720）。
+ * 保留它是因为"哪个模块拥有哪个命令"这样表达更清晰，
+ * 且全功能构建仍有富余空间 —— 不是因为它省了什么。
+ * 每个字节都要省的话就退回显式 if 链。
  *
- * Bit layout of byte k: bits 1:0 = char (4k), 3:2 = char (4k+1),
- *                       5:4 = char (4k+2), 7:6 = char (4k+3). */
+ * 字节 k 的位布局：bit 1:0 = 字符(4k)，3:2 = 字符(4k+1)，
+ *                   5:4 = 字符(4k+2)，7:6 = 字符(4k+3)。 */
 static const uint8_t s_featureBits[17] PROGMEM = {
-  0x02,                                     /* '0' -> buttons (home, alias of M)  */
+  0x02,                                     /* '0' -> 按键（回中，M 的别名） */
   0x00, 0x00, 0x00,
-  0x54,                                     /* A B C -> pick, D -> draw           */
-  0xFF,                                     /* D E F G all -> draw                */
+  0x54,                                     /* A B C -> 取放，D -> 绘图      */
+  0xFF,                                     /* D E F G 全部 -> 绘图          */
   0x00,
-  0x28,                                     /* M N -> buttons                     */
-  0x2E,                                     /* P -> buttons, Q -> draw, R -> btn  */
-  0xCC,                                     /* U -> draw, W -> draw               */
+  0x28,                                     /* M N -> 按键                    */
+  0x2E,                                     /* P -> 按键，Q -> 绘图，R -> 按键 */
+  0xCC,                                     /* U -> 绘图，W -> 绘图           */
   0x00, 0x00, 0x00, 0x00, 0x00,
-  0xF0,                                     /* n o -> draw                        */
-  0x03                                      /* p -> draw                          */
+  0xF0,                                     /* n o -> 绘图                    */
+  0x03                                      /* p -> 绘图                      */
 };
 
 __attribute__((noinline)) static uint8_t protoCmdFeature(char cmd)
@@ -6488,17 +5851,17 @@ __attribute__((noinline)) static uint8_t protoCmdFeature(char cmd)
   return (uint8_t)((pgm_read_byte(s_featureBits + (i >> 2)) >> (uint8_t)((i & 3u) * 2u)) & 0x03u);
 }
 
-/* ========== main loop interface ========== */
-/* Called once per loop(): collect the characters that arrived into one line and run it */
+/* ========== 主循环接口 ========== */
+/* 每轮 loop() 调用一次：把已到达的字符攒成一行并执行 */
 void serialProtocolLoop(void)
 {
   int c;
 
   while ((c = protoRxTake()) >= 0) {
-    /* remember when the last character arrived */
+    /* 记住最后一个字符到达的时刻 */
     s_lastCharMs = millis();
 
-    /* over-long line: stay in the dropping state until the EOL */
+    /* 超长行：保持在丢弃状态直到行尾 */
     if (c == '\n' || c == '\r') {
       if (s_dropUntilEol) {
         s_dropUntilEol = false;
@@ -6510,10 +5873,10 @@ void serialProtocolLoop(void)
       continue;
     }
     if (s_dropUntilEol) {
-      continue;  /* drop characters up to the EOL */
+      continue;  /* 丢弃到行尾之前的字符 */
     }
 
-    /* line buffer overflow */
+    /* 行缓冲溢出 */
     if (s_len >= PROTO_LINE_BUF_SIZE - 1) {
       s_dropUntilEol = true;
       s_len = 0;
@@ -6521,22 +5884,22 @@ void serialProtocolLoop(void)
       continue;
     }
 
-    /* store the character */
+    /* 存入字符 */
     s_line[s_len++] = (char)c;
     s_pending = true;
 
-    /* single character fixed commands run immediately */
+    /* 单字符固定命令立即执行 */
     if (s_len == 1 && protoCmdBit(s_fastBits, s_line[0])) {
-      protoFlushLine();  /* dispatch single character commands right away */
+      protoFlushLine();  /* 立即派发单字符命令 */
     }
   }
 
-  /* line timeout: buffered data that went quiet is treated as a complete line */
+  /* 行超时：缓冲数据静默了一段时间就按整行已到处理 */
   if (s_pending && (millis() - s_lastCharMs) >= PROTO_LINE_TIMEOUT_MS) {
     protoFlushLine();
   }
 
-  /* over-long line drop timeout */
+  /* 超长行丢弃超时 */
   if (s_dropUntilEol && (millis() - s_lastCharMs) >= PROTO_LINE_TIMEOUT_MS) {
     s_dropUntilEol = false;
     s_line[0] = '\0';
@@ -6545,8 +5908,8 @@ void serialProtocolLoop(void)
   }
 }
 
-/* ========== dispatch ========== */
-/* Dispatch the buffered line to the command handler */
+/* ========== 派发 ========== */
+/* 把缓冲好的行派发给命令处理器 */
 static bool protoRuntimeEnabled(uint8_t feature)
 {
   return (s_runtimeFeatures & feature) != 0;
@@ -6559,11 +5922,11 @@ static uint8_t protoCompiledFeatures(void)
          (WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u);
 }
 
-/* Reply for one button-family result (N/R/P/M/0) so every one of those commands
- * is answered the same way: OK / BUSY / DISCARD / EMPTY / ERR. */
+/* 按键族结果（N/R/P/M/0）的统一回复，让这几条命令都用同一种方式回答：
+ * OK / BUSY / DISCARD / EMPTY / ERR。 */
 static void protoReplyButtonResult(int result)
 {
-  (void)result; /* keep -Wunused-parameter quiet when responses are compiled out */
+  (void)result; /* 关闭响应层时用来压掉 -Wunused-parameter 警告 */
   if (result == PROTO_RES_BUSY) {
     R_BUSY();
   } else if (result == PROTO_RES_REC_REJECTED) {
@@ -6577,10 +5940,9 @@ static void protoReplyButtonResult(int result)
   }
 }
 
-/* Answer a command whose module will not take it right now: "OFF" when the
- * firmware does contain the module but the user switched it off with !P/!B/!D,
- * "REJECTED" when it was compiled out of this build. Shared by every refusal
- * site so the two cases cannot drift apart. */
+/* 回答一个其所属模块现在不肯接受的命令：固件里确实有该模块但被用户用
+ * !P/!B/!D 关掉了就回 "OFF"，被编译掉了就回 "REJECTED"。
+ * 所有拒绝点共用这一份，防止两种情况漂移。 */
 static void protoRefuseModule(uint8_t feature)
 {
   if ((protoCompiledFeatures() & feature) != 0u) {
@@ -6600,17 +5962,16 @@ static void protoFlushLine(void)
   s_pending = false;
 }
 
-/* ========== command handling ========== */
-/* Handle one complete line (newline already removed) */
+/* ========== 命令处理 ========== */
+/* 处理一整行（换行符已被移除） */
 int protoHandleLine(const char *line)
 {
   if (line == NULL) {
     return PROTO_RES_NONE;
   }
 
-  /* Work directly on the caller's string. Every parser below skips blanks on
-   * its own, so the old "collapse blanks into a local copy" pass - and the
-   * 40 byte stack frame it needed - is gone. */
+  /* 直接在调用者的字符串上工作。下面每个解析器都会自己跳过空白，
+   * 所以旧版"把空白压进本地副本"那一遍（以及它需要的 40 字节栈帧）已经没了。 */
   const char *p = line;
   PROTO_SKIP_BLANKS(p);
 
@@ -6619,8 +5980,8 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
-  /* "single" is the old "normalized length == 1": blanks only after the command
-   * character. buf[0] of the old copy was exactly this cmd. */
+  /* "single" 就是旧版的"归一化长度 == 1"：命令字符之后只有空白。
+   * 旧副本的 buf[0] 恰好就是这个 cmd。 */
   const char *tail = p + 1;
   PROTO_SKIP_BLANKS(tail);
   const bool single = (*tail == '\0');
@@ -6655,11 +6016,10 @@ int protoHandleLine(const char *line)
     return PROTO_RES_BAD_SYNTAX;
   }
   if (single) {
-    /* Feature gate: a command that belongs to a module (pick & place, buttons,
-     * drawing) is refused unless that module is both compiled in and switched on
-     * at runtime. s_runtimeFeatures starts out as the compiled set and only the
-     * '!' commands change it, so protoRuntimeEnabled() alone is the whole test:
-     * a module compiled out can never be switched on. */
+    /* 功能门控：属于某个模块（取放、按键、绘图）的命令，只有该模块既被
+     * 编译进来、又处于运行时开启状态才被接受。
+     * s_runtimeFeatures 初始就是编译期的集合，只有 '!' 命令会改它，
+     * 所以 protoRuntimeEnabled() 一票就能判定：被编译掉的模块永远打不开。 */
     uint8_t module = protoCmdFeature(cmd);
 
     if (module != 0u) {
@@ -6673,23 +6033,21 @@ int protoHandleLine(const char *line)
     }
   }
 
-  /* Busy decision: while a pick/place sequence runs, or the button module is
-   * recording/playing/homing, or a drawing task is running, every other serial
-   * motion command gives way.
+  /* 忙判定：取放序列运行中、按键模块录制/播放/回中中、或绘图任务运行中，
+   * 其它所有串口运动指令一律让位。
    *
-   * Two exceptions must pass (the callee decides again and answers
-   * PROTO_RES_BUSY when it disagrees):
-   *   1) speed commands (H, L, 1, 2, 3) - you may want to change speed in the
-   *      middle of a pick/place sequence or a recording;
-   *   2) button commands (N, R, P, M) - sending R to stop a recording must not
-   *      be blocked here, or the recording could never be stopped.
-   *   3) drawing commands (F, D, G, E, Q, U, W and p, n, o) - pause/resume/
-   *      cancel/teach/calibrate are exactly what you send while drawing, so
-   *      blocking them would disable all three control functions.
+   * 有两类例外必须放行（真正是否执行由被调方再次判定，
+   * 不同意时会回 PROTO_RES_BUSY）：
+   *   1) 调速命令（H、L、1、2、3）—— 你可能想在取放序列或录制中途改速度；
+   *   2) 按键命令（N、R、P、M）—— 用 R 结束录制不能被这里挡住，
+   *      否则录制永远停不下来。
+   *   3) 绘图命令（F、D、G、E、Q、U、W 以及 p、n、o）——
+   *      暂停/继续/取消/示教/标定正是绘制时该发的命令，
+   *      挡住它们等于三项控制功能全废。
    *
-   * The three predicates are pure queries, so || order cannot change the
-   * answer; it is written cheapest-first only to keep the code short.
-   * Measured: -8 bytes versus pickPlaceIsBusy() first. */
+   * 三个判据都是纯查询，|| 顺序不会改变结果；
+   * 这里按"最便宜的先算"来写只是为了代码短。
+   * 实测：与"pickPlaceIsBusy() 放最前"相比省 8 字节。 */
   if (drawControlBusy() || buttonControlBusy() || pickPlaceIsBusy()) {
     if (!protoCmdBit(s_liveBits, cmd)) {
       R_BUSY();
@@ -6697,33 +6055,28 @@ int protoHandleLine(const char *line)
     }
   }
 
-  /* single character commands */
+  /* 单字符命令 */
   if (single) {
-    /* '0' is the only command below the 'O'..'W' range, so it is pulled out of
-     * the if chain: the chain then only pays for the comparisons it needs. */
+    /* '0' 是唯一落在 'O'..'W' 范围以下的命令，所以从 if 链里单拎出来：
+     * 剩下的链只需要为自己用到的比较买单。 */
     if (cmd == PROTO_CMD_BTN_HOME_ALT) {
       int result = buttonHandleCommand(cmd);
       protoReplyButtonResult(result);
       return result < 0 ? PROTO_RES_UNKNOWN : result;
     }
 
-    /* An if chain instead of a switch on purpose: the case labels span 'O'..'W',
-     * so switch would emit a 64 entry jump table while the chain only pays for
-     * the comparisons it needs.
-     * Measured on the real AVR build: -78 bytes for this whole dispatcher. */
+    /* 刻意用 if 链而不是 switch：case 标签跨 'O'..'W'，
+     * switch 会生成一张 64 项的跳转表，而 if 链只为自己用到的比较买单。
+     * 真实 AVR 构建实测：整个派发器省 78 字节。 */
     if (cmd == PROTO_CMD_GRIPPER_OPEN) {
-        posSetAngle4(servoLimit.maxF);
-        DEBUG_PRINT(F("[tool] angle4 -> "));
-        DEBUG_PRINTLN(Pos.ser.angle4);
-        R_OKN();
-        return PROTO_RES_GRIPPER_OPEN;
+      posSetAngle4(150.0);  // 硬编码：夹爪张开（与 f 行程上限一致）
+      R_OKN();
+      return PROTO_RES_GRIPPER_OPEN;
 
     } else if (cmd == PROTO_CMD_GRIPPER_CLOSE) {
-        posSetAngle4(servoLimit.minF);
-        DEBUG_PRINT(F("[tool] angle4 -> "));
-        DEBUG_PRINTLN(Pos.ser.angle4);
-        R_OKN();
-        return PROTO_RES_GRIPPER_CLOSE;
+      posSetAngle4(60.0);   // 硬编码：夹爪合拢（与 f 行程下限一致）
+      R_OKN();
+      return PROTO_RES_GRIPPER_CLOSE;
 
     } else if (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN) {
         protoSpeedStep((cmd == PROTO_CMD_SPEED_UP) ? +1 : -1);
@@ -6734,14 +6087,9 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_PICK_C) {
         int object = PICK_OBJECT_A + (cmd - PROTO_CMD_PICK_A);
         int rc = pickPlaceStart(object);
-        DEBUG_PRINT(F("[pick] "));
-        DEBUG_PRINT(cmd);
-        DEBUG_PRINT(F(" start -> "));
-        DEBUG_PRINTLN(rc == 0 ? F("OK") : F("REJECTED"));
-        /* 0 = started; -2 = busy; -1/-3 = could not start this time (bad number /
-         * path validation failed). Both are reported as BUSY so the host knows
-         * the command was understood but the sequence did not run; the reason is
-         * on the debug serial. */
+        /* 0 = 已启动；-2 = 忙；-1/-3 = 这一次启动不了（编号非法 /
+         * 路径校验失败）。这两种都回 BUSY，让主机知道命令被看懂了，
+         * 但序列没有跑起来。 */
         if (rc == 0) {
           R_OK();
           return PROTO_RES_PICK_STARTED;
@@ -6749,31 +6097,30 @@ int protoHandleLine(const char *line)
         R_BUSY();
         return PROTO_RES_BUSY;
 
-    /* N/R/P/M and '0': serial twins of the four physical buttons. Whether they
-     * can run right now (recording/playing/pick-place) is decided inside
-     * button_control.cpp, which answers PROTO_RES_BUSY when it cannot - the
-     * busy guard above deliberately lets these characters through, otherwise
-     * sending R to stop a recording would be blocked. */
+    /* N/R/P/M 与 '0'：四个物理按键的串口孪生。
+     * 能不能立刻执行（录制/播放/取放中）由 button_control.cpp 内部判定，
+     * 不行时它回 PROTO_RES_BUSY —— 上面的忙判定刻意放行这几个字符，
+     * 否则"用 R 结束录制"就会被挡住。 */
     } else if (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
                cmd == PROTO_CMD_BTN_PLAY || cmd == PROTO_CMD_BTN_HOME) {
       int result = buttonHandleCommand(cmd);
       protoReplyButtonResult(result);
       return result < 0 ? PROTO_RES_UNKNOWN : result;
 
-    /* F/D/G/E/Q/U/W: drawing commands (pick task / start / teach point / undo /
-     * pause / resume / cancel). Whether they can run (already drawing, not
-     * enough teach points, path validation) is decided inside draw_control.cpp,
-     * which answers PROTO_RES_BUSY or PROTO_RES_DRAW_REJECTED - the busy guard
-     * above deliberately lets these characters through, otherwise pause/cancel
-     * while drawing would be blocked. */
+    /* F/D/G/E/Q/U/W：绘图命令（选图形 / 开始 / 记示教点 / 撤销 /
+     * 暂停 / 继续 / 取消）。能不能执行（已在绘制中、示教点不够、
+     * 路径校验不通过）由 draw_control.cpp 内部判定，
+     * 它会回 PROTO_RES_BUSY 或 PROTO_RES_DRAW_REJECTED ——
+     * 上面的忙判定刻意放行这几个字符，
+     * 否则绘制中的暂停/取消就会被挡住。 */
     } else if (cmd == PROTO_CMD_DRAW_TASK || cmd == PROTO_CMD_DRAW_START ||
                cmd == PROTO_CMD_DRAW_RECORD || cmd == PROTO_CMD_DRAW_UNDO ||
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      /* 'F' is answered with the shape that is now selected ("OK F=V") instead
-       * of a bare "OK": the operator (and the ESP8266 board) has no other way
-       * to tell which of the seven drawing tasks is armed. */
+      /* 'F' 用"当前选中的图形"回复（"OK F=V"），而不是干巴巴的 "OK"：
+       * 操作者（以及 ESP8266 板子）没有别的办法知道 7 种绘图任务里
+       * 究竟选中了哪一种。 */
       if (result == PROTO_RES_DRAW_TASK_SELECTED) {
         protoReplyTaskTag(drawTaskTag(drawGetTask()));
       } else if (result == PROTO_RES_BUSY) R_BUSY();
@@ -6782,12 +6129,12 @@ int protoHandleLine(const char *line)
       else R_OK();
       return result;
     }
-    /* unknown single character command: fall through to angle parsing */
+    /* 未知单字符命令：落到下面的角度解析 */
   }
 
-  /* Paper calibration p/n/o: multi character (p12.5 / n6 / o20,0). Handled
-   * before angle parsing because the 'o' line contains a comma and would
-   * otherwise be taken for "an angle command with a syntax error". */
+  /* 纸面标定 p/n/o：多字符（p12.5 / n6 / o20,0）。
+   * 放在角度解析之前处理，因为 'o' 行里带逗号，
+   * 否则会被当成"语法错误的角度命令"。 */
   if ((cmd == PROTO_CMD_DRAW_PAPER_Z ||
        cmd == PROTO_CMD_DRAW_HALF ||
        cmd == PROTO_CMD_DRAW_CENTER) && !single) {
@@ -6800,43 +6147,32 @@ int protoHandleLine(const char *line)
     return result;
   }
 
-  /* x/y/z: the three-servo synchronous angle command (exam task 1.3).
-   * x -> base servo (angle1 = b), y -> shoulder servo (angle2 = r),
-   * z -> elbow servo (angle3 = c). Every axis the line mentions is written in
-   * one go and the forward kinematics runs once afterwards, so one line is one
-   * synchronized pose change - the same convention the rest of the firmware
-   * uses (Pos.ser is the truth, Pos.rec is derived from it). */
+  /* x/y/z：三舵机同步角度指令（考题 1.3）。
+   * x -> 基座舵机（angle1 = b），y -> 上臂舵机（angle2 = r），
+   * z -> 下臂舵机（angle3 = c）。一行里出现的每个轴都在同一次
+   * 正解刷新之前一次写完，所以一行就是一次同步姿态改变 ——
+   * 与固件其它部分同一约定（Pos.ser 是真值，Pos.rec 由它派生）。 */
   if (protoAxisIndexFromChar(cmd) >= 0) {
     double angles[3];
     uint8_t seen = 0;
 
     if (!protoParseAxisLine(p, angles, &seen)) {
-      DEBUG_PRINTLN(F("[proto] bad syntax, ignored"));
       R_ERR();
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    /* Out of travel is clamped rather than rejected: the limits come from
-     * servoLimit (the one shared truth, also used by the joystick and the
-     * drawing module), so "x200" lands on that joint's travel maximum instead of
-     * turning the whole command into a no-op. A line naming no axis at all never
-     * gets this far - protoParseAxisLine rejects it. */
+    /* 超出机械行程是夹取而不是拒绝：b/r/c 三轴的上下限已硬编码为 0..180，
+     * 所以 "x200" 会落到该关节行程的上限，
+     * 而不是把整条命令变成什么都不做的空操作。
+     * 一个轴都没提到的行根本走不到这里 —— protoParseAxisLine 会拒掉它。 */
     protoApplyAngles(angles, seen);
 
-#if WEARM_DEBUG_SERIAL
-    Serial.print(F("[proto] sync angles b="));
-    Serial.print(Pos.ser.angle1);
-    Serial.print(F(" r="));
-    Serial.print(Pos.ser.angle2);
-    Serial.print(F(" c="));
-    Serial.println(Pos.ser.angle3);
-#endif
     R_OK();
     return PROTO_RES_ANGLES_SET;
   }
 
-  /* Not an axis letter, but it contains a comma or starts with '=': it looks
-   * like an angle command that was mistyped. Everything else is unknown. */
+  /* 不是轴字母，但里面带逗号或开头是 '='：看起来像写错的角度命令。
+   * 其它一切视为未知。 */
   {
     const char *scan = p;
     while (*scan != '\0' && *scan != ',') {
@@ -6852,53 +6188,53 @@ int protoHandleLine(const char *line)
   return PROTO_RES_BAD_SYNTAX;
 }
 
-/* ========== angle parsing ========== */
-/* Parse an angle command: group (',' group)*, group = [blank] axis letter
- * [blank] [optional '='] [blank] value. The parsed numbers are servo angles in
- * degrees, x/y/z in the order protoAxisIndexFromChar() returns them. The whole
- * line must parse; an axis given twice keeps its last value. Anything that does
- * not match the grammar returns false and touches nothing but angles/seen. */
+/* ========== 角度解析 ========== */
+/* 解析一条角度命令：group (',' group)*，group = [空白] 轴字母 [空白]
+ * [可选 '='] [空白] 数值。解析出的数值是舵机角度（度），
+ * x/y/z 按 protoAxisIndexFromChar() 返回的下标顺序排列。
+ * 整行必须能解析；同一个轴给两次以最后一次为准。
+ * 语法不匹配就返回 false，除了 angles/seen 之外什么都不碰。 */
 static bool protoParseAxisLine(const char *s, double angles[3], uint8_t *seen)
 {
   const char *p = s;
   int groups = 0;
 
   for (;;) {
-    /* 1) blanks before the group */
+    /* 1) 组之前的空白 */
     PROTO_SKIP_BLANKS(p);
 
-    /* 2) axis letter (either case) */
+    /* 2) 轴字母（大小写均可） */
     int axis = protoAxisIndexFromChar(*p);
     if (axis < 0) return false;
     p++;
 
-    /* 3) blanks between the letter and the '=' */
+    /* 3) 字母与 '=' 之间的空白 */
     PROTO_SKIP_BLANKS(p);
 
-    /* 4) optional '=' */
+    /* 4) 可选 '=' */
     if (*p == '=') {
       p++;
       PROTO_SKIP_BLANKS(p);
     }
 
-    /* 5) the value (must really start with a digit) */
+    /* 5) 数值（必须真的以数字开头） */
     if (!protoParseNumber(&p, &angles[axis])) return false;
 
-    /* 6) record it (an axis given twice keeps the last value) */
+    /* 6) 记录下来（同一个轴给两次以最后一次为准） */
     *seen |= (uint8_t)(1u << axis);
     groups++;
 
-    /* 7) only the end of line or a comma may follow */
+    /* 7) 后面只能是行尾或逗号 */
     PROTO_SKIP_BLANKS(p);
     if (*p == '\0') break;
     if (*p != ',') return false;
-    p++;   /* eat the comma and go to the next group */
+    p++;   /* 吃掉逗号，处理下一组 */
   }
 
   return (groups > 0);
 }
 
-/* Hand written number parser: avoids strtod/atof */
+/* 手写数字解析器：避免引入 strtod/atof */
 static bool protoParseNumber(const char **pp, double *out)
 {
   const char *p = *pp;
@@ -6906,7 +6242,7 @@ static bool protoParseNumber(const char **pp, double *out)
   unsigned int ip = 0;
   double value;
 
-  /* optional sign */
+  /* 可选符号 */
   if (*p == '+') {
     p++;
   } else if (*p == '-') {
@@ -6914,14 +6250,13 @@ static bool protoParseNumber(const char **pp, double *out)
     p++;
   }
 
-  /* integer part: at least one digit */
+  /* 整数部分：至少一位数字 */
   if (*p < '0' || *p > '9') {
     return false;
   }
-  /* Digits are collected in an integer and converted once. Saturating at
-   * 1000000 leaves the clamped result identical to the old per digit double
-   * accumulation: every value this firmware accepts as an angle is far below
-   * the clamp ceiling, so both forms end up at the same limit. */
+  /* 数字先攒在整数里、最后一次转换。饱和在 1000000 之后夹取结果
+   * 与老版本逐位累积结果一致：本固件接受为角度的值都远低于饱和上限，
+   * 所以两种写法都落到同一个极限。 */
   do {
     if (ip < 9999u) {
       ip = ip * 10u + (unsigned int)(*p - '0');
@@ -6931,13 +6266,13 @@ static bool protoParseNumber(const char **pp, double *out)
 
   value = (double)ip;
 
-  /* fraction: a '.' must be followed by digits, and the digits are still added
-   * one decimal place at a time so the rounding is unchanged */
+  /* 小数部分：'.' 后面必须跟数字，数字仍是按十进制位逐个加上去，
+   * 所以舍入结果不变 */
   if (*p == '.') {
     double decimal_place = 0.1;
     p++;
     if (*p < '0' || *p > '9') {
-      return false;  /* "12." is not valid */
+      return false;  /* "12." 不合法 */
     }
     do {
       value += (*p - '0') * decimal_place;
@@ -6951,37 +6286,34 @@ static bool protoParseNumber(const char **pp, double *out)
   return true;
 }
 
-/* ========== angle application ========== */
-/* Write the axes the line mentioned into the three joints and refresh the
- * forward kinematics once. Axis a is joint a+1: angle1 = b (base), angle2 = r
- * (shoulder), angle3 = c (elbow) - that is exactly the x/y/z mapping the exam
- * asks for, and it is also why the three joints can be written through one
- * pointer walk instead of a switch.
+/* ========== 角度应用 ========== */
+/* 把这一行提到的轴写进三个关节，并只刷新一次正运动学。
+ * 轴 a 就是关节 a+1：angle1 = b（基座），angle2 = r（上臂），
+ * angle3 = c（下臂）—— 正是考题要求的 x/y/z 映射，
+ * 也是为什么三个关节能用一次指针遍历写完，而不必 switch 展开。
  *
- * clampServoAngles() is the same clamp every other writer uses (joystick,
- * drawing jog, pick & place), so a value outside the mechanical travel snaps to
- * the travel limit and the command is still an OK - the host sees the arm move
- * to the nearest legal pose instead of getting an error it cannot act on. */
+ * 角度在这里硬夹到 0..180（取代了原来的 clampServoAngles() 调用）。
+ * 同样的上限在舵机驱动层也会执行，但在这里夹一次能让 Pos.ser 自身
+ * 保持在合法范围内。 */
 static void protoApplyAngles(const double angles[3], uint8_t seen)
 {
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     if ((seen & (uint8_t)(1u << a)) == 0u) continue;
-    (&Pos.ser.angle1)[a] = angles[a];
+    double v = angles[a];
+    if (v < 0.0)   v = 0.0;
+    if (v > 180.0) v = 180.0;
+    (&Pos.ser.angle1)[a] = v;
   }
 
-  clampServoAngles(&Pos.ser);
-  if (!recFromServo(&Pos.rec, &Pos.ser)) {
-    DEBUG_PRINTLN(F("[proto] warning: recFromServo failed"));
-  }
+  (void) recFromServo(&Pos.rec, &Pos.ser);
 }
 
-/* ========== drawing parameter calibration ========== */
-/* p<paper z> / n<half width> / o<center x>,<center y>
- * A syntax error or an out-of-range value answers PROTO_RES_DRAW_REJECTED and
- * changes no parameter. */
+/* ========== 绘图参数标定 ========== */
+/* p<纸面 z> / n<半宽> / o<中心 x>,<中心 y>
+ * 语法错误或值越界会回 PROTO_RES_DRAW_REJECTED，并且不改动任何参数。 */
 static int protoHandleDrawCalib(const char *line, char cmd)
 {
-  const char *p = line + 1;   /* skip the command letter */
+  const char *p = line + 1;   /* 跳过命令字母 */
   double v1;
   double v2;
 
@@ -7007,100 +6339,55 @@ static int protoHandleDrawCalib(const char *line, char cmd)
 
   if (ok) {
     R_OK();
-    DEBUG_PRINT(F("[draw] calib -> paper z="));
-    DEBUG_PRINTF(drawGetPaperZ(), 2);
-    DEBUG_PRINT(F(" half="));
-    DEBUG_PRINTF(drawGetHalfSize(), 2);
-    DEBUG_PRINT(F(" center=("));
-    DEBUG_PRINTF(drawGetCenterX(), 2);
-    DEBUG_PRINT(F(","));
-    DEBUG_PRINTF(drawGetCenterY(), 2);
-    DEBUG_PRINTLN(F(")"));
     return PROTO_RES_DRAW_CALIBRATED;
   }
 
   R_ERR();
-  DEBUG_PRINTLN(F("[draw] calib syntax error or bad value, parameters unchanged"));
   return PROTO_RES_DRAW_REJECTED;
 }
 
-/* ========== speed control ========== */
-/* Step the speed level */
+/* ========== 调速控制 ========== */
+/* 步进一档速度 */
 static int protoSpeedStep(int delta)
 {
   int current_level = speedGetLevel();
 
-  /* a custom level falls back to the default one */
+  /* 自定义档位回落到默认档 */
   if (current_level < PROTO_SPEED_LEVEL_MIN || current_level > PROTO_SPEED_LEVEL_MAX) {
     current_level = PROTO_SPEED_LEVEL_DEF;
   }
 
   int want_level = current_level + delta;
 
-  /* clamp to the level range */
+  /* 夹到档位范围 */
   if (want_level < PROTO_SPEED_LEVEL_MIN) {
     want_level = PROTO_SPEED_LEVEL_MIN;
   } else if (want_level > PROTO_SPEED_LEVEL_MAX) {
     want_level = PROTO_SPEED_LEVEL_MAX;
   }
 
-  /* already at the end: do not call adjustSpeed */
+  /* 已经在端点：不再调用 adjustSpeed */
   if (want_level == current_level) {
-    DEBUG_PRINT(F("[speed] already at "));
-    DEBUG_PRINTLN(speedLevelName(current_level));
     return current_level;
   }
 
-  /* change the speed level */
+  /* 切换速度档位 */
   want_level = adjustSpeed(want_level);
-  DEBUG_PRINT(F("[speed] "));
-  DEBUG_PRINT(delta > 0 ? F("H") : F("L"));
-  DEBUG_PRINT(F(" -> "));
-  DEBUG_PRINTLN(speedLevelName(want_level));
   return want_level;
 }
 
-/* ========== initialization ========== */
-/* UART setup (raw registers on the release AVR build, Serial otherwise) plus
- * the command table */
+/* ========== 初始化 ========== */
+/* UART 初始化（release AVR 构建走裸寄存器，其它情况走 Serial）
+ * 以及命令表输出 */
 void serialProtocolBegin(void)
 {
   protoSerialBegin();
   s_runtimeFeatures = protoCompiledFeatures();
 
-  /* command table: kept under WEARM_SERIAL_RESPONSES so the host still gets the
-   * command list with WEARM_DEBUG_SERIAL=0. Deliberately terse: every character
-   * here is flash, so the command list and the angle syntax share one line. */
+  /* 命令表：放在 WEARM_SERIAL_RESPONSES 里，
+   * 这样主机能拿到命令列表。刻意写得简洁：这里每个字符都是 flash，
+   * 所以命令列表与角度语法共挤一行。 */
   R_BOOT();
-
-  /* verbose table */
-  DEBUG_PRINTLN(F("[proto] ===== serial command table ====="));
-  DEBUG_PRINTLN(F("[proto] O            gripper OPEN  (angle4 -> f max)"));
-  DEBUG_PRINTLN(F("[proto] S            gripper CLOSE (angle4 -> f min)"));
-  DEBUG_PRINTLN(F("[proto] H / L        speed up / down one level"));
-  DEBUG_PRINTLN(F("[proto] x,y,z        three servo angles in degrees, e.g. x10,y30,z20"));
-  DEBUG_PRINTLN(F("[proto]              x = base (angle1), y = shoulder (angle2), z = elbow (angle3)"));
-  DEBUG_PRINTLN(F("[proto]              one line = one synchronized write, out-of-travel is clamped"));
-  for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
-    double lo, hi;
-    if (!protoAxisGetLimit(a, &lo, &hi)) continue;
-    /* the axis letter is printed through a one character C string so it is not
-     * taken for a code value; the joint letter comes from the mapping table */
-    DEBUG_PRINT(F("[proto] "));
-    DEBUG_PRINT(protoAxisChar[a]);
-    DEBUG_PRINT(F(" = angle"));
-    DEBUG_PRINT((char)('1' + a));
-    DEBUG_PRINT(F(" ("));
-    DEBUG_PRINT(protoAxisJoint[a]);
-    DEBUG_PRINT(F(") travel "));
-    DEBUG_PRINTF(lo, 1);
-    DEBUG_PRINT(F(" .. "));
-    DEBUG_PRINTF(hi, 1);
-    DEBUG_PRINTLN();
-  }
-  DEBUG_PRINTLN(F("[proto] legacy: 1/2/3 = slow/normal/fast, k/K = tool step open/close"));
-  DEBUG_PRINTLN(F("[proto] A/B/C = start pick/place sequence for object A/B/C"));
-  DEBUG_PRINTLN(F("[proto] ================================"));
 }
 
 // ===== meArm.ino =====
@@ -7270,16 +6557,20 @@ void serialProtocolBegin(void)
  * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
 #if WEARM_MIRROR_BASE
-  servoDriveWrite(0, (servoLimit.minB + servoLimit.maxB) - Pos.ser.angle1);
+    // 基座：硬编码 0~180 的镜像
+    servoDriveWrite(0, 180.0 - Pos.ser.angle1);
 #else
-  servoDriveWrite(0, Pos.ser.angle1);
+    servoDriveWrite(0, Pos.ser.angle1);
 #endif
-  servoDriveWrite(1, Pos.ser.angle2);
-  servoDriveWrite(2, Pos.ser.angle3);
+
+    servoDriveWrite(1, Pos.ser.angle2);
+    servoDriveWrite(2, Pos.ser.angle3);
+
 #if WEARM_MIRROR_TOOL
-  servoDriveWrite(3, (servoLimit.minF + servoLimit.maxF) - Pos.ser.angle4);
+    // 夹爪：保留 60~150 的硬编码镜像
+    servoDriveWrite(3, (60.0 + 150.0) - Pos.ser.angle4);
 #else
-  servoDriveWrite(3, Pos.ser.angle4);
+    servoDriveWrite(3, Pos.ser.angle4);
 #endif
 }
 

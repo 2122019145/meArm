@@ -35,6 +35,9 @@ int protoAxisIndexFromChar(int c)
 
 /* 取第 axis 个轴（0..2）的关节行程上下限，直接转发 servoLimit。
  * axis 越界或指针为空时返回 false。 */
+/* 取第 axis 个轴（0..2）的关节行程上下限。
+ * 【本版本】已删除 servoLimit 配置，统一硬编码为舵机物理行程 0~180 度。
+ * axis 越界或指针为空时返回 false。 */
 bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
 {
   /* 检查参数有效性 */
@@ -42,23 +45,9 @@ bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
     return false;
   }
 
-  /* 根据轴索引映射到对应的舵机行程限制 */
-  switch (axis) {
-    case 0:  /* x -> angle1 = b 基座回转 */
-      *minAngle = servoLimit.minB;
-      *maxAngle = servoLimit.maxB;
-      break;
-    case 1:  /* y -> angle2 = r 上臂俯仰 */
-      *minAngle = servoLimit.minR;
-      *maxAngle = servoLimit.maxR;
-      break;
-    case 2:  /* z -> angle3 = c 下臂俯仰 */
-      *minAngle = servoLimit.minC;
-      *maxAngle = servoLimit.maxC;
-      break;
-    default:
-      return false;  /* 理论上不会执行到这里 */
-  }
+  /* b/r/c 三轴行程均为 0~180 度（硬编码，无需 switch 分支） */
+  *minAngle = 0.0;
+  *maxAngle = 180.0;
 
   return true;
 }

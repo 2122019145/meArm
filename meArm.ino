@@ -171,16 +171,20 @@
  * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
 #if WEARM_MIRROR_BASE
-  servoDriveWrite(0, (servoLimit.minB + servoLimit.maxB) - Pos.ser.angle1);
+    // 基座：硬编码 0~180 的镜像
+    servoDriveWrite(0, 180.0 - Pos.ser.angle1);
 #else
-  servoDriveWrite(0, Pos.ser.angle1);
+    servoDriveWrite(0, Pos.ser.angle1);
 #endif
-  servoDriveWrite(1, Pos.ser.angle2);
-  servoDriveWrite(2, Pos.ser.angle3);
+
+    servoDriveWrite(1, Pos.ser.angle2);
+    servoDriveWrite(2, Pos.ser.angle3);
+
 #if WEARM_MIRROR_TOOL
-  servoDriveWrite(3, (servoLimit.minF + servoLimit.maxF) - Pos.ser.angle4);
+    // 夹爪：保留 60~150 的硬编码镜像
+    servoDriveWrite(3, (60.0 + 150.0) - Pos.ser.angle4);
 #else
-  servoDriveWrite(3, Pos.ser.angle4);
+    servoDriveWrite(3, Pos.ser.angle4);
 #endif
 }
 
