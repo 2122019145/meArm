@@ -164,17 +164,17 @@ static double *btnAngle(int joint) {
  * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
-  /* b/r/c 三轴硬编码 0~180、f 硬编码 60~150（原 clampServoAngles 已随
-   * servoLimit 结构体一起删除）。录制/回放/回中的角度理论上都落在合法区间
-   * 内，此夹取只是一道保险。 */
+  /* 四个轴都只夹到舵机电气行程：b/r/c 0~180，f 是 TOOL_ANGLE_MIN..MAX(0~180)。
+   * 60~150 的"夹爪范围限制"已删除 —— 否则录制/回放/回中会把夹紧角顶回 60。
+   * 原 clampServoAngles() 已随 servoLimit 结构体一起删除，这里只是一道保险。 */
   if (tmp.angle1 < 0.0)   tmp.angle1 = 0.0;
   if (tmp.angle1 > 180.0) tmp.angle1 = 180.0;
   if (tmp.angle2 < 0.0)   tmp.angle2 = 0.0;
   if (tmp.angle2 > 180.0) tmp.angle2 = 180.0;
   if (tmp.angle3 < 0.0)   tmp.angle3 = 0.0;
   if (tmp.angle3 > 180.0) tmp.angle3 = 180.0;
-  if (tmp.angle4 < 60.0)  tmp.angle4 = 60.0;
-  if (tmp.angle4 > 150.0) tmp.angle4 = 150.0;
+  if (tmp.angle4 < TOOL_ANGLE_MIN) tmp.angle4 = TOOL_ANGLE_MIN;
+  if (tmp.angle4 > TOOL_ANGLE_MAX) tmp.angle4 = TOOL_ANGLE_MAX;
   Pos.ser = tmp;
   (void) recFromServo(&Pos.rec, &Pos.ser);
 }

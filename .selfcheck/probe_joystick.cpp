@@ -146,25 +146,26 @@ int main(void) {
     check("Pos.rec == recFromServo(Pos.ser)", ok && err < 1e-9, buf);
   }
 
-  printf("=== 3) 末端舵机 angle4：右手柄左右推，停在机械限位内 ===\n");
+  printf("=== 3) 末端舵机 angle4：右手柄左右推，停在舵机电气行程边界 ===\n");
   {
-    /* 固件约定（沿用老手柄的手感）：A2 右推 = angle4 减小(收回)，左推 = 增大(张开)。
+    /* 【本版本语义】f 的 60~150 软限位已删除，A2 推到底停在电气行程 TOOL_ANGLE_MIN/MAX。
+     * 固件约定（沿用老手柄的手感）：A2 右推 = angle4 减小(收回/夹紧)，左推 = 增大(张开)。
      * 上机若觉得反了，把 joystick_control.cpp 里 toolStep 的 sign 取反即可。 */
     resetInputs(); posInit();
     double f0 = Pos.ser.angle4;
     g_mockAnalog[MOCK_TX] = 900;              /* 右推 -> 角度减小 */
     runLoop(400, 30);
-    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (下限 60)", f0, Pos.ser.angle4);
-    check("A2 右推 -> angle4 减到 60 停住",
-          Pos.ser.angle4 < f0 && Pos.ser.angle4 >= 60.0 - 1e-9, buf);
+    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (下限 %.1f)", f0, Pos.ser.angle4, TOOL_ANGLE_MIN);
+    check("A2 右推 -> angle4 减到 TOOL_ANGLE_MIN(0) 停住",
+          Pos.ser.angle4 < f0 && fabs(Pos.ser.angle4 - TOOL_ANGLE_MIN) < 1e-9, buf);
 
     resetInputs(); posInit();
     f0 = Pos.ser.angle4;
     g_mockAnalog[MOCK_TX] = 200;              /* 左推 -> 角度增大 */
     runLoop(400, 30);
-        snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (上限 150)", f0, Pos.ser.angle4);
-    check("A2 左推 -> angle4 增到 150 停住",
-          Pos.ser.angle4 > f0 && Pos.ser.angle4 <= 150.0 + 1e-9, buf);
+    snprintf(buf, sizeof(buf), "f: %.1f -> %.1f (上限 %.1f)", f0, Pos.ser.angle4, TOOL_ANGLE_MAX);
+    check("A2 左推 -> angle4 增到 TOOL_ANGLE_MAX(180) 停住",
+          Pos.ser.angle4 > f0 && fabs(Pos.ser.angle4 - TOOL_ANGLE_MAX) < 1e-9, buf);
   }
 
   printf("=== 4) 斜推可以同时动多个关节（角度模式下逐轴独立） ===\n");
@@ -249,7 +250,7 @@ int main(void) {
     check("同起点同轮数下 快速转角 > 慢速转角", fastDb > slowDb, buf);
   }
 
-  printf("=== 7) 持续推杆：每个关节最终都停在 servoLimit 内 ===\n");
+  printf("=== 7) 持续推杆：每个关节最终都停在舵机电气行程内 ===\n");
   {
     adjustSpeed(SPEED_NORMAL);
     resetInputs(); posInit();
@@ -260,11 +261,11 @@ int main(void) {
     runLoop(600, 30);
     struct Joints j1 = snap();
     bool inRange = j1.b <= 180.0 + 1e-6 && j1.r >= 0.0 - 1e-6 &&
-                   j1.c >= 0.0 - 1e-6 && j1.f >= 60.0 - 1e-6;
+                   j1.c >= 0.0 - 1e-6 && j1.f >= TOOL_ANGLE_MIN - 1e-6;
     bool valid = (j1.b == j1.b) && (j1.r == j1.r) && (j1.c == j1.c) && (j1.f == j1.f);
-        snprintf(buf, sizeof(buf), "b=%.1f(max 180) r=%.1f(min 0) c=%.1f(min 0) f=%.1f",
-             j1.b, j1.r, j1.c, j1.f);
-    check("四路都推到头：角度全部落在 servoLimit 内且非 NaN", inRange && valid, buf);
+        snprintf(buf, sizeof(buf), "b=%.1f(max 180) r=%.1f(min 0) c=%.1f(min 0) f=%.1f(min %.1f)",
+             j1.b, j1.r, j1.c, j1.f, TOOL_ANGLE_MIN);
+    check("四路都推到头：角度全部落在舵机电气行程内且非 NaN", inRange && valid, buf);
   }
 
   printf("=== 8) 4000 轮随机推杆压力测试 ===\n");
@@ -281,11 +282,12 @@ int main(void) {
       g_mockAnalog[which] = v;                  /* 轮流扰动四路轴 */
       runLoop(1, 25);
 
-      /* 角度必须全部在 servoLimit 内 */
+      /* 角度必须全部落在舵机电气行程内（f 的 60~150 软限位已删除） */
       if (Pos.ser.angle1 < 0.0 - 1e-6 || Pos.ser.angle1 > 180.0 + 1e-6) bad++;
       if (Pos.ser.angle2 < 0.0 - 1e-6 || Pos.ser.angle2 > 180.0 + 1e-6) bad++;
       if (Pos.ser.angle3 < 0.0 - 1e-6 || Pos.ser.angle3 > 180.0 + 1e-6) bad++;
-      if (Pos.ser.angle4 < 60.0 - 1e-6 || Pos.ser.angle4 > 150.0 + 1e-6) bad++;
+      if (Pos.ser.angle4 < TOOL_ANGLE_MIN - 1e-6 ||
+          Pos.ser.angle4 > TOOL_ANGLE_MAX + 1e-6) bad++;
       /* 不能出现 NaN */
       if (!(Pos.ser.angle1 == Pos.ser.angle1) || !(Pos.ser.angle2 == Pos.ser.angle2) ||
           !(Pos.ser.angle3 == Pos.ser.angle3) || !(Pos.ser.angle4 == Pos.ser.angle4)) bad++;

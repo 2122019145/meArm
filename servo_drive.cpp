@@ -16,7 +16,7 @@
 #define SERVO_MAX_US      2400    /* MAX_PULSE_WIDTH  */
 #define SERVO_TRIM_US     2       /* TRIM_DURATION：补偿 ISR 开销，Servo 库同值 */
 #define SERVO_TICKS_PER_US 2u     /* 预分频 8 => 0.5us/tick => 1us = 2 tick */
-#define SERVO_FRAME_TICKS 40000u  /* REFRESH_INTERVAL 20ms */
+#define SERVO_FRAME_TICKS 60000u  /* 帧周期 = 60000 tick × 0.5us = 30ms（Servo 库是 20ms） */
 #define SERVO_FIRST_TICKS 1000u   /* 上电后 0.5ms 发第一个事件（等寄存器稳定） */
 #define SERVO_DEFAULT_TICKS 3000u /* usToTicks(1500us)：与 Servo 库 attach 的默认脉宽一致 */
 #define SERVO_PIN_NONE    0xFFu   /* 未 attach 的通道哨兵（引脚号 0~19 不会撞上） */

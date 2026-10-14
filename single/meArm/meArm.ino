@@ -64,14 +64,18 @@
  * 把多个 -D 塞进一个带空格的字符串会被当成一个参数，报
  * "token "=" is not valid in preprocessor expressions"。
  *
- * 实测容量（Program / Data，**v1.6.4 定版实编**；百分比按 32768 / 2048 算）：
- *     取放 + 按键 + 绘图       : 32016 B (97.7%) / 1475 B (72.0%)  <- 出厂默认
- *     取放 + 绘图   + 按键关   : 28814 B (87.9%) /  558 B (27.2%)
- *     取放 + 按键   + 绘图关   : 19260 B (58.8%) / 1224 B (59.8%)
- *     绘图 + 按键   + 取放关   : 29114 B (88.8%) / 1441 B (70.4%)
- * 默认配置相对 Uno 可用 flash（32256 B）只剩 **240 B** 余量
- * （单文件版 32028 B / 97.7%，余量 228 B；两者差 +12 B 是 LTO 内联顺序）。
- * 本轮（删掉"偏转越大走得越快"的动态步间间隔 + 施密特迟滞 + 中位跟踪时间门控）相对上一轮
+ * 实测容量（Program / Data，**v1.6.5 定版实编**；百分比按 32768 / 2048 算）：
+ *     取放 + 按键 + 绘图       : 30800 B (94.0%) / 1419 B (69.3%)  <- 出厂默认
+ *     取放 + 绘图   + 按键关   : 27214 B (83.1%) /  502 B (24.5%)
+ *     取放 + 按键   + 绘图关   : 18162 B (55.4%) / 1168 B (57.0%)
+ *     绘图 + 按键   + 取放关   : 27912 B (85.2%) / 1385 B (67.6%)
+ * 默认配置相对 Uno 可用 flash（32256 B）剩 **1456 B** 余量（单文件同为 30800 B /
+ * 94.0%，本轮两者完全相同）。相对 v1.6.4（32016 / 28814 / 19260 / 29114、
+ * Data 1475 / 558 / 1224 / 1441）四行 **−1216 / −1600 / −1098 / −1202 B**、
+ * Data 四行全部 **−56 B**：去配置化两轮删掉 servoLimit / rangeLimit 两块全局与
+ * 5 个辅助函数、DEBUG_PRINT* 调试打印、f 的 60~150 与纸面 z 的范围限制代码，
+ * 新增的只有 TOOL_* 常量（宏，不占 RAM）与每帧夹紧的重申调用。
+ * v1.6.4 轮（删掉"偏转越大走得越快"的动态步间间隔 + 施密特迟滞 + 中位跟踪时间门控）相对上一轮
  * 【四行为 32114 / 28922 / 19280 / 29240，Data 1457 / 540 / 1206 / 1423】分别
  * **−98 / −108 / −20 / −126 B**，Data 四行 **+18 B**：删掉 `speedIntervalMs()` 与
  * `jogIntervalMs()` 两个带浮点乘除与区间夹取的插值函数省下的，比新增的迟滞判断多；
@@ -161,14 +165,14 @@
  *    实机装配时，基座回转（通道 0 / b）与末端夹爪（通道 3 / f）的舵机是
  *    反向装上的：逻辑角增大时它们物理上朝反方向走。实机表现：
  *      - 左右旋转的舵机转向反了（摇杆/坐标指令给的方向与机械实际相反）；
- *      - 串口 O（张开 = 逻辑角 maxF）实际把爪子夹紧、S（夹紧 = minF）反而张开。
+ *      - 串口 O（张开 = 逻辑角 150）实际把爪子夹紧、S（夹紧 = 逻辑角 60）反而张开。
  *    修法不动 0~180 的整套映射，也不动任何逻辑角，只在唯一写出口
  *    writeServo() 里对这两个通道做一次"在自身行程窗口内镜像"：
  *        physical = (min + max) - logical
  *    逻辑角（限位、反解、录制回放、绘图、示教）仍是唯一真值，变的只是最后
- *    送给舵机的那个数。镜像后 physical 仍落在 [min,max] 区间内：
- *    b 是 [0,180] 对称、f 是 [60,150] 对称（60+150=210），所以夹爪不可能被
- *    推到机械危险区。
+ *    送给舵机的那个数。基座的镜像和是 180（整行程对称）；夹爪是 210（装配角），
+ *    而夹爪的逻辑角范围已放宽到 0~180，所以镜像后的物理角可能超出 0~180，
+ *    由 servo_drive 在脉宽层面夹到电气行程端点。
  *    换一套装配（舵机正着装）就把对应开关改成 0，其它文件一行都不用动。
  * ------------------------------------------------------------------------ */
 #ifndef WEARM_MIRROR_BASE
@@ -269,8 +273,14 @@
 //     clampToRange() 全部移除。末端 x/y/z 只是角度正解出来的派生量。
 //   - 可配置的关节硬限位：struct servoLimitCfg / servoLimit、servoSelfCheck()、
 //     isServoInRange()、clampServoAngles() 全部移除。
-//   - b/r/c 三轴的物理行程 0~180 与 f 的 60~150 分别在 moveJointStep()、
-//     posSetAngle4() 与 writeServo() 里硬编码。
+//   - 【本版本新增删除】夹爪 f 的 60~150 硬限位：getAngleEx() 里的越限吸附、
+//     posSetAngle4() 的夹取、button_control 录制/回放里的夹取全部删掉，
+//     f 现在只受舵机电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，
+//     于是"夹紧"（压到 60 以下）才可能做到。
+//   - 【本版本新增删除】纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
+//   - 【本版本新增删除】isReachable() 的竖向边界 |z - armheight| <= L1+L2：
+//     可达性只看水平半径，竖向交给反解残差与路径校验把关。
+//   - b/r/c 三轴的物理行程 0~180 在 moveJointStep() 内硬编码。
 //
 #ifndef WEARM_CONSTANT_AND_POSITIONS_H
 #define WEARM_CONSTANT_AND_POSITIONS_H
@@ -322,10 +332,21 @@ typedef struct position {
 extern pos Pos;
 extern struct arm arm1;
 
-/* 关节限位越界策略（当前仅对 f 生效；b/r/c 在反解阶段就被显式筛掉） */
-#define SERVO_LIMIT_CLAMP  0
-#define SERVO_LIMIT_REJECT 1
-extern int servoLimitMode;
+/* ---------- 末端夹爪（f）关节角：逻辑角，单位度 ----------
+ * 【本版本已删除 60~150 的"夹爪范围限制"】现在只剩舵机自身的电气行程
+ * 0~180（与 b/r/c 同一套边界），夹爪可以一直往里压到 0 也不会被软件拦下。
+ * TOOL_ANGLE_TIGHT 是"夹紧"角：比名义合拢角再往里压几度，靠舵机的保持力矩
+ * 把物体/笔夹住——取放序列与绘图循环每一帧都会重申这个角（见 pick_place.cpp
+ * 的 pickHoldingStage() 与 draw_control.cpp 的 drawLoop()）。
+ * 注意：压得越深堵转电流越大，舵机最好单独供电；夹不住再一点点调小。 */
+#define TOOL_ANGLE_MIN   0.0     /* f 逻辑角下限（舵机电气行程） */
+#define TOOL_ANGLE_MAX   180.0   /* f 逻辑角上限 */
+#define TOOL_ANGLE_OPEN  150.0   /* 张开到位，与串口 'O' 一致 */
+#define TOOL_ANGLE_CLOSE 60.0    /* 名义合拢，与串口 'S' 一致 */
+#define TOOL_ANGLE_TIGHT 55.0    /* 夹紧：再往里压 5 度 */
+/* 夹爪的装配镜像：physical = TOOL_MIRROR_SUM - logical（与基座的 180- 同理）。
+ * 210 是这台机器上舵机摆臂的装配角，与"行程"无关，换装配才需要改。 */
+#define TOOL_MIRROR_SUM  210.0
 
 /* 全局调速配置：所有移动源 (摇杆/示教点动/手动步进) 共用。 */
 struct speedCfg {
@@ -334,21 +355,26 @@ struct speedCfg {
 };
 extern struct speedCfg speed;
 
-/* 几何可达性：末端到肩的距离 R 必须落在 [|L1-L2|, L1+L2] 内，
- * 否则 acos 会越域。这是反解的数学前提，不属于"范围限制"，保留。 */
+/* 几何可达性：末端的水平半径 sqrt(x²+y²) 必须 <= L1+L2。
+ * 这是反解的数学前提（尽早拒掉明显够不到的点），不属于"范围限制"，保留。
+ * 【本版本】竖向边界 |z - armheight| <= L1+L2 已按需求删除：z 不再单独设卡，
+ * 竖向靠 getAngleEx() 的残差判据与路径校验把关（cosC 在 acos 前已夹到 ±1，
+ * 不会越域）。 */
 bool isReachable(const REC *rec);
 
 /* 由笛卡尔坐标 rec 反解出舵机角度 ser（逆运动学）。
  * 返回值:
- *   true  —— 运动学可解，且 b/r/c 都落在硬编码的 0~180 内
- *            （f 的越界按 servoLimitMode 处理）
- *   false —— 目标点不可达、角度出现 NaN/Inf，或 REJECT 策略下 f 越限
+ *   true  —— 运动学可解，且 b/r/c 都落在硬编码的 0~180 内（f 不参与判定）
+ *   false —— 目标点不可达，或角度出现 NaN/Inf
  * 返回 false 时不修改 pos1->ser，调用方应保留上一次的有效角度。
  * angle4(末端 f) 不参与反解，保持调用前已有的值不变。 */
 bool getAngle(pos *pos1);
 
-/* getAngle 的扩展版：*clamped 回传"是否因 f 越限被吸附"。
- * clamped 传 NULL 时行为与 getAngle 完全一致。 */
+/* getAngle 的扩展版：*clamped 回传"解出的姿态是否被吸附到关节限位上"。
+ * 【本版本】f 的 60~150 吸附已删除，b/r/c 走的是显式区间筛选（不合格就换
+ * 分支/拒绝），不做吸附，所以 *clamped 目前恒为 false；参数保留给将来的
+ * 姿态吸附策略，调用方（path_core.h）的判据不用改。clamped 传 NULL 时与
+ * getAngle 完全一致。 */
 bool getAngleEx(pos *pos1, bool *clamped);
 
 /* 正运动学：由四个舵机角度算出末端笛卡尔坐标，写入 *rec。
@@ -365,7 +391,9 @@ void posInit(void);
 bool posGetHomeAngles(SER *ser);
 
 /* 设置末端舵机 angle4 (f) 的角度（度）。
- * 角度会被夹在硬编码的 60~150 内；返回 true 表示确实发生了变化。 */
+ * 只夹在舵机电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 内（60~150 的
+ * "夹爪范围限制"已删除，所以比名义合拢角 60 更小的"夹紧角"能写进去）；
+ * 返回 true 表示确实发生了变化。 */
 bool posSetAngle4(double angleDeg);
 
 /* 全局调速 */
@@ -1347,9 +1375,10 @@ int drawLastResult(void);
 //     串口发送 H / L          整体运行速度 提升 / 降低 一档  (波特率 115200)
 //     串口发送 x角度,y角度,z角度  同步设置三个舵机，例: x10,y30,z20
 //                             x -> angle1 基座、y -> angle2 上臂、z -> angle3 下臂
-//                             超出行程按 servoLimit 夹取，不会因为数值大小被拒
+//                             超出舵机行程的值按行程夹取，不会因为数值大小被拒
 //
-//   每个关节的行程由全局 servoLimit 限制（b 0~180 / r 0~180 / c 0~180 / f 60~150），
+//   每个关节都只受舵机电气行程限制（b/r/c 0~180，f 0~180 —— f 原来还有 60~150
+//   的夹爪软限位，本版本已按需求删除），
 //   推到行程尽头就停住（moveJointStep 返回 MOVE_AT_LIMIT），不会顶死舵机。
 //
 // 【为什么改成"控角度"而不是"控末端坐标"】
@@ -1462,15 +1491,16 @@ void joystickLoop(void);
  *
  * 【本版本已删除】pathCorePointOk() 里的 limit 范围检查。笛卡尔坐标范围
  * 限制（rangeLimit/limit）已按需求整体移除；b/r/c 的物理行程 0~180 在
- * moveJointStep() 内硬编码，f 的 60~150 在 posSetAngle4() 内硬编码。
+ * moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
+ * （原有的 f 60~150 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
 
 
 /* 反解一个工作区点，成功时给出 b/r/c。
- * 注意必须给 angle4 一个合法值：getAngleEx() 会把四个关节一起夹，
- * angle4 非法（例如 0）会让 clamped 恒为 true（.selfcheck 的历史教训）。 */
+ * 注：本版本 getAngleEx() 不再因 angle4 越限而吸附或拒绝，*clamped 恒为 false；
+ * 调用方式仍带着当前的 Pos.ser（与固件其它调用点保持一致）。 */
 inline bool pathCoreSolveJoint(double x, double y, double z,
                                double *b, double *r, double *c) {
   pos p;
@@ -1571,7 +1601,7 @@ inline bool pathCoreSegmentOk(const double *p0, const double *p1,
 #define SERVO_MAX_US      2400    /* MAX_PULSE_WIDTH  */
 #define SERVO_TRIM_US     2       /* TRIM_DURATION：补偿 ISR 开销，Servo 库同值 */
 #define SERVO_TICKS_PER_US 2u     /* 预分频 8 => 0.5us/tick => 1us = 2 tick */
-#define SERVO_FRAME_TICKS 40000u  /* REFRESH_INTERVAL 20ms */
+#define SERVO_FRAME_TICKS 60000u  /* 帧周期 = 60000 tick × 0.5us = 30ms（Servo 库是 20ms） */
 #define SERVO_FIRST_TICKS 1000u   /* 上电后 0.5ms 发第一个事件（等寄存器稳定） */
 #define SERVO_DEFAULT_TICKS 3000u /* usToTicks(1500us)：与 Servo 库 attach 的默认脉宽一致 */
 #define SERVO_PIN_NONE    0xFFu   /* 未 attach 的通道哨兵（引脚号 0~19 不会撞上） */
@@ -1718,9 +1748,6 @@ struct speedCfg speed = {
   .stepDelayMs = 40
 };
 
-/* 关节越界策略：吸附到最近限位（当前仅对 f 生效） */
-int servoLimitMode = SERVO_LIMIT_CLAMP;
-
 /* 当前档位。-1 = 自定义，否则为 SPEED_* 之一 */
 static int speedLevel = SPEED_NORMAL;
 
@@ -1739,23 +1766,48 @@ static double __attribute__((noinline)) clampDouble(double v, double lo, double 
   return v;
 }
 
-/* ---------- 运动学 ---------- */
-
-/* 几何可达性：末端到肩的距离 R 必须落在 [|L1-L2|, L1+L2] 内，
- * 否则 acos 会越域。这是反解的前提，不是用户可配的"范围限制"。 */
+/* ---------- 可达性（圆柱工作空间模型） ----------
+ *
+ * 【与旧版的区别】旧版是球壳：末端到肩关节的三维距离
+ *     R = sqrt(x² + y² + z²)
+ * 必须落在 [|L1-L2|, L1+L2] = [0, 40] 内。
+ * 新版改为"以肩关节竖直轴为中心、半径 40 的圆柱"：
+ *     sqrt(x² + y²)  <=  L1 + L2 = 40   （水平边界）
+ * 【本版本再删一刀】竖向边界 |z - armheight| <= L1+L2 也已按需求删除：
+ * z 方向不再单独设卡，能不能到由 getAngleEx() 的残差判据与路径校验决定。
+ *
+ * 【为什么是圆柱】机械臂的实际可达空间是一个球（球心在肩关节），
+ * 圆柱是它的外接柱状包围盒。改用的直接效果：
+ *   - 球内的点（R ≤ 40）→ 水平半径 ≤ R ≤ 40，必然放行，**不会误杀**；
+ *   - 圆柱内、球外的点（角落区域，例如 (35, 0, 25)），
+ *     isReachable 会放行，但下游 getAngleEx() 用余弦定理反解时
+ *     仍会因为 R > 40 被拒（残差检查）。所以这一改对最终行为
+ *     影响很小，主要作用是"圆柱内的点不再被提前拒掉，让反解
+ *     去说能不能到"。
+ *
+ * 【与反解的分工】本函数只做粗粒度的工作空间外边界检查，
+ * 用来尽早拒掉明显不可达的点；能不能真正反解出 b/r/c 由
+ * getAngleEx() 判定。圆柱内的奇异点（例如 (0,0,40) 附近）仍可能
+ * 被反解拒掉，这是几何事实，不是 bug。
+ *
+ * 【调用方无需改动】签名与返回值语义不变（true = 大致可达），
+ * path_core.h / pick_place.cpp / draw_control.cpp 直接复用。 */
 bool isReachable(const REC *rec) {
   if (rec == NULL) return false;
   if (!isFiniteNum(rec->x) || !isFiniteNum(rec->y) || !isFiniteNum(rec->z)) return false;
-
-  double zv = rec->z - arm1.armheight;
-  double R = sqrt(rec->x * rec->x + rec->y * rec->y + zv * zv);
 
   double L1 = arm1.armLength1;
   double L2 = arm1.armLength2;
   if (L1 <= 0 || L2 <= 0) return false;
 
+  /* 水平半径 = 臂展 = L1 + L2。竖向不再设卡（见上面的说明）。 */
+  const double RHO_MAX = L1 + L2;
   const double GEOM_EPS = 1e-9;
-  if (R > L1 + L2 + GEOM_EPS || R < fabs(L1 - L2) - GEOM_EPS) return false;
+
+  /* 水平半径检查（用平方比较，省一次 sqrt） */
+  double rho2 = rec->x * rec->x + rec->y * rec->y;
+  if (rho2 > RHO_MAX * RHO_MAX + GEOM_EPS) return false;
+
   return true;
 }
 
@@ -1854,7 +1906,8 @@ bool getAngleEx(pos *pos1, bool *clamped) {
 
   /* 【硬编码的关节行程】b/r/c 三轴物理行程都是 0~180。
    * 原版本从 servoLimit 结构体读取；本版本已删除该结构体，改为本地常量。
-   * f 的 60~150 在下面 f 越限处理与 posSetAngle4() 里单独硬编码。 */
+   * f 不再参与反解判定（60~150 的硬限位已删除，只有 posSetAngle4() 里的
+   * 舵机电气行程 0~180）。 */
   const double minB = 0.0, maxB = 180.0;
   const double minR = 0.0, maxR = 180.0;
   const double minC = 0.0, maxC = 180.0;
@@ -1917,33 +1970,15 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   if (angle2 > -ANGLE_EPS && angle2 < 0) angle2 = 0;
   if (angle3 > -ANGLE_EPS && angle3 < 0) angle3 = 0;
 
-  /* 【先判 f 再写回】本函数契约：返回 false 时不修改 pos1->ser */
-  const double LIM_EPS = 1e-9;
-  const double a4 = pos1->ser.angle4;
-  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
-  const double minF = 60.0, maxF = 150.0;
-  const bool toolBad = (a4 < minF - LIM_EPS || a4 > maxF + LIM_EPS);
-
-  if (toolBad && servoLimitMode == SERVO_LIMIT_REJECT) {
-    WEARM_LOG("[servo] reject joint f out of tool range");
-    return false;
-  }
-
+  /* 【本函数契约：返回 false 时不修改 pos1->ser】走到这里说明 b/r/c 已经有解，
+   * 下面一次性写回。angle4(f) 不由反解决定，保持调用前已有的值不动。
+   * f 的 60~150 硬限位与"越限就吸附/拒绝"的策略已按需求删除（见
+   * constant_and_positions.h 的 TOOL_ANGLE_*），所以这里不再碰 angle4，
+   * *clamped 也保持函数开头设的 false。 */
   pos1->ser.angle1 = angle1;
   pos1->ser.angle2 = angle2;
   pos1->ser.angle3 = angle3;
-  /* angle4(f) 不由反解决定，保持调用前已有的值不动 */
 
-  bool limClamped = false;
-  if (toolBad) {
-    /* CLAMP 策略：只对 f 吸附到最近限位（b/r/c 已被上面的区间判断筛过） */
-    double v = a4;
-    if (v < minF) v = minF;
-    if (v > maxF) v = maxF;
-    pos1->ser.angle4 = v;
-    limClamped = true;
-  }
-  if (clamped != NULL) *clamped = limClamped;
   return true;
 }
 
@@ -1956,9 +1991,10 @@ void posInit(void) {
   Pos.rec.y = POS_HOME.y;
   Pos.rec.z = POS_HOME.z;
 
-  /* 末端舵机取行程中位（f 硬编码 60~150，中位 = 105），
-   * 避免开机时停在极限位置 */
-  Pos.ser.angle4 = (60.0 + 150.0) * 0.5;
+  /* 末端舵机取名义半开位置 105 度（TOOL_ANGLE_OPEN 与 TOOL_ANGLE_CLOSE 的中点），
+   * 开机既不夹紧也不到极限，避免上电瞬间把夹在里面的东西压坏。
+   * 逻辑角范围已是 0~180，105 仍在区间内。 */
+  Pos.ser.angle4 = (TOOL_ANGLE_OPEN + TOOL_ANGLE_CLOSE) * 0.5;
 
   if (!getAngle(&Pos)) {
     WEARM_LOG("[pos] ERROR: POS_HOME unreachable");
@@ -2052,8 +2088,9 @@ int speedStepDown(void) {
 bool posSetAngle4(double angleDeg) {
   if (!isFiniteNum(angleDeg)) return false;
 
-  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
-  double v = clampDouble(angleDeg, 60.0, 150.0);
+  /* 末端 f：只夹在舵机电气行程 0~180 内。
+   * 60~150 的"夹爪范围限制"已删除 —— 正是这条限制让"夹紧"（< 60）写不进去。 */
+  double v = clampDouble(angleDeg, TOOL_ANGLE_MIN, TOOL_ANGLE_MAX);
   if (v == Pos.ser.angle4) return false;
   Pos.ser.angle4 = v;
   return true;
@@ -2842,15 +2879,17 @@ void joystickLoop(void) {
  *
  *   TO_SRC_APPROACH  从当前位姿直线移动到「物体正上方」
  *   DESCEND_SRC      垂直下降到物体（合爪高度）
- *   CLOSE_TOOL       夹爪合拢到 servoLimit.minF（与串口 'S' 同一个角度）
+ *   CLOSE_TOOL       夹爪合拢到 TOOL_ANGLE_TIGHT（比名义合拢角 60 更紧几度）
  *   DWELL_CLOSE      停顿 PICK_DWELL_MS，等夹稳
  *   LIFT             垂直抬起回接近高度
  *   TRAVERSE         在接近高度上平移到「放置点正上方」
  *   DESCEND_DST      垂直下降到放置点
- *   OPEN_TOOL        夹爪张到 servoLimit.maxF（与串口 'O' 同一个角度）
+ *   OPEN_TOOL        夹爪张到 TOOL_ANGLE_OPEN = 150（与串口 'O' 同一个角度）
  *   DWELL_OPEN       停顿，等物体落稳
  *   RETREAT          垂直撤离回接近高度，序列结束
  *
+ * 【夹紧】CLOSE_TOOL 结束之后到 OPEN_TOOL 之前的每一帧都会重申一次夹紧角
+ * （见 pickHoldingStage()），所以搬运途中夹爪不会因为别处的写入而松开。
  * 每个「移动」阶段都在 x/y/z 上线性插值（所以下降与抬起是垂直的），
  * 每个插值点用固件自己的 getAngleEx() 反解成 b/r/c，三个轴一次写完，
  * 再只做一次正解刷新 Pos.rec —— 与串口角度指令同一约定，坐标与关节角始终自洽。
@@ -2864,16 +2903,17 @@ void joystickLoop(void) {
  */
 
 
+
 #if WEARM_ENABLE_PICK_PLACE
 /* ==================== 可自定义的位置与参数 ==================== */
 
 /* 台面高度：物体放在这个高度上（工具点与物体同高时合爪）。
  * 上机时按实际台面 + 夹爪几何改这一个值即可，三个物体共用同一张台面。 */
-#define PICK_GRASP_Z 12.0
+#define PICK_GRASP_Z -18.0
 
 /* 接近 / 撤离高度：取放点正上方这么高的位置，垂直下降从这里开始，
  * 抬起与撤离也回到这里；它同时是平移到另一个位置时保持的飞行高度。 */
-#define PICK_APPROACH_DZ 6.0
+#define PICK_APPROACH_DZ 41.0
 
 struct pickPoint {
   double x;
@@ -2885,7 +2925,7 @@ struct pickPoint {
  * 72 bytes out of RAM; every read goes through pgm_read_float(). */
 /* 物体初始位置（= 夹取点）。三个位置互不相同。 */
 static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] PROGMEM = {
-  { 24.0,  12.0, PICK_GRASP_Z },   /* A：右侧偏前 */
+  { 24.0,  15.0, PICK_GRASP_Z },   /* A：右侧偏前 */
   { 24.0, -12.0, PICK_GRASP_Z },   /* B：右侧偏后 */
   { 12.0,  20.0, PICK_GRASP_Z }    /* C：左前，离基座较近 */
 };
@@ -2933,10 +2973,13 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
  * 直接用会让第一段开头猛跳一下，所以宁可拒绝启动。 */
 #define PICK_START_TOL_DEG 10.0
 
-/* 夹爪开 / 合的目标角度：直接硬编码为 f 关节的物理行程上下限（150 / 60）。
- * 与串口 O / S 命令的硬编码值保持一致，不再依赖已删除的 servoLimit 结构体。 */
-#define PICK_TOOL_OPEN_ANGLE  150.0
-#define PICK_TOOL_CLOSE_ANGLE 60.0
+/* 夹爪开 / 合的目标角度（末端 f 关节，逻辑角）。
+ * 开：TOOL_ANGLE_OPEN = 150（与串口 'O' 一致，见 constant_and_positions.h）。
+ * 合：TOOL_ANGLE_TIGHT —— 比名义合拢角 60 再往里压几度。60~150 的"夹爪范围
+ *     限制"已删除，正是它以前让"比 60 更紧"写不进去；合爪之后到开爪之前的
+ *     每一帧都会重申这个角（见 pickHoldingStage()），搬运途中不会松脱。 */
+#define PICK_TOOL_OPEN_ANGLE  TOOL_ANGLE_OPEN
+#define PICK_TOOL_CLOSE_ANGLE TOOL_ANGLE_TIGHT
 
 /* ==================== 状态机 ==================== */
 
@@ -3131,6 +3174,18 @@ static void abortSequence(void) {
 #define PICK_ABORT(msg) abortSequence()
 #endif
 
+/* 【每一帧都夹紧】手里的东西从"合上夹爪"到"松开夹爪"之间必须一直夹着：
+ * 判据 = 当前阶段是否处于"已经夹住、还没放开"的区间。
+ *   DWELL_CLOSE   合爪结束后的稳定停顿（此时已经是夹紧角）
+ *   LIFT/TRAVERSE/DESCEND_DST  抬升、平移、下降到目标上方（全程不能松）
+ * 不含 TRAVERSE 之后的 DESCEND_SRC/CLOSE_TOOL（还在往夹紧角插值，s_kind==TOOL
+ * 自己会处理），也不含 DWELL_OPEN/OPEN_TOOL/RETREAT（已经松开）。
+ * 调用点用 s_kind != PICK_KIND_TOOL 把 TOOL 阶段排除掉，避免与插值打架。 */
+static bool pickHoldingStage(int st) {
+  return st == PICK_ST_DWELL_CLOSE || st == PICK_ST_LIFT ||
+         st == PICK_ST_TRAVERSE    || st == PICK_ST_DESCEND_DST;
+}
+
 /* 本阶段跑完，进入下一阶段 */
 static void advanceStage(void) {
   double src[3], dst[3];
@@ -3304,6 +3359,13 @@ void pickPlaceLoop(void) {
     /* 停顿：什么都不动，等物体被夹稳 / 放稳 */
   }
 
+  /* 【每一帧都夹紧】合爪之后、松开之前的每一帧都重申一次夹紧角（见 pickHoldingStage）。
+   * posSetAngle4() 在值没变时返回 false 且不写状态，所以这里只是保证目标角始终是
+   * 夹紧角（TOOL_ANGLE_TIGHT），不会和 CLOSE_TOOL / OPEN_TOOL 的插值打架。 */
+  if (s_kind != PICK_KIND_TOOL && pickHoldingStage(s_stage)) {
+    (void) posSetAngle4(PICK_TOOL_CLOSE_ANGLE);
+  }
+
   if (stageDone) advanceStage();
 }
 
@@ -3398,12 +3460,13 @@ double pickPlaceApproachDz(void) {
 /* ==================== 可自定义的参数 ==================== */
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
-#define DRAW_PEN_Z_DEFAULT    12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
+#define DRAW_PEN_Z_DEFAULT    -12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
 #define DRAW_CENTER_X_DEFAULT 20.0   /* 内置图形的中心 x */
 #define DRAW_CENTER_Y_DEFAULT  0.0   /* 内置图形的中心 y */
 #define DRAW_HALF_DEFAULT      6.0   /* 内置图形的半宽（顶点落在 ±半宽 的正方形里） */
-#define DRAW_PEN_Z_MIN        -5.0
-#define DRAW_PEN_Z_MAX        30.0
+/* 【本版本删除】原来这里还有纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
+ * 纸面高度只影响落笔深度，标定成什么值都允许（不在工作空间内的点在启动时
+ * 会被 pathCore 系列的路径校验拒掉），所以不再在这里硬卡范围。 */
 #define DRAW_HALF_MIN          2.0
 #define DRAW_HALF_MAX         12.0
 #define DRAW_CENTER_LIMIT     35.0   /* 中心允许的 |x|、|y| 上限（工作区单位） */
@@ -4486,8 +4549,10 @@ int drawCancel(void)
 /* 标定接口 */
 bool drawSetPaperZ(double z)
 {
-  if (z != z) return false;                        /* NaN */
-  if (z < DRAW_PEN_Z_MIN || z > DRAW_PEN_Z_MAX) return false;
+  if (z != z) return false;                        /* NaN：纸面高度必须是有限数 */
+  /* 【范围限制已删除】原来这里还要求 z ∈ [DRAW_PEN_Z_MIN, DRAW_PEN_Z_MAX](-5~30)。
+   * 现在接受任意有限值：纸面标定只决定落笔深度，标到工作空间外面的点会在
+   * 启动时被路径校验拒掉，不需要在这里提前拒绝。 */
   s_penZ = z;
   return true;
 }
@@ -4643,6 +4708,14 @@ void drawLoop(void)
   }
 
   if (s_paused) return;                    /* 暂停：保持任务状态，什么都不推进 */
+
+  /* 【每一帧都夹紧】绘图运动中把末端持续压在"夹紧角"上（与取放序列同一个约定，
+   * 见 constant_and_positions.h 的 TOOL_ANGLE_TIGHT）。60~150 的夹爪范围限制
+   * 已删除，所以这个角可以比名义合拢角 60 更小，笔才真正被夹住。
+   * posSetAngle4() 在"值没变"时返回 false 且不写状态，所以这里等价于每帧重申
+   * 一次目标角：不产生额外抖动，只是保证夹爪始终保持在夹紧位置。
+   * 示教阶段（DRAW_PHASE_TEACH）与暂停时不会走到这里，示教点动仍可单独调末端。 */
+  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
 
   switch (s_phase) {
     case DRAW_PHASE_HOME: {
@@ -4901,17 +4974,17 @@ static double *btnAngle(int joint) {
  * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
-  /* b/r/c 三轴硬编码 0~180、f 硬编码 60~150（原 clampServoAngles 已随
-   * servoLimit 结构体一起删除）。录制/回放/回中的角度理论上都落在合法区间
-   * 内，此夹取只是一道保险。 */
+  /* 四个轴都只夹到舵机电气行程：b/r/c 0~180，f 是 TOOL_ANGLE_MIN..MAX(0~180)。
+   * 60~150 的"夹爪范围限制"已删除 —— 否则录制/回放/回中会把夹紧角顶回 60。
+   * 原 clampServoAngles() 已随 servoLimit 结构体一起删除，这里只是一道保险。 */
   if (tmp.angle1 < 0.0)   tmp.angle1 = 0.0;
   if (tmp.angle1 > 180.0) tmp.angle1 = 180.0;
   if (tmp.angle2 < 0.0)   tmp.angle2 = 0.0;
   if (tmp.angle2 > 180.0) tmp.angle2 = 180.0;
   if (tmp.angle3 < 0.0)   tmp.angle3 = 0.0;
   if (tmp.angle3 > 180.0) tmp.angle3 = 180.0;
-  if (tmp.angle4 < 60.0)  tmp.angle4 = 60.0;
-  if (tmp.angle4 > 150.0) tmp.angle4 = 150.0;
+  if (tmp.angle4 < TOOL_ANGLE_MIN) tmp.angle4 = TOOL_ANGLE_MIN;
+  if (tmp.angle4 > TOOL_ANGLE_MAX) tmp.angle4 = TOOL_ANGLE_MAX;
   Pos.ser = tmp;
   (void) recFromServo(&Pos.rec, &Pos.ser);
 }
@@ -6498,14 +6571,16 @@ void serialProtocolBegin(void)
 // 【方向镜像：基座与夹爪在这台机器上是反向装配的】
 //   实机装配把 b（基座回转，通道 0）和 f（末端夹爪，通道 3）的舵机装反了：
 //   逻辑角增大时它们物理上朝反方向走。表现就是"左右旋转的舵机转向反了"和
-//   "抓取时 O/S 反了"（O 走 maxF 本该张开，实际夹紧）。
+//   "抓取时 O/S 反了"（逻辑角 150 = 张开，实际却夹紧）。
 //   修法只在唯一写出口 writeServo() 里对这两个通道做一次窗口内镜像
 //   physical = (min + max) - logical，逻辑角（限位/反解/录制/绘图）仍是唯一真值；
-//   镜像后物理角仍落在 [min,max] 内，夹爪不会被推到危险区。
+//   注意夹爪的镜像和是 210、逻辑角范围已放宽到 0~180，所以镜像后的物理角可能
+//   超出 0~180（例如逻辑 0 -> 物理 210），那由 servo_drive 在脉宽层面夹取。
 //   换一套装配就把 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL 改成 0。
 //
 // 安全边界:
-//   1. servoLimit 关节硬限位 —— b[0,180] r[0,180] c[0,180] f[60,150]，唯一的软件边界。
+//   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
+//                              （原来的 f 60~150 夹爪软限位已按需求删除），唯一的软件边界。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
@@ -6544,7 +6619,7 @@ void serialProtocolBegin(void)
 //
 
 /* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
- * 字母记号（与 constant_and_positions.h 的 servoLimit 一致）:
+ * 字母记号（与 constant_and_positions.h 的 TOOL_ANGLE_* 一致）:
  *   通道0 = b 水平回转   通道1 = r 上臂俯仰
  *   通道2 = c 下臂俯仰   通道3 = f 末端 */
 
@@ -6553,7 +6628,10 @@ void serialProtocolBegin(void)
  * 【方向镜像】基座回转（b）与末端夹爪（f）在这台机器上是反向装配的，所以这两个
  * 通道在各自的行程窗口内做一次镜像：physical = (min + max) - logical。
  * 逻辑角仍是唯一真值（限位/反解/录制/绘图/示教全用逻辑角），只有送到舵机的
- * 那一个数被换向；镜像后仍落在 [min,max] 内，夹爪不会被推到危险区。
+ * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）。
+ * 【本版本提示】夹爪的逻辑角范围已放宽到 0~180，所以镜像后可能超过 180（例如
+ * 逻辑角 0 -> 物理 210）；servo_drive 会把脉宽夹在电气行程内，舵机只是顶到
+ * 自己的极限，不会再由本函数保证"落在 [min,max] 内"。
  * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
 #if WEARM_MIRROR_BASE
@@ -6567,8 +6645,8 @@ void writeServo(void){
     servoDriveWrite(2, Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
-    // 夹爪：保留 60~150 的硬编码镜像
-    servoDriveWrite(3, (60.0 + 150.0) - Pos.ser.angle4);
+    // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）
+    servoDriveWrite(3, TOOL_MIRROR_SUM - Pos.ser.angle4);
 #else
     servoDriveWrite(3, Pos.ser.angle4);
 #endif
@@ -6598,8 +6676,8 @@ void setup() {
    *    引脚号请按实际硬件修改 (示例: 9, 7, 8, 6) */
   servoDriveBegin();
   servoDriveAttach(0, 9);   /* 水平回转 */
-  servoDriveAttach(1, 7);   /* 上臂俯仰 */
-  servoDriveAttach(2, 8);   /* 下臂俯仰 */
+  servoDriveAttach(1, 8);   /* 上臂俯仰 */
+  servoDriveAttach(2, 7);   /* 下臂俯仰 */
   servoDriveAttach(3, 6);   /* 末端 */
 
   /* 6. 上电后先让机械臂到位，再开始接收手柄输入 */

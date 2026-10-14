@@ -35,9 +35,6 @@ struct speedCfg speed = {
   .stepDelayMs = 40
 };
 
-/* 关节越界策略：吸附到最近限位（当前仅对 f 生效） */
-int servoLimitMode = SERVO_LIMIT_CLAMP;
-
 /* 当前档位。-1 = 自定义，否则为 SPEED_* 之一 */
 static int speedLevel = SPEED_NORMAL;
 
@@ -56,23 +53,48 @@ static double __attribute__((noinline)) clampDouble(double v, double lo, double 
   return v;
 }
 
-/* ---------- 运动学 ---------- */
-
-/* 几何可达性：末端到肩的距离 R 必须落在 [|L1-L2|, L1+L2] 内，
- * 否则 acos 会越域。这是反解的前提，不是用户可配的"范围限制"。 */
+/* ---------- 可达性（圆柱工作空间模型） ----------
+ *
+ * 【与旧版的区别】旧版是球壳：末端到肩关节的三维距离
+ *     R = sqrt(x² + y² + z²)
+ * 必须落在 [|L1-L2|, L1+L2] = [0, 40] 内。
+ * 新版改为"以肩关节竖直轴为中心、半径 40 的圆柱"：
+ *     sqrt(x² + y²)  <=  L1 + L2 = 40   （水平边界）
+ * 【本版本再删一刀】竖向边界 |z - armheight| <= L1+L2 也已按需求删除：
+ * z 方向不再单独设卡，能不能到由 getAngleEx() 的残差判据与路径校验决定。
+ *
+ * 【为什么是圆柱】机械臂的实际可达空间是一个球（球心在肩关节），
+ * 圆柱是它的外接柱状包围盒。改用的直接效果：
+ *   - 球内的点（R ≤ 40）→ 水平半径 ≤ R ≤ 40，必然放行，**不会误杀**；
+ *   - 圆柱内、球外的点（角落区域，例如 (35, 0, 25)），
+ *     isReachable 会放行，但下游 getAngleEx() 用余弦定理反解时
+ *     仍会因为 R > 40 被拒（残差检查）。所以这一改对最终行为
+ *     影响很小，主要作用是"圆柱内的点不再被提前拒掉，让反解
+ *     去说能不能到"。
+ *
+ * 【与反解的分工】本函数只做粗粒度的工作空间外边界检查，
+ * 用来尽早拒掉明显不可达的点；能不能真正反解出 b/r/c 由
+ * getAngleEx() 判定。圆柱内的奇异点（例如 (0,0,40) 附近）仍可能
+ * 被反解拒掉，这是几何事实，不是 bug。
+ *
+ * 【调用方无需改动】签名与返回值语义不变（true = 大致可达），
+ * path_core.h / pick_place.cpp / draw_control.cpp 直接复用。 */
 bool isReachable(const REC *rec) {
   if (rec == NULL) return false;
   if (!isFiniteNum(rec->x) || !isFiniteNum(rec->y) || !isFiniteNum(rec->z)) return false;
-
-  double zv = rec->z - arm1.armheight;
-  double R = sqrt(rec->x * rec->x + rec->y * rec->y + zv * zv);
 
   double L1 = arm1.armLength1;
   double L2 = arm1.armLength2;
   if (L1 <= 0 || L2 <= 0) return false;
 
+  /* 水平半径 = 臂展 = L1 + L2。竖向不再设卡（见上面的说明）。 */
+  const double RHO_MAX = L1 + L2;
   const double GEOM_EPS = 1e-9;
-  if (R > L1 + L2 + GEOM_EPS || R < fabs(L1 - L2) - GEOM_EPS) return false;
+
+  /* 水平半径检查（用平方比较，省一次 sqrt） */
+  double rho2 = rec->x * rec->x + rec->y * rec->y;
+  if (rho2 > RHO_MAX * RHO_MAX + GEOM_EPS) return false;
+
   return true;
 }
 
@@ -171,7 +193,8 @@ bool getAngleEx(pos *pos1, bool *clamped) {
 
   /* 【硬编码的关节行程】b/r/c 三轴物理行程都是 0~180。
    * 原版本从 servoLimit 结构体读取；本版本已删除该结构体，改为本地常量。
-   * f 的 60~150 在下面 f 越限处理与 posSetAngle4() 里单独硬编码。 */
+   * f 不再参与反解判定（60~150 的硬限位已删除，只有 posSetAngle4() 里的
+   * 舵机电气行程 0~180）。 */
   const double minB = 0.0, maxB = 180.0;
   const double minR = 0.0, maxR = 180.0;
   const double minC = 0.0, maxC = 180.0;
@@ -234,33 +257,15 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   if (angle2 > -ANGLE_EPS && angle2 < 0) angle2 = 0;
   if (angle3 > -ANGLE_EPS && angle3 < 0) angle3 = 0;
 
-  /* 【先判 f 再写回】本函数契约：返回 false 时不修改 pos1->ser */
-  const double LIM_EPS = 1e-9;
-  const double a4 = pos1->ser.angle4;
-  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
-  const double minF = 60.0, maxF = 150.0;
-  const bool toolBad = (a4 < minF - LIM_EPS || a4 > maxF + LIM_EPS);
-
-  if (toolBad && servoLimitMode == SERVO_LIMIT_REJECT) {
-    WEARM_LOG("[servo] reject joint f out of tool range");
-    return false;
-  }
-
+  /* 【本函数契约：返回 false 时不修改 pos1->ser】走到这里说明 b/r/c 已经有解，
+   * 下面一次性写回。angle4(f) 不由反解决定，保持调用前已有的值不动。
+   * f 的 60~150 硬限位与"越限就吸附/拒绝"的策略已按需求删除（见
+   * constant_and_positions.h 的 TOOL_ANGLE_*），所以这里不再碰 angle4，
+   * *clamped 也保持函数开头设的 false。 */
   pos1->ser.angle1 = angle1;
   pos1->ser.angle2 = angle2;
   pos1->ser.angle3 = angle3;
-  /* angle4(f) 不由反解决定，保持调用前已有的值不动 */
 
-  bool limClamped = false;
-  if (toolBad) {
-    /* CLAMP 策略：只对 f 吸附到最近限位（b/r/c 已被上面的区间判断筛过） */
-    double v = a4;
-    if (v < minF) v = minF;
-    if (v > maxF) v = maxF;
-    pos1->ser.angle4 = v;
-    limClamped = true;
-  }
-  if (clamped != NULL) *clamped = limClamped;
   return true;
 }
 
@@ -273,9 +278,10 @@ void posInit(void) {
   Pos.rec.y = POS_HOME.y;
   Pos.rec.z = POS_HOME.z;
 
-  /* 末端舵机取行程中位（f 硬编码 60~150，中位 = 105），
-   * 避免开机时停在极限位置 */
-  Pos.ser.angle4 = (60.0 + 150.0) * 0.5;
+  /* 末端舵机取名义半开位置 105 度（TOOL_ANGLE_OPEN 与 TOOL_ANGLE_CLOSE 的中点），
+   * 开机既不夹紧也不到极限，避免上电瞬间把夹在里面的东西压坏。
+   * 逻辑角范围已是 0~180，105 仍在区间内。 */
+  Pos.ser.angle4 = (TOOL_ANGLE_OPEN + TOOL_ANGLE_CLOSE) * 0.5;
 
   if (!getAngle(&Pos)) {
     WEARM_LOG("[pos] ERROR: POS_HOME unreachable");
@@ -369,8 +375,9 @@ int speedStepDown(void) {
 bool posSetAngle4(double angleDeg) {
   if (!isFiniteNum(angleDeg)) return false;
 
-  /* f 的 60~150 硬编码（原 servoLimit.minF / maxF） */
-  double v = clampDouble(angleDeg, 60.0, 150.0);
+  /* 末端 f：只夹在舵机电气行程 0~180 内。
+   * 60~150 的"夹爪范围限制"已删除 —— 正是这条限制让"夹紧"（< 60）写不进去。 */
+  double v = clampDouble(angleDeg, TOOL_ANGLE_MIN, TOOL_ANGLE_MAX);
   if (v == Pos.ser.angle4) return false;
   Pos.ser.angle4 = v;
   return true;

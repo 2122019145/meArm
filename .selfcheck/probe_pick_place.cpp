@@ -46,12 +46,13 @@ static bool recInLimit(const REC *r) {
   return true;
 }
 
-/* 本地版本的关节行程检查：b/r/c 硬编码 0~180、f 硬编码 60~150。 */
+/* 本地版本的关节行程检查：四轴都只到舵机电气行程（b/r/c 0~180，f 0~180）。
+ * f 的 60~150 软限位已从固件删除，所以这里也不能再按 60~150 判。 */
 static bool isServoInRange(const SER *ser) {
   return ser->angle1 >= 0.0   && ser->angle1 <= 180.0 &&
          ser->angle2 >= 0.0   && ser->angle2 <= 180.0 &&
          ser->angle3 >= 0.0   && ser->angle3 <= 180.0 &&
-         ser->angle4 >= 60.0  && ser->angle4 <= 150.0;
+         ser->angle4 >= TOOL_ANGLE_MIN && ser->angle4 <= TOOL_ANGLE_MAX;
 }
 
 static bool sameSer(const SER *a, const SER *b) {
@@ -70,13 +71,15 @@ static double distXY(const REC *a, const REC *b) {
   return sqrt(dx * dx + dy * dy);
 }
 
-/* 调固件反解，要求成功且没被吸附 */
+/* 调固件反解，要求成功且没被吸附。
+ * 注：*clamped 现在恒为 false（f 的"越限就吸附"策略已删除），
+ * p.ser 仍然带着当前 angle4，保持与固件调用方式一致。 */
 static bool ikOk(double x, double y, double z) {
   pos p;
   p.rec.x = x;
   p.rec.y = y;
   p.rec.z = z;
-  p.ser = Pos.ser;            /* 必须带一个合法的 angle4，否则 clamped 恒真 */
+  p.ser = Pos.ser;            /* 与固件调用方式一致：带上当前 angle4 */
   bool clamped = false;
   if (!getAngleEx(&p, &clamped)) return false;
   return !clamped;
@@ -228,8 +231,8 @@ int main(void) {
     snprintf(d, sizeof(d), "结束阶段=%s", pickPlaceStageName());
     check("结束阶段回到 idle", strcmp(pickPlaceStageName(), "idle") == 0, d);
 
-    snprintf(d, sizeof(d), "angle4=%.3f 期望 maxF=%.3f", Pos.ser.angle4, 150.0);
-    check("末端张开到位（与串口 O 同角度）", fabs(Pos.ser.angle4 - 150.0) < 1e-9, d);
+    snprintf(d, sizeof(d), "angle4=%.3f 期望 TOOL_ANGLE_OPEN=%.3f", Pos.ser.angle4, TOOL_ANGLE_OPEN);
+    check("末端张开到位（与串口 O 同角度）", fabs(Pos.ser.angle4 - TOOL_ANGLE_OPEN) < 1e-9, d);
 
     snprintf(d, sizeof(d), "final=(%.4f,%.4f,%.4f) 期望=(%.4f,%.4f,%.4f)",
              Pos.rec.x, Pos.rec.y, Pos.rec.z,

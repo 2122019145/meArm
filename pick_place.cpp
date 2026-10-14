@@ -5,15 +5,17 @@
  *
  *   TO_SRC_APPROACH  从当前位姿直线移动到「物体正上方」
  *   DESCEND_SRC      垂直下降到物体（合爪高度）
- *   CLOSE_TOOL       夹爪合拢到 servoLimit.minF（与串口 'S' 同一个角度）
+ *   CLOSE_TOOL       夹爪合拢到 TOOL_ANGLE_TIGHT（比名义合拢角 60 更紧几度）
  *   DWELL_CLOSE      停顿 PICK_DWELL_MS，等夹稳
  *   LIFT             垂直抬起回接近高度
  *   TRAVERSE         在接近高度上平移到「放置点正上方」
  *   DESCEND_DST      垂直下降到放置点
- *   OPEN_TOOL        夹爪张到 servoLimit.maxF（与串口 'O' 同一个角度）
+ *   OPEN_TOOL        夹爪张到 TOOL_ANGLE_OPEN = 150（与串口 'O' 同一个角度）
  *   DWELL_OPEN       停顿，等物体落稳
  *   RETREAT          垂直撤离回接近高度，序列结束
  *
+ * 【夹紧】CLOSE_TOOL 结束之后到 OPEN_TOOL 之前的每一帧都会重申一次夹紧角
+ * （见 pickHoldingStage()），所以搬运途中夹爪不会因为别处的写入而松开。
  * 每个「移动」阶段都在 x/y/z 上线性插值（所以下降与抬起是垂直的），
  * 每个插值点用固件自己的 getAngleEx() 反解成 b/r/c，三个轴一次写完，
  * 再只做一次正解刷新 Pos.rec —— 与串口角度指令同一约定，坐标与关节角始终自洽。
@@ -27,6 +29,7 @@
  */
 
 #include <math.h>
+
 #include <Arduino.h>
 #include "constant_and_positions.h"
 #include "path_core.h"
@@ -37,11 +40,11 @@
 
 /* 台面高度：物体放在这个高度上（工具点与物体同高时合爪）。
  * 上机时按实际台面 + 夹爪几何改这一个值即可，三个物体共用同一张台面。 */
-#define PICK_GRASP_Z 12.0
+#define PICK_GRASP_Z -18.0
 
 /* 接近 / 撤离高度：取放点正上方这么高的位置，垂直下降从这里开始，
  * 抬起与撤离也回到这里；它同时是平移到另一个位置时保持的飞行高度。 */
-#define PICK_APPROACH_DZ 6.0
+#define PICK_APPROACH_DZ 41.0
 
 struct pickPoint {
   double x;
@@ -53,7 +56,7 @@ struct pickPoint {
  * 72 bytes out of RAM; every read goes through pgm_read_float(). */
 /* 物体初始位置（= 夹取点）。三个位置互不相同。 */
 static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] PROGMEM = {
-  { 24.0,  12.0, PICK_GRASP_Z },   /* A：右侧偏前 */
+  { 24.0,  15.0, PICK_GRASP_Z },   /* A：右侧偏前 */
   { 24.0, -12.0, PICK_GRASP_Z },   /* B：右侧偏后 */
   { 12.0,  20.0, PICK_GRASP_Z }    /* C：左前，离基座较近 */
 };
@@ -101,10 +104,13 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
  * 直接用会让第一段开头猛跳一下，所以宁可拒绝启动。 */
 #define PICK_START_TOL_DEG 10.0
 
-/* 夹爪开 / 合的目标角度：直接硬编码为 f 关节的物理行程上下限（150 / 60）。
- * 与串口 O / S 命令的硬编码值保持一致，不再依赖已删除的 servoLimit 结构体。 */
-#define PICK_TOOL_OPEN_ANGLE  150.0
-#define PICK_TOOL_CLOSE_ANGLE 60.0
+/* 夹爪开 / 合的目标角度（末端 f 关节，逻辑角）。
+ * 开：TOOL_ANGLE_OPEN = 150（与串口 'O' 一致，见 constant_and_positions.h）。
+ * 合：TOOL_ANGLE_TIGHT —— 比名义合拢角 60 再往里压几度。60~150 的"夹爪范围
+ *     限制"已删除，正是它以前让"比 60 更紧"写不进去；合爪之后到开爪之前的
+ *     每一帧都会重申这个角（见 pickHoldingStage()），搬运途中不会松脱。 */
+#define PICK_TOOL_OPEN_ANGLE  TOOL_ANGLE_OPEN
+#define PICK_TOOL_CLOSE_ANGLE TOOL_ANGLE_TIGHT
 
 /* ==================== 状态机 ==================== */
 
@@ -299,6 +305,18 @@ static void abortSequence(void) {
 #define PICK_ABORT(msg) abortSequence()
 #endif
 
+/* 【每一帧都夹紧】手里的东西从"合上夹爪"到"松开夹爪"之间必须一直夹着：
+ * 判据 = 当前阶段是否处于"已经夹住、还没放开"的区间。
+ *   DWELL_CLOSE   合爪结束后的稳定停顿（此时已经是夹紧角）
+ *   LIFT/TRAVERSE/DESCEND_DST  抬升、平移、下降到目标上方（全程不能松）
+ * 不含 TRAVERSE 之后的 DESCEND_SRC/CLOSE_TOOL（还在往夹紧角插值，s_kind==TOOL
+ * 自己会处理），也不含 DWELL_OPEN/OPEN_TOOL/RETREAT（已经松开）。
+ * 调用点用 s_kind != PICK_KIND_TOOL 把 TOOL 阶段排除掉，避免与插值打架。 */
+static bool pickHoldingStage(int st) {
+  return st == PICK_ST_DWELL_CLOSE || st == PICK_ST_LIFT ||
+         st == PICK_ST_TRAVERSE    || st == PICK_ST_DESCEND_DST;
+}
+
 /* 本阶段跑完，进入下一阶段 */
 static void advanceStage(void) {
   double src[3], dst[3];
@@ -470,6 +488,13 @@ void pickPlaceLoop(void) {
     (void) posSetAngle4(s_fromX + (s_toX - s_fromX) * t);
   } else {
     /* 停顿：什么都不动，等物体被夹稳 / 放稳 */
+  }
+
+  /* 【每一帧都夹紧】合爪之后、松开之前的每一帧都重申一次夹紧角（见 pickHoldingStage）。
+   * posSetAngle4() 在值没变时返回 false 且不写状态，所以这里只是保证目标角始终是
+   * 夹紧角（TOOL_ANGLE_TIGHT），不会和 CLOSE_TOOL / OPEN_TOOL 的插值打架。 */
+  if (s_kind != PICK_KIND_TOOL && pickHoldingStage(s_stage)) {
+    (void) posSetAngle4(PICK_TOOL_CLOSE_ANGLE);
   }
 
   if (stageDone) advanceStage();

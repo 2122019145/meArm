@@ -10,7 +10,7 @@
 //     1) 用**测试侧独立复刻**的 Servo 库映射公式（不复用固件实现，否则是自证）
 //        逐位比对 servoDriveTicksForDeg()；
 //     2) 直接按 ISR 的方式步进伺服状态机 servoDriveStep()，用 mock 的 digitalWrite
-//        日志验证"引脚顺序 + 极性 + 每路脉宽 + 20ms 帧长"，让时序逻辑在 PC 上可测。
+//        日志验证"引脚顺序 + 极性 + 每路脉宽 + 30ms 帧长"，让时序逻辑在 PC 上可测。
 //
 // 【注意】本探针会调用 servoDriveBegin()，它会重置驱动的通道表 ——
 //   这只会影响舵机状态，不影响 Pos / 运动学，故与其它探针无耦合。
@@ -39,7 +39,7 @@ static unsigned libTicks(double deg) {
   return (unsigned)(us * 2);
 }
 
-#define FRAME_TICKS_EXPECT 40000u   /* 20ms * 2 tick/us */
+#define FRAME_TICKS_EXPECT 60000u   /* 30ms * 2 tick/us（servo_drive.cpp 的 SERVO_FRAME_TICKS） */
 
 struct Frame {
   int      logPin[MOCK_WRITE_LOG_MAX];
@@ -91,10 +91,10 @@ static void attach1234(void) {
  *
  * 为什么要带延迟测：captureFrame() 是零延迟模型（nowTicks 正好等于上一次排定的
  * 比较值），它只能验证"排出去的下一个比较值是多少"。带延迟的模型验证的是**真实
- * 帧长**：帧尾比较值是绝对计数 40000，它会自我校正，所以中断延迟不会累积；
- * 但如果哪天有人把帧尾改成"在帧尾中断里现算剩余量"（那时入口 TCNT1 ≈ 40006），
- * uint16 下溢会把下一帧排到 ~52800 tick 之后（19Hz，舵机抖动），
- * 这条用例会立刻报出来。 */
+ * 帧长**：帧尾比较值是绝对计数 60000（SERVO_FRAME_TICKS = 30ms），它会自我校正，
+ * 所以中断延迟不会累积；但如果哪天有人把帧尾改成"在帧尾中断里现算剩余量"
+ * （那时入口 TCNT1 ≈ 60006），uint16 下溢会把下一帧排到错位的时刻，
+ * 帧周期会明显偏离 30ms（舵机抖动），这条用例会立刻报出来。 */
 static unsigned framePeriodTicks(unsigned latency) {
   /* servo_drive.cpp 里 servoDriveBegin() 排的第一个比较值（SERVO_FIRST_TICKS = 1000），
    * 那个宏是 .cpp 私有的，探针这边按已知值写死。 */
@@ -158,7 +158,7 @@ int main(void) {
     snprintf(buf, sizeof buf, "通道%d 脉宽 %4u tick (%.1f° -> %4u)", k, f.width[k], set4[k], libTicks(set4[k]));
     check(buf, f.width[k] == libTicks(set4[k]), NULL);
   }
-  snprintf(buf, sizeof buf, "帧长 %u tick (期望 %u = 20ms)", f.frameTicks, FRAME_TICKS_EXPECT);
+  snprintf(buf, sizeof buf, "帧长 %u tick (期望 %u = 30ms)", f.frameTicks, FRAME_TICKS_EXPECT);
   check(buf, f.frameTicks == FRAME_TICKS_EXPECT, NULL);
   check("一帧只有一次帧起点（TCNT1 清零）", f.startEvents == 1, NULL);
   check("每路引脚号与 attach 一致（9/7/8/6）",
@@ -186,7 +186,7 @@ int main(void) {
   }
   snprintf(buf, sizeof buf, "只绑 0/2 号通道：一帧只写 9 与 8（实际 %d 条）", f.logCount);
   check(buf, onlyBound, NULL);
-  check("未绑通道不影响帧长（仍 20ms）", f.frameTicks == FRAME_TICKS_EXPECT, NULL);
+  check("未绑通道不影响帧长（仍 30ms）", f.frameTicks == FRAME_TICKS_EXPECT, NULL);
   check("已绑通道脉宽仍然正确",
         f.width[0] == libTicks(30.0) && f.width[2] == libTicks(150.0), NULL);
 
@@ -219,10 +219,10 @@ int main(void) {
   check("越界通道 attach/write 被忽略（引脚 5 没被驱动）",
         f.logCount == 2 && f.logPin[0] == 9 && f.logLevel[0] == HIGH, NULL);
 
-  /* 8) 带中断延迟的真实帧长：帧边界之间的间隔必须 ≈ 40000 tick（20ms），
-   *    不能因为"在帧尾中断里现算剩余量"而下溢成 ~52800 tick（19Hz）。
+  /* 8) 带中断延迟的真实帧长：帧边界之间的间隔必须 ≈ 60000 tick（30ms），
+   *    不能因为"在帧尾中断里现算剩余量"而下溢到错位的时刻。
    *    一帧里有 1 次帧边界中断 + 4 次换路/帧尾中断，所以延迟会被累加 4 次；
-   *    这里断言 [40000, 40000 + 8*latency]，既允许中断开销又不放过下溢。 */
+   *    这里断言 [60000, 60000 + 8*latency]，既允许中断开销又不放过下溢。 */
   const unsigned lat[3] = { 2u, 6u, 30u };
   for (int i = 0; i < 3; i++) {
     attach1234();
@@ -236,8 +236,8 @@ int main(void) {
              FRAME_TICKS_EXPECT, hi);
     check(buf, period >= FRAME_TICKS_EXPECT && period <= hi, NULL);
   }
-  check("带延迟的帧长没有下溢成 ~52800 tick（19Hz 抖动）",
-        framePeriodTicks(30u) < 45000u, NULL);
+  check("带延迟的帧长没有下溢（周期仍在一帧 + 中断开销之内）",
+        framePeriodTicks(30u) <= FRAME_TICKS_EXPECT + 8u * 30u, NULL);
 
   printf(">>> %s (失败 %d 项)\n", g_fail == 0 ? "ALL PASS" : "HAS FAILURES", g_fail);
   return g_fail == 0 ? 0 : 1;

@@ -359,8 +359,10 @@ int main(void) {
   check("drawSetup 后默认任务 = 直线", drawGetTask() == DRAW_TASK_LINE, drawTaskName(drawGetTask()));
   snprintf(d, sizeof d, "纸面 z=%.2f 半宽=%.2f 中心=(%.2f,%.2f)",
            drawGetPaperZ(), drawGetHalfSize(), drawGetCenterX(), drawGetCenterY());
-  check("默认纸面 z=12 / 半宽 6 / 中心 (20,0)",
-        fabs(drawGetPaperZ() - 12.0) < 1e-9 && fabs(drawGetHalfSize() - 6.0) < 1e-9 &&
+  /* DRAW_PEN_Z_DEFAULT 是 draw_control.cpp 的私有宏，探针看不到，只能硬编码；
+   * -12.0 是"笔尖刚好落在纸上"的出厂标定值。 */
+  check("默认纸面 z=-12 / 半宽 6 / 中心 (20,0)",
+        fabs(drawGetPaperZ() - (-12.0)) < 1e-9 && fabs(drawGetHalfSize() - 6.0) < 1e-9 &&
         fabs(drawGetCenterX() - 20.0) < 1e-9 && fabs(drawGetCenterY()) < 1e-9, d);
   check("空闲时 drawControlBusy()/Locked() 都是 false",
         !drawControlBusy() && !drawControlLocked(), drawStateName());
@@ -399,8 +401,12 @@ int main(void) {
   }
 
   check("标定纸面高度 p：合法通过", drawSetPaperZ(11.5) && fabs(drawGetPaperZ() - 11.5) < 1e-9, "11.5");
-  check("标定纸面高度 p：超范围拒绝且不改动",
-        !drawSetPaperZ(999.0) && fabs(drawGetPaperZ() - 11.5) < 1e-9, "p999 被拒");
+  /* 【本版本语义】纸面高度的标定范围(-5~30)已删除：任意有限值都接受，
+   * 只有 NaN 被拒（拒绝后必须不改动上一次的值）。 */
+  check("标定纸面高度 p：超出旧范围(999)也接受",
+        drawSetPaperZ(999.0) && fabs(drawGetPaperZ() - 999.0) < 1e-9, "999 现在被接受");
+  check("标定纸面高度 p：NaN 被拒且不改动",
+        !drawSetPaperZ(NAN) && fabs(drawGetPaperZ() - 999.0) < 1e-9, "pNaN 被拒");
   check("标定半宽 n：超范围拒绝", !drawSetHalfSize(1.0) && !drawSetHalfSize(13.0), "1.0 / 13.0 被拒");
   check("标定中心 o：超上限拒绝且不改动",
         !drawSetCenter(100.0, 0.0) && fabs(drawGetCenterX() - 20.0) < 1e-9, "o100,0 被拒");
@@ -851,8 +857,9 @@ int main(void) {
 
     check("串口 p11.5 标定纸面高度",
           protoHandleLine("p11.5") == PROTO_RES_DRAW_CALIBRATED && fabs(drawGetPaperZ() - 11.5) < 1e-9, "CALIBRATED");
-    check("串口 p999 超范围被拒且不改动",
-          protoHandleLine("p999") == PROTO_RES_DRAW_REJECTED && fabs(drawGetPaperZ() - 11.5) < 1e-9, "REJECTED");
+    check("串口 p999 超出旧范围也接受（纸面高度范围限制已删除）",
+          protoHandleLine("p999") == PROTO_RES_DRAW_CALIBRATED && fabs(drawGetPaperZ() - 999.0) < 1e-9,
+          "CALIBRATED");
     check("串口 pabc 非数字被拒", protoHandleLine("pabc") == PROTO_RES_DRAW_REJECTED, "REJECTED");
     check("串口 n7 标定半宽",
           protoHandleLine("n7") == PROTO_RES_DRAW_CALIBRATED && fabs(drawGetHalfSize() - 7.0) < 1e-9, "CALIBRATED");

@@ -14,7 +14,7 @@
 #   5) -ProbeCheck 时在 build\nocomment\verify 里搭一棵"去注释固件 + 完整 .selfcheck"
 #      的树，跑那份 run_all.ps1（9 个 TU 零警告 + 11 个探针 ALL PASS）；
 #   6) 每个包写一份 README.txt，Compress-Archive 成
-#      dist\meArm_v1.6.4_multifile_nocomment.zip 与 dist\meArm_v1.6.4_single_nocomment.zip；
+#      dist\meArm_v1.6.5_multifile_nocomment.zip 与 dist\meArm_v1.6.5_single_nocomment.zip；
 #   7) 报告写 .selfcheck\out\nocomment_report.md。
 #
 # 为什么这样验证：去注释是纯文本手术，怕的是动到字符串字面量、行尾续行、条件编译
@@ -200,7 +200,7 @@ if ($ProbeCheck) {
 
 Write-Host '=== 5) README.txt + 打包 ==='
 $readme = @"
-meArm v1.6.4 源码（无注释版，__GROUP__）
+meArm v1.6.5 源码（无注释版，__GROUP__）
 ========================================
 
 这个包和仓库里的源码**功能完全一样**，只是把所有注释删掉了。
@@ -232,8 +232,8 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $pkg 'meArm_single_nocomment\README.txt'),   ($sfText -replace "`r`n", "`n"), $utf8)
 
 if (-not $SkipZip) {
-    $z1 = Join-Path $root 'dist\meArm_v1.6.4_multifile_nocomment.zip'
-    $z2 = Join-Path $root 'dist\meArm_v1.6.4_single_nocomment.zip'
+    $z1 = Join-Path $root 'dist\meArm_v1.6.5_multifile_nocomment.zip'
+    $z2 = Join-Path $root 'dist\meArm_v1.6.5_single_nocomment.zip'
     Compress-Archive -Path (Join-Path $pkg 'meArm_multifile_nocomment') -DestinationPath $z1 -Force
     Compress-Archive -Path (Join-Path $pkg 'meArm_single_nocomment')    -DestinationPath $z2 -Force
     Write-Host ("  {0}  {1} B" -f $z1, (Get-Item $z1).Length)

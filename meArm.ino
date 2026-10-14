@@ -105,14 +105,16 @@
 // 【方向镜像：基座与夹爪在这台机器上是反向装配的】
 //   实机装配把 b（基座回转，通道 0）和 f（末端夹爪，通道 3）的舵机装反了：
 //   逻辑角增大时它们物理上朝反方向走。表现就是"左右旋转的舵机转向反了"和
-//   "抓取时 O/S 反了"（O 走 maxF 本该张开，实际夹紧）。
+//   "抓取时 O/S 反了"（逻辑角 150 = 张开，实际却夹紧）。
 //   修法只在唯一写出口 writeServo() 里对这两个通道做一次窗口内镜像
 //   physical = (min + max) - logical，逻辑角（限位/反解/录制/绘图）仍是唯一真值；
-//   镜像后物理角仍落在 [min,max] 内，夹爪不会被推到危险区。
+//   注意夹爪的镜像和是 210、逻辑角范围已放宽到 0~180，所以镜像后的物理角可能
+//   超出 0~180（例如逻辑 0 -> 物理 210），那由 servo_drive 在脉宽层面夹取。
 //   换一套装配就把 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL 改成 0。
 //
 // 安全边界:
-//   1. servoLimit 关节硬限位 —— b[0,180] r[0,180] c[0,180] f[60,150]，唯一的软件边界。
+//   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
+//                              （原来的 f 60~150 夹爪软限位已按需求删除），唯一的软件边界。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
@@ -150,7 +152,7 @@
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
 #include "servo_drive.h"             /* 4 路舵机（Timer1 硬件 PWM，取代 Servo 库） */
-#include "constant_and_positions.h"  /* Pos（唯一被控量）与 servoLimit / rangeLimit */
+#include "constant_and_positions.h"  /* Pos（唯一被控量）与末端夹爪角 TOOL_ANGLE_* */
 #include "joystick_control.h"        /* 摇杆读取、板载 LED、全局调速 */
 #include "serial_protocol.h"         /* 串口命令解析（x/y/z 直接写三个关节角，不逆解） */
 #include "pick_place.h"              /* 取放序列 A/B/C */
@@ -158,7 +160,7 @@
 #include "draw_control.h"            /* 绘图任务（采样点交给 move.h 的 moveToPoint()） */
 
 /* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
- * 字母记号（与 constant_and_positions.h 的 servoLimit 一致）:
+ * 字母记号（与 constant_and_positions.h 的 TOOL_ANGLE_* 一致）:
  *   通道0 = b 水平回转   通道1 = r 上臂俯仰
  *   通道2 = c 下臂俯仰   通道3 = f 末端 */
 
@@ -167,7 +169,10 @@
  * 【方向镜像】基座回转（b）与末端夹爪（f）在这台机器上是反向装配的，所以这两个
  * 通道在各自的行程窗口内做一次镜像：physical = (min + max) - logical。
  * 逻辑角仍是唯一真值（限位/反解/录制/绘图/示教全用逻辑角），只有送到舵机的
- * 那一个数被换向；镜像后仍落在 [min,max] 内，夹爪不会被推到危险区。
+ * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）。
+ * 【本版本提示】夹爪的逻辑角范围已放宽到 0~180，所以镜像后可能超过 180（例如
+ * 逻辑角 0 -> 物理 210）；servo_drive 会把脉宽夹在电气行程内，舵机只是顶到
+ * 自己的极限，不会再由本函数保证"落在 [min,max] 内"。
  * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
 #if WEARM_MIRROR_BASE
@@ -181,8 +186,8 @@ void writeServo(void){
     servoDriveWrite(2, Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
-    // 夹爪：保留 60~150 的硬编码镜像
-    servoDriveWrite(3, (60.0 + 150.0) - Pos.ser.angle4);
+    // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）
+    servoDriveWrite(3, TOOL_MIRROR_SUM - Pos.ser.angle4);
 #else
     servoDriveWrite(3, Pos.ser.angle4);
 #endif
@@ -212,8 +217,8 @@ void setup() {
    *    引脚号请按实际硬件修改 (示例: 9, 7, 8, 6) */
   servoDriveBegin();
   servoDriveAttach(0, 9);   /* 水平回转 */
-  servoDriveAttach(1, 7);   /* 上臂俯仰 */
-  servoDriveAttach(2, 8);   /* 下臂俯仰 */
+  servoDriveAttach(1, 8);   /* 上臂俯仰 */
+  servoDriveAttach(2, 7);   /* 下臂俯仰 */
   servoDriveAttach(3, 6);   /* 末端 */
 
   /* 6. 上电后先让机械臂到位，再开始接收手柄输入 */

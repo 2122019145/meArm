@@ -64,12 +64,13 @@
 /* ==================== 可自定义的参数 ==================== */
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
-#define DRAW_PEN_Z_DEFAULT    12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
+#define DRAW_PEN_Z_DEFAULT    -12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
 #define DRAW_CENTER_X_DEFAULT 20.0   /* 内置图形的中心 x */
 #define DRAW_CENTER_Y_DEFAULT  0.0   /* 内置图形的中心 y */
 #define DRAW_HALF_DEFAULT      6.0   /* 内置图形的半宽（顶点落在 ±半宽 的正方形里） */
-#define DRAW_PEN_Z_MIN        -5.0
-#define DRAW_PEN_Z_MAX        30.0
+/* 【本版本删除】原来这里还有纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
+ * 纸面高度只影响落笔深度，标定成什么值都允许（不在工作空间内的点在启动时
+ * 会被 pathCore 系列的路径校验拒掉），所以不再在这里硬卡范围。 */
 #define DRAW_HALF_MIN          2.0
 #define DRAW_HALF_MAX         12.0
 #define DRAW_CENTER_LIMIT     35.0   /* 中心允许的 |x|、|y| 上限（工作区单位） */
@@ -1152,8 +1153,10 @@ int drawCancel(void)
 /* 标定接口 */
 bool drawSetPaperZ(double z)
 {
-  if (z != z) return false;                        /* NaN */
-  if (z < DRAW_PEN_Z_MIN || z > DRAW_PEN_Z_MAX) return false;
+  if (z != z) return false;                        /* NaN：纸面高度必须是有限数 */
+  /* 【范围限制已删除】原来这里还要求 z ∈ [DRAW_PEN_Z_MIN, DRAW_PEN_Z_MAX](-5~30)。
+   * 现在接受任意有限值：纸面标定只决定落笔深度，标到工作空间外面的点会在
+   * 启动时被路径校验拒掉，不需要在这里提前拒绝。 */
   s_penZ = z;
   return true;
 }
@@ -1309,6 +1312,14 @@ void drawLoop(void)
   }
 
   if (s_paused) return;                    /* 暂停：保持任务状态，什么都不推进 */
+
+  /* 【每一帧都夹紧】绘图运动中把末端持续压在"夹紧角"上（与取放序列同一个约定，
+   * 见 constant_and_positions.h 的 TOOL_ANGLE_TIGHT）。60~150 的夹爪范围限制
+   * 已删除，所以这个角可以比名义合拢角 60 更小，笔才真正被夹住。
+   * posSetAngle4() 在"值没变"时返回 false 且不写状态，所以这里等价于每帧重申
+   * 一次目标角：不产生额外抖动，只是保证夹爪始终保持在夹紧位置。
+   * 示教阶段（DRAW_PHASE_TEACH）与暂停时不会走到这里，示教点动仍可单独调末端。 */
+  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
 
   switch (s_phase) {
     case DRAW_PHASE_HOME: {

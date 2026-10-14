@@ -68,7 +68,7 @@ int main(void) {
              selfConsistent() ? 1 : 0);
     check("home=(20,0,20)、在 limit 内、坐标与角度自洽",
           d < 1e-6 && selfConsistent() &&
-          Pos.ser.angle4 >= 60.0 && Pos.ser.angle4 <= 150.0, buf);
+          Pos.ser.angle4 >= TOOL_ANGLE_MIN && Pos.ser.angle4 <= TOOL_ANGLE_MAX, buf);
   }
 
   printf("=== 1) 六个定长方向各走一步：目标关节正好 ±1 度，其它关节不动 ===\n");
@@ -150,8 +150,16 @@ int main(void) {
     check("单步后坐标自洽", res == MOVE_OK && selfConsistent(), buf);
 
     REC far;
-    far.x = 0; far.y = 0; far.z = 100;
-    check("超臂展点 isReachable() == false", !isReachable(&far), "z=100 远超 L1+L2=40");
+    far.x = 100; far.y = 0; far.z = 0;
+    check("水平超出臂展的点 isReachable() == false", !isReachable(&far),
+          "x=100 超过 RHO_MAX=L1+L2=40");
+
+    /* 【本版本语义】isReachable() 只剩水平判据：竖向(与 armheight 之差)不再单独设卡。
+     * 竖向能不能真正走到由 getAngleEx() 的残差(<=0.05)决定，不看 isReachable()。 */
+    REC above;
+    above.x = 0; above.y = 0; above.z = 100;
+    check("竖向不再单独设卡：z=100 也判可达", isReachable(&above),
+          "z=100 以前被竖向限位拒掉，现在只判水平半径");
   }
 
   printf("=== 5) 调速档位 ===\n");

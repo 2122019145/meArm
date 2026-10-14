@@ -85,10 +85,11 @@ int main(void) {
   char buf[160];
 
   /* 0) setup() 的接线动作：servoDriveAttach(0..3) 必须先 pinMode(OUTPUT) 再拉低引脚，
-   *    顺序 9,7,8,6。用 digitalWrite 日志看 —— 它是"真的动了哪根脚"的证据。 */
+   *    顺序 9,8,7,6（通道1/通道2 的引脚在本版本按实机接线对调过）。
+   *    用 digitalWrite 日志看 —— 它是"真的动了哪根脚"的证据。 */
   mockDigitalWriteReset();
   setup();
-  const int wantPin[4] = { 9, 7, 8, 6 };
+  const int wantPin[4] = { 9, 8, 7, 6 };
   for (int i = 0; i < 4; i++) {
     int got = -1;
     if (i < g_mockWriteLogCount && g_mockWriteLogLevel[i] == LOW) got = g_mockWriteLogPin[i];
@@ -113,8 +114,8 @@ int main(void) {
     snprintf(buf, sizeof buf, "上电脉宽 通道%d=%u tick (逻辑=%.6f -> %u)", i, width[i], want, wantTicks);
     check(buf, width[i] == wantTicks, NULL);
   }
-  snprintf(buf, sizeof buf, "帧长 %u tick = %.2f ms (期望 40000 tick = 20ms)", frameTicks, frameTicks * 0.5);
-  check(buf, frameTicks == 40000u, NULL);
+  snprintf(buf, sizeof buf, "帧长 %u tick = %.2f ms (期望 60000 tick = 30ms)", frameTicks, frameTicks * 0.5);
+  check(buf, frameTicks == 60000u, NULL);
 
   /* 2) 上电角度必须是 POS_HOME 对应的 (90,90,90, 末端行程中位)，不能是 0 —— 角度 0 会让
    *    机械臂在上电瞬间甩出去，这是老版本踩过的坑。
@@ -125,16 +126,17 @@ int main(void) {
            Pos.ser.angle3, Pos.ser.angle4);
   check(buf, fabs(Pos.ser.angle1 - 90.0) < 1e-6 && fabs(Pos.ser.angle2 - 90.0) < 1e-6 &&
              fabs(Pos.ser.angle3 - 90.0) < 1e-6, NULL);
-  /* 末端 f 的行程是 [60,150]，posInit() 取中位 105（不是 90）—— 这一条曾经把
-   * "assert f == 90" 写错，是探针自己的错，固件行为才是对的。 */
-    const double wantF = 105.0;   /* 硬编码 (60+150)/2 */
+  /* 末端 f 的电气行程是 [0,180]，posInit() 取夹爪"开/合"两个名义角的中点 105
+   * （不是 90）—— 这一条曾经把 "assert f == 90" 写错，是探针自己的错，
+   * 固件行为才是对的。 */
+    const double wantF = (TOOL_ANGLE_OPEN + TOOL_ANGLE_CLOSE) * 0.5;
   snprintf(buf, sizeof buf, "末端上电取行程中位 f=%.1f (期望 %.1f)", Pos.ser.angle4, wantF);
   check(buf, fabs(Pos.ser.angle4 - wantF) < 1e-9, NULL);
   check("上电脉宽非 0° 脉宽（不会甩向原点）",
         width[0] != physTicks(0, 0.0) && width[1] != physTicks(1, 0.0) &&
         width[2] != physTicks(2, 0.0), NULL);
-  check("上电脉冲顺序 = 引脚 9,7,8,6",
-        pins[0] == 9 && pins[1] == 7 && pins[2] == 8 && pins[3] == 6, NULL);
+  check("上电脉冲顺序 = 引脚 9,8,7,6",
+        pins[0] == 9 && pins[1] == 8 && pins[2] == 7 && pins[3] == 6, NULL);
 
   /* 3) loop(): 手柄不动 -> 角度不变、坐标自洽；writeServo 仍然照写 */
   double b0 = Pos.ser.angle1, r0 = Pos.ser.angle2, c0 = Pos.ser.angle3;
@@ -163,8 +165,9 @@ int main(void) {
   /* 5) 方向镜像：把基座与夹爪的逻辑角放到偏离中位的地方，检查真正输出到引脚的
    *    脉宽是"镜像后"的那个角，而不是逻辑角本身。这条用例正面锁住用户报的两个
    *    现象：左右旋转的舵机转向反了、抓取时 O/S 反了。
-   *    夹爪的镜像尤其要看：f 的行程 [60,150] 镜像后仍落在原区间内，所以就算
-   *    开关关掉也不会把爪子推出危险区，但方向会反。 */
+   *    夹爪的镜像尤其要看：逻辑角范围放宽到 0~180 之后，镜像和仍是 210，
+   *    所以逻辑 0 会算出物理 210（超出电气行程，由 servo_drive 在脉宽层面夹取），
+   *    方向反不反仍然看得见。 */
 #if WEARM_MIRROR_BASE || WEARM_MIRROR_TOOL
   Pos.ser.angle1 = 30.0;
   Pos.ser.angle4 = 60.0;
@@ -180,9 +183,9 @@ int main(void) {
   check(buf, width[3] == mir3, NULL);
   check("镜像确实改变了输出（b 30° 与 f 60° 都不是原值）",
         mir0 != servoDriveTicksForDeg(30.0) && mir3 != servoDriveTicksForDeg(60.0), NULL);
-  /* 镜像落点仍在各自行程内：夹爪不可能被镜像推到行程外 */
-    check("镜像后物理角仍在 f 行程 [60,150] 内",
-        (210.0 - 60.0) >= 60.0 && (210.0 - 60.0) <= 150.0, NULL);
+  /* 镜像和是这台机器的装配常数：夹爪 210。逻辑角可能镜像到超出 0~180，
+   * 那由 servo_drive 在脉宽层面夹到电气行程端点，不再是本层的契约。 */
+  check("夹爪镜像和 = TOOL_MIRROR_SUM(210)", TOOL_MIRROR_SUM == 210.0, NULL);
   posInit();
   writeServo();
 #endif

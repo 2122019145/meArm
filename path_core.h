@@ -14,7 +14,8 @@
  *
  * 【本版本已删除】pathCorePointOk() 里的 limit 范围检查。笛卡尔坐标范围
  * 限制（rangeLimit/limit）已按需求整体移除；b/r/c 的物理行程 0~180 在
- * moveJointStep() 内硬编码，f 的 60~150 在 posSetAngle4() 内硬编码。
+ * moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
+ * （原有的 f 60~150 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
@@ -23,8 +24,8 @@
 #include "constant_and_positions.h"
 
 /* 反解一个工作区点，成功时给出 b/r/c。
- * 注意必须给 angle4 一个合法值：getAngleEx() 会把四个关节一起夹，
- * angle4 非法（例如 0）会让 clamped 恒为 true（.selfcheck 的历史教训）。 */
+ * 注：本版本 getAngleEx() 不再因 angle4 越限而吸附或拒绝，*clamped 恒为 false；
+ * 调用方式仍带着当前的 Pos.ser（与固件其它调用点保持一致）。 */
 inline bool pathCoreSolveJoint(double x, double y, double z,
                                double *b, double *r, double *c) {
   pos p;
