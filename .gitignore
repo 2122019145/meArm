@@ -41,3 +41,13 @@ Thumbs.db
 
 # 日志（探针日志在 .selfcheck/out/ 下，已被上面排除）
 *.log
+
+# ---- 交付物与本机文档（按惯例不入库） ----
+# dist/ 的发布 zip 与 docs/ 的 Word/PDF 说明文档只留在本地（docs/ 里的
+# *.py 生成脚本也一并留在本地）；根目录的手传压缩包、备忘文件与交接
+# 说明（HANDOVER*.md）同样只留本地，不进版本库。
+/dist/
+/docs/
+/*.zip
+/p1.txt
+/HANDOVER*.md
