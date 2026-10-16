@@ -660,6 +660,13 @@ static bool stallGuard(double movedNow)
   }
   s_stallCount++;
   if (s_stallCount > DRAW_STALL_LIMIT) {
+    /* 放弃前先在串口上留一行证据（不是对命令的回复，是主动上报）：
+     * 没有它的话，"画到一半停下不动"在串口上完全静默，操作者分不清
+     * 是任务被丢弃还是还在慢慢挪。六个整数都是 s_phase 被改之前取的。
+     * 调试日志（WEARM_DEBUG_SERIAL）另外还会打一行中文，那是给 PC 端看的。 */
+    serialReportDrawStop((int)s_task, (int)s_phase,
+                         (int)s_hitCount, (int)s_hitTotal,
+                         (int)Pos.rec.x, (int)Pos.rec.y);
 #if DRAW_DEBUG_SERIAL
     Serial.println(F("[draw] 无法继续前进（关节速率或可达性受限），放弃本次绘图"));
 #endif

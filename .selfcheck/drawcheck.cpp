@@ -7,12 +7,17 @@
  *   (2) 7 个内置/示教任务在**当前代码默认值**下能不能启动、能不能画完；
  *   (3) 一组候选 (纸面 z, 中心 y, 半宽) 里哪些能通过 validatePath()。
  *
- * 编译（链接固件本体，不碰 avr）：
+ * 编译（链接固件本体，不碰 avr；v1.6.8 起绘图类工具还需串口层，见下）：
  *   g++ -std=gnu++17 -O2 -I. -I.\.selfcheck\mock `
  *       -DWEARM_ENABLE_DRAW=1 -DWEARM_ENABLE_PICK_PLACE=0 -DWEARM_ENABLE_BUTTONS=1 `
  *       .\.selfcheck\drawcheck.cpp .\draw_control.cpp .\constant_and_positions.cpp `
  *       .\move.cpp .\servo_drive.cpp .\button_control.cpp .\joystick_control.cpp `
+ *       .\protocol_constants.cpp .\serial_protocol.cpp `
  *       .\.selfcheck\mock\Arduino.cpp -o .\.selfcheck\out\drawcheck.exe
+ *
+ * 注意：`draw_control.cpp` 的"卡死保护"放弃时会调 `serialReportDrawStop()`
+ * （实现在 `serial_protocol.cpp`），所以必须多链 `serial_protocol.cpp` +
+ * `protocol_constants.cpp`，否则 undefined reference。
  *
  * 运行：.\.selfcheck\out\drawcheck.exe           （默认做 (1)(2)(3) 全部）
  *       .\.selfcheck\out\drawcheck.exe scan      （只做 (1)）

@@ -58,7 +58,9 @@
  *                                  （192 × 200 ms = 38.4 秒、768 B SRAM，见第 5 节）
  *
  * 【v1.6.8 默认组合 = 取放 + 绘图（按键关）】取放 1 / 绘图 1 / 按键 0，
- * 实编 **31250 B（95.4%）/ 569 B** —— 装得下，余 1006 B。
+ * 实编 **31740 B（96.9%）/ 570 B** —— 装得下，余 516 B。
+ * （其中 490 B 是 v1.6.8 新增的"绘图卡死时主动上报 DRW STOP…"，
+ * 只在带绘图的构建里编进去：DRAW 0 的组合不受影响。）
  * 代价：串口 N/R/P/M/0（录制/回放/按键循环取放）都回 REJECTED；
  * **回中仍然做得到**：`x90,y90,z90` 与 M 等价（见第 2 节 WEARM_ENABLE_BUTTONS 注释）。
  * 想要按键模块就把绘图关掉（取放 + 按键 = 22770 B / 1236 B，余 9486 B）。
@@ -74,11 +76,11 @@
  * "token "=" is not valid in preprocessor expressions"。
  *
  * 实测容量（Program / Data，**v1.6.8 实编**；百分比按 32768 / 2048 算）：
- *     取放 + 按键 + 绘图       : 34688 B (105.9%) / 1486 B (72.6%)  <- 装不进 Uno
- *     取放 + 绘图   + 按键关   : 31250 B (95.4%)  /  569 B (27.8%)  <- v1.6.8 默认
+ *     取放 + 按键 + 绘图       : 35162 B (107.3%) / 1487 B (72.6%)  <- 装不进 Uno
+ *     取放 + 绘图   + 按键关   : 31740 B (96.9%)  /  570 B (27.8%)  <- v1.6.8 默认
  *     取放 + 按键   + 绘图关   : 22770 B (69.5%)  / 1236 B (60.4%)
- *     绘图 + 按键   + 取放关   : 28870 B (88.1%)  / 1447 B (70.7%)
- * 三开那行比 Uno 可用 flash（32256 B）**多 2432 B**，Arduino IDE 会直接报
+ *     绘图 + 按键   + 取放关   : 29356 B (89.6%)  / 1448 B (70.7%)
+ * 三开那行比 Uno 可用 flash（32256 B）**多 2906 B**，Arduino IDE 会直接报
  * "Sketch too big"。想同时要取放和绘图时，被裁掉的是按键模块 —— 三个功能里
  * 它最省得掉：回中可用 `x90,y90,z90` 代替，录制/回放不是必需。
  * 三个开关全开的构建仍然保留（PC 端自检 run_all.ps1 / compile_only.ps1 就是这么
@@ -205,7 +207,7 @@
 
 /* 取放序列：把 A/B/C 三个物体夹到各自的放置点（串口 A/B/C）。
  * 【本版开启】三者的取舍见下面两段：当前默认组合是
- * **取放 1 + 按键 0 + 绘图 1**（v1.6.8 实测 31250 B / 95.4%，Data 569 B）。 */
+ * **取放 1 + 按键 0 + 绘图 1**（v1.6.8 实测 31740 B / 96.9%，Data 570 B）。 */
 #ifndef WEARM_ENABLE_PICK_PLACE
 #  define WEARM_ENABLE_PICK_PLACE 1
 #endif
@@ -222,8 +224,8 @@
 #endif
 
 /* 绘图：铅笔轨迹绘制（v1.0.0 新增，串口 F/D/G/E/Q/U/W/p/n/o）。
- * 【本版开启】与取放同时装得下：31250 B / 95.4%，余 1006 B。
- * 三开（再加按键模块）是 34688 B，比 Uno 可用的 32256 B 多 2432 B
+ * 【本版开启】与取放同时装得下：31740 B / 96.9%，余 516 B。
+ * 三开（再加按键模块）是 35162 B，比 Uno 可用的 32256 B 多 2906 B
  * （Arduino IDE 报 Sketch too big），所以本版裁掉的是按键模块。
  * 纸面高度先上机用 `p<z>` 标定 —— 默认值只是"能把 50×50mm 图形
  * 塞进可达区"的最低平面，纸要垫块（见 draw_control.cpp 的纸面段）。
@@ -979,6 +981,15 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */
 void serialProtocolBegin(void);
+
+/* 绘图被"卡死保护"放弃时主动上报一行（不是对某条命令的回复）：
+ *   DRW STOP t2 ph4 h2/4 x-25 y98
+ * 含义：任务号 / 放弃时所在阶段 / 已过点 / 点的总数 / 笔尖停下的 x、y（整数，单位 mm）。
+ * 存在的理由：绘图失败有两条完全不同的路径 —— "画完了自己回待机"与"卡住把任务丢了"
+ * （draw_control.cpp 的 stallGuard），而后者以前在串口上**什么都不说**：操作者只看到
+ * 机械臂停在纸上不动，分不清是卡住还是还在慢慢画。加了这一行，纯串口主机就能判定。
+ * 只在放弃时打印，正常完成不会出现。 */
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y);
 
 /* 每轮 loop() 调用一次：把串口收到的字符攒成一行并执行。
  * 注意: 旧接口 handleSerialSpeedCmd() 已被本函数取代并删除，不要再同时调用两者
@@ -4544,6 +4555,13 @@ static bool stallGuard(double movedNow)
   }
   s_stallCount++;
   if (s_stallCount > DRAW_STALL_LIMIT) {
+    /* 放弃前先在串口上留一行证据（不是对命令的回复，是主动上报）：
+     * 没有它的话，"画到一半停下不动"在串口上完全静默，操作者分不清
+     * 是任务被丢弃还是还在慢慢挪。六个整数都是 s_phase 被改之前取的。
+     * 调试日志（WEARM_DEBUG_SERIAL）另外还会打一行中文，那是给 PC 端看的。 */
+    serialReportDrawStop((int)s_task, (int)s_phase,
+                         (int)s_hitCount, (int)s_hitTotal,
+                         (int)Pos.rec.x, (int)Pos.rec.y);
 #if DRAW_DEBUG_SERIAL
     Serial.println(F("[draw] 无法继续前进（关节速率或可达性受限），放弃本次绘图"));
 #endif
@@ -6394,23 +6412,105 @@ static const char s_rOff[] PROGMEM = "OFF";
 static const char s_rBoot[] PROGMEM = "CMD v" WEARM_FW_VERSION
     " OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
-/* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
- * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
+/* 'F'（切换绘图任务）回复 "OK F=<tag>"，'D'（开始绘制）回复 "OK D=<tag>"：
+ * tag 是简短的 ASCII 名称（"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
  * 让纯串口主机（PC 终端或 ESP8266 板子）知道当前选中的是哪种绘图模式。
- * tag 本身由 draw_control.cpp 提供（drawTaskTag）。 */
+ * tag 本身由 draw_control.cpp 提供（drawTaskTag）。
+ * 【v1.6.8】原来只给 'F' 回标签、'D' 回一个干巴巴的 "OK"，
+ * 于是"到底画了什么"从串口上完全看不出来（画成别的图形时无从判断是选错任务
+ * 还是轨迹本身出问题）；现在 'D' 也带上同一个标签。 */
 __attribute__((noinline))
-static void protoReplyTaskTag(const char *tag)
+static void protoReplyTaskTag(char cmd, const char *tag)
 {
   protoPut('O');
   protoPut('K');
   protoPut(' ');
-  protoPut('F');
+  protoPut(cmd);
   protoPut('=');
   while (*tag != '\0') {
     protoPut(*tag++);
   }
   protoPut('\n');
 }
+
+/* 下面这行"放弃绘图"上报只给带绘图的构建用（约 490 B flash）。
+ * `serialReportDrawStop()` 的调用点在 `draw_control.cpp` 的 stallGuard 里，
+ * `WEARM_ENABLE_DRAW 0` 时那个模块整块是空桩、根本不会调用它，所以这里也
+ * 不编进去 —— 取放/按键那些组合不必为一个用不到的诊断付体积。
+ * 声明始终在 serial_protocol.h 里，所以两个分支都必须给出定义。 */
+#if WEARM_ENABLE_DRAW
+
+/* 十进制打印一个 int（只用于下面那行"放弃绘图"的上报）。
+ * 响应层刻意不用 Serial.print() 打数字：那会把浮点/整数格式化层整块链进来
+ * （见文件顶部说明）。要打的量级只有 0~7（任务/阶段/点数）与 ±175mm 的坐标，
+ * 缓存 6 字节足够。 */
+static void protoPutInt(int v)
+{
+  char buf[6];
+  uint8_t n = 0;
+
+  if (v < 0) {
+    protoPut('-');
+    v = -v;
+  }
+  if (v == 0) {
+    buf[n++] = '0';
+  }
+  while (v > 0 && n < (uint8_t)sizeof(buf)) {
+    buf[n++] = (char)('0' + (v % 10));
+    v /= 10;
+  }
+  while (n > 0u) {
+    protoPut(buf[--n]);
+  }
+}
+
+/* stallGuard 放弃时主动上报（声明与用途见 serial_protocol.h）。
+ * 模板里 '#' 依次吃掉六个整数参数。 */
+static const char s_drwStop[] PROGMEM = "DRW STOP t# ph# h#/# x# y#";
+
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  int vals[6];
+  uint8_t k = 0;
+
+  vals[0] = task;
+  vals[1] = phase;
+  vals[2] = hit;
+  vals[3] = hitTotal;
+  vals[4] = x;
+  vals[5] = y;
+
+  for (uint8_t i = 0; ; i++) {
+    char c = (char)pgm_read_byte(&s_drwStop[i]);
+
+    if (c == '\0') {
+      break;
+    }
+    if (c == '#') {
+      if (k < 6u) {
+        protoPutInt(vals[k++]);
+      }
+      continue;
+    }
+    protoPut(c);
+  }
+  protoPut('\n');
+}
+
+#else
+
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  (void)task;
+  (void)phase;
+  (void)hit;
+  (void)hitTotal;
+  (void)x;
+  (void)y;
+}
+
+#endif
 
 /* 'm'（查询/切换基座、上臂与下臂换向）的回复："B=1 S=0 E=1" 形式，
  * 与 protoReplyFeature 同一风格。 */
@@ -6466,9 +6566,21 @@ static void protoReplyFeature(void)
 #define R_EMPTY() do { } while (0)
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
-#define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
+#define protoReplyTaskTag(cmd, tag) do { (void)(cmd); (void)(tag); } while (0)
 #define protoReplyMirror() do { } while (0)
 #define protoReplyFeature() do { } while (0)
+
+/* 响应层整个关掉时，"放弃绘图"的上报同样没有输出；保留一个空定义，
+ * 免得 draw_control.cpp 的调用点在链接期找不到符号。 */
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  (void)task;
+  (void)phase;
+  (void)hit;
+  (void)hitTotal;
+  (void)x;
+  (void)y;
+}
 #endif
 
 /* ========== 命令分类位图 ========== */
@@ -6841,11 +6953,14 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      /* 'F' 用"当前选中的图形"回复（"OK F=V"），而不是干巴巴的 "OK"：
-       * 操作者（以及 ESP8266 板子）没有别的办法知道 7 种绘图任务里
-       * 究竟选中了哪一种。 */
+      /* 'F' 与 'D' 都用"当前选中的图形"回复（"OK F=V" / "OK D=V"），
+       * 而不是干巴巴的 "OK"：操作者（以及 ESP8266 板子）没有别的办法知道
+       * 7 种绘图任务里究竟选中了哪一种 —— 'D' 尤其重要，因为"画出来的形状
+       * 不对"的第一个问题永远是"它到底规划的是哪个图形"。 */
       if (result == PROTO_RES_DRAW_TASK_SELECTED) {
-        protoReplyTaskTag(drawTaskTag(drawGetTask()));
+        protoReplyTaskTag('F', drawTaskTag(drawGetTask()));
+      } else if (result == PROTO_RES_DRAW_STARTED) {
+        protoReplyTaskTag('D', drawTaskTag(drawGetTask()));
       } else if (result == PROTO_RES_BUSY) R_BUSY();
       else if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
       else if (result < 0) R_ERR();

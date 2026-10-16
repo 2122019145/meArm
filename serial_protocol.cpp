@@ -230,23 +230,105 @@ static const char s_rOff[] PROGMEM = "OFF";
 static const char s_rBoot[] PROGMEM = "CMD v" WEARM_FW_VERSION
     " OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
-/* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
- * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
+/* 'F'（切换绘图任务）回复 "OK F=<tag>"，'D'（开始绘制）回复 "OK D=<tag>"：
+ * tag 是简短的 ASCII 名称（"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
  * 让纯串口主机（PC 终端或 ESP8266 板子）知道当前选中的是哪种绘图模式。
- * tag 本身由 draw_control.cpp 提供（drawTaskTag）。 */
+ * tag 本身由 draw_control.cpp 提供（drawTaskTag）。
+ * 【v1.6.8】原来只给 'F' 回标签、'D' 回一个干巴巴的 "OK"，
+ * 于是"到底画了什么"从串口上完全看不出来（画成别的图形时无从判断是选错任务
+ * 还是轨迹本身出问题）；现在 'D' 也带上同一个标签。 */
 __attribute__((noinline))
-static void protoReplyTaskTag(const char *tag)
+static void protoReplyTaskTag(char cmd, const char *tag)
 {
   protoPut('O');
   protoPut('K');
   protoPut(' ');
-  protoPut('F');
+  protoPut(cmd);
   protoPut('=');
   while (*tag != '\0') {
     protoPut(*tag++);
   }
   protoPut('\n');
 }
+
+/* 下面这行"放弃绘图"上报只给带绘图的构建用（约 490 B flash）。
+ * `serialReportDrawStop()` 的调用点在 `draw_control.cpp` 的 stallGuard 里，
+ * `WEARM_ENABLE_DRAW 0` 时那个模块整块是空桩、根本不会调用它，所以这里也
+ * 不编进去 —— 取放/按键那些组合不必为一个用不到的诊断付体积。
+ * 声明始终在 serial_protocol.h 里，所以两个分支都必须给出定义。 */
+#if WEARM_ENABLE_DRAW
+
+/* 十进制打印一个 int（只用于下面那行"放弃绘图"的上报）。
+ * 响应层刻意不用 Serial.print() 打数字：那会把浮点/整数格式化层整块链进来
+ * （见文件顶部说明）。要打的量级只有 0~7（任务/阶段/点数）与 ±175mm 的坐标，
+ * 缓存 6 字节足够。 */
+static void protoPutInt(int v)
+{
+  char buf[6];
+  uint8_t n = 0;
+
+  if (v < 0) {
+    protoPut('-');
+    v = -v;
+  }
+  if (v == 0) {
+    buf[n++] = '0';
+  }
+  while (v > 0 && n < (uint8_t)sizeof(buf)) {
+    buf[n++] = (char)('0' + (v % 10));
+    v /= 10;
+  }
+  while (n > 0u) {
+    protoPut(buf[--n]);
+  }
+}
+
+/* stallGuard 放弃时主动上报（声明与用途见 serial_protocol.h）。
+ * 模板里 '#' 依次吃掉六个整数参数。 */
+static const char s_drwStop[] PROGMEM = "DRW STOP t# ph# h#/# x# y#";
+
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  int vals[6];
+  uint8_t k = 0;
+
+  vals[0] = task;
+  vals[1] = phase;
+  vals[2] = hit;
+  vals[3] = hitTotal;
+  vals[4] = x;
+  vals[5] = y;
+
+  for (uint8_t i = 0; ; i++) {
+    char c = (char)pgm_read_byte(&s_drwStop[i]);
+
+    if (c == '\0') {
+      break;
+    }
+    if (c == '#') {
+      if (k < 6u) {
+        protoPutInt(vals[k++]);
+      }
+      continue;
+    }
+    protoPut(c);
+  }
+  protoPut('\n');
+}
+
+#else
+
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  (void)task;
+  (void)phase;
+  (void)hit;
+  (void)hitTotal;
+  (void)x;
+  (void)y;
+}
+
+#endif
 
 /* 'm'（查询/切换基座、上臂与下臂换向）的回复："B=1 S=0 E=1" 形式，
  * 与 protoReplyFeature 同一风格。 */
@@ -302,9 +384,21 @@ static void protoReplyFeature(void)
 #define R_EMPTY() do { } while (0)
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
-#define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
+#define protoReplyTaskTag(cmd, tag) do { (void)(cmd); (void)(tag); } while (0)
 #define protoReplyMirror() do { } while (0)
 #define protoReplyFeature() do { } while (0)
+
+/* 响应层整个关掉时，"放弃绘图"的上报同样没有输出；保留一个空定义，
+ * 免得 draw_control.cpp 的调用点在链接期找不到符号。 */
+void serialReportDrawStop(int task, int phase, int hit, int hitTotal, int x, int y)
+{
+  (void)task;
+  (void)phase;
+  (void)hit;
+  (void)hitTotal;
+  (void)x;
+  (void)y;
+}
 #endif
 
 /* ========== 命令分类位图 ========== */
@@ -677,11 +771,14 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_DRAW_PAUSE || cmd == PROTO_CMD_DRAW_RESUME ||
                cmd == PROTO_CMD_DRAW_CANCEL) {
       int result = drawHandleCommand(cmd);
-      /* 'F' 用"当前选中的图形"回复（"OK F=V"），而不是干巴巴的 "OK"：
-       * 操作者（以及 ESP8266 板子）没有别的办法知道 7 种绘图任务里
-       * 究竟选中了哪一种。 */
+      /* 'F' 与 'D' 都用"当前选中的图形"回复（"OK F=V" / "OK D=V"），
+       * 而不是干巴巴的 "OK"：操作者（以及 ESP8266 板子）没有别的办法知道
+       * 7 种绘图任务里究竟选中了哪一种 —— 'D' 尤其重要，因为"画出来的形状
+       * 不对"的第一个问题永远是"它到底规划的是哪个图形"。 */
       if (result == PROTO_RES_DRAW_TASK_SELECTED) {
-        protoReplyTaskTag(drawTaskTag(drawGetTask()));
+        protoReplyTaskTag('F', drawTaskTag(drawGetTask()));
+      } else if (result == PROTO_RES_DRAW_STARTED) {
+        protoReplyTaskTag('D', drawTaskTag(drawGetTask()));
       } else if (result == PROTO_RES_BUSY) R_BUSY();
       else if (result == PROTO_RES_DRAW_REJECTED) R_REJ();
       else if (result < 0) R_ERR();
