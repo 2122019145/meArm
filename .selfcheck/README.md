@@ -2467,6 +2467,54 @@ owner）+ GitHub Release 列表 + 本地交付物（`rel_*.md`、`single/meArm/m
 > （`-Check` 只报告）。v1.6.8 这次做串口打包稿时就是先手工补 `EF BB BF` 才让新脚本
 > 跑起来的，顺手用 `ensure_bom.ps1` 把 `avr_build.ps1` 缺的 BOM 也补上了。
 
+## 第二块板的交付稿 —— `.selfcheck/make_keypad_single.ps1`
+
+需求是"把给**另一块** Arduino 开发板（= 按键板 `arduino_keypad/`）的版本打包给我"，
+并要求形式是**一个可以直接打开的 `.ino`**（不是 zip），配套文件在文件头说明清楚。
+`.selfcheck/make_keypad_single.ps1` 就是干这个的：
+
+| 顺序 | 文件 | 说明 |
+| --- | --- | --- |
+| 说明头 | （生成器内置 30 行） | 这是什么 / 从哪来 / 怎么上传 / 配套文件 / 实测占用 / 主控固件要求 |
+| 正文 | `arduino_keypad/arduino_keypad.ino` | **逐字拷贝**，不改一行 |
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\make_keypad_single.ps1
+
+⇒ 产出 `single/arduino_keypad/arduino_keypad.ino`（本机实测 **20438 B / 447 行** = 正文
+417 行 + 说明头 30 行；LF-only、无 CR）。与 `make_single.ps1` 的关键区别是**它不做任何
+改写**：按键板只依赖核心自带的 `<SoftwareSerial.h>`，没有内部 `#include` 要删，也没有
+重名函数要改名，所以逐字拷贝即可。
+
+> ⚠️ **IDE 要求 `.ino` 的文件名与所在文件夹同名**，所以交付稿必须放在名为
+> `arduino_keypad` 的文件夹里（仓库里就是 `single/arduino_keypad/`）—— 这也正是文件名
+> 没被改掉的原因。改名会让 IDE 报"sketch 必须放在同名文件夹中"。
+
+**按键板的 AVR 真编（v1.6.8 新增，此前仓库从未验过这块板）**：把 `.ino` 当成
+`arduino_keypad.ino.cpp` 并前置 `#include <Arduino.h>`（模拟 IDE 的处理），用
+`.selfcheck/avr_build.ps1` 同款参数（avr-gcc 7.3.0 + AVR core 1.8.8、`-Os -std=gnu++11
+-fpermissive -fno-exceptions -ffunction-sections -fdata-sections -fno-threadsafe-statics
+-flto`），把链接库从 `Servo` 换成 `SoftwareSerial`（`-I
+%LOCALAPPDATA%\Arduino15\packages\arduino\hardware\avr\1.8.8\libraries\SoftwareSerial\src`），
+再链上缓存好的 `.selfcheck\avrbuild\core.a`：
+
+    Program:  6170 字节（18.8%）   Data:  975 字节（47.6%）
+
+⇒ Uno 上很宽裕，也证明了"单个 `.ino` + 只有 SoftwareSerial 依赖"是自洽的（说明头加了
+30 行注释后再编，数字**一个字节都没变**）。
+
+**配套关系（v1.6.8 起必须说明的一点）**：按键板发出的 `N/R/P/M/0` 属于主控的**按键模块**，
+而本版默认功能组合是「取放 + 绘图，按键关」（PICK 1 / BUTTONS 0 / DRAW 1，31740 B），
+那 5 个槽位会被主控回 `REJECTED`。用这块板请把主控改成「取放 + 按键（绘图关）」
+（22770 B）或「绘图 + 按键」（29356 B）。三开 35162 B 装不进 Uno（可用 32256 B）。
+`arduino_keypad.ino` 头部现在写的就是这套对照，`REJECTED` / `OFF` / `BUSY` 三种回复的
+区别也在那里。
+
+> 教训：`@('-mmcu=' + $mcu, '-DF_CPU=16000000L', …)` 会被 PowerShell 解析成
+> `'-mmcu=' + ($mcu, '−DF_CPU=…', …)` —— **逗号优先级高于 `+`**，结果所有宏被拼成
+> 一个字符串，avr-g++ 报 `strange device name 'atmega328p -DF_CPU=16000000L …' after
+> '-mmcu=': bad character ' '`。必须写成 `@(('-mmcu=' + $mcu), '-DF_CPU=16000000L', …)`
+> （`avr_build.ps1:51` 一直是对的写法）。
+
 ## 初始位姿改回 (40,0,0) —— 上电仍是 x90,y90,z90
 
 > **（v1.6.7 之前的历史，运动模型已被整体替换，见 README 的对应章节）**

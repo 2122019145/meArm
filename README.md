@@ -18,7 +18,7 @@ v1.6.8 只动**可诊断性与默认组合**，运动逻辑一行未改：① �
 三个功能全开 35162 B 装不进 Uno，只能裁一个，详见
 [功能裁剪与容量](#功能裁剪与容量v166-起)。
 
-**一套源码，三种交付形态：**
+**一套源码，四种交付形态：**
 
 - **多文件版**：仓库根目录 21 个文件（`meArm.ino` + 9 个 `.cpp` + 11 个 `.h`），工程形态，日常开发只改这里；
 - **单文件版**：`single/meArm/meArm.ino`（LF 换行），由 `.selfcheck/make_single.ps1` 从多文件版
@@ -28,9 +28,14 @@ v1.6.8 只动**可诊断性与默认组合**，运动逻辑一行未改：① �
   只把"协议常量层 + 串口协议层"这 4 个文件按依赖顺序拼成一个文件，方便整段阅读或拷给别人。
   它保留对外的 `#include`（`weArm_config.h`、各模块头），因此能单独编译成一个编译单元，
   但要链成固件仍需其它模块 —— 它是打包稿，**不是给人 `#include` 的**（定义与实现都在里面）。
+- **按键板单文件版**（第二块 Arduino）：`single/arduino_keypad/arduino_keypad.ino`，由
+  `.selfcheck/make_keypad_single.ps1` 从 `arduino_keypad/arduino_keypad.ino` **逐字拷贝** + 一段
+  说明头生成。这份是**可以直接上传**的完整 sketch（只依赖核心自带的 `<SoftwareSerial.h>`），
+  IDE 里打开 `single/arduino_keypad/` 即可 —— 注意 IDE 要求 `.ino` 与文件夹同名，所以文件名没改。
 
-> 单文件版是生成物，不要手改。改完根目录源码后必须重跑 `make_single.ps1`，
-> 否则 `.selfcheck` 里的 `wearm_ino_test` 探针会立刻失败。
+> 单文件版与按键板版都是生成物，不要手改。改完源码后必须重跑对应的 `make_*.ps1`，
+> 否则 `.selfcheck` 里的 `wearm_ino_test` 探针会立刻失败（按键板版没有探针，见
+> `.selfcheck/README.md` 的按键板一节）。
 
 详细设计说明（1500+ 行中文，含每个决策的理由与上机确认清单）在
 [`.selfcheck/README.md`](.selfcheck/README.md)。
@@ -480,8 +485,9 @@ x=0 沿 +y 扫 rho，步长 1mm）：
 
 ## 构建与自检
 
-Arduino IDE 直接打开仓库根目录（sketch 名 `meArm`）或 `single/meArm/` 即可；PC 端自检脚本
-一律这样调用（本机没有 `pwsh`，用 Windows PowerShell 5.1）：
+Arduino IDE 直接打开仓库根目录（sketch 名 `meArm`）或 `single/meArm/` 即可；第二块板（按键板）
+打开 `single/arduino_keypad/`（或源码目录 `arduino_keypad/`），它只依赖核心自带的 `<SoftwareSerial.h>`。
+PC 端自检脚本一律这样调用（本机没有 `pwsh`，用 Windows PowerShell 5.1）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
@@ -494,6 +500,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
 | `.selfcheck/avr_build.ps1 [-SketchDir ...] [-ExtraDefs @(...)] [-Relax]` | AVR 真编（avr-gcc 7.3.0 + core 1.8.8，`-Os -flto`）并打印 flash/SRAM；`-ExtraDefs` 用来做功能开关消融 |
 | `.selfcheck/make_single.ps1` | 由多文件版生成 `single/meArm/meArm.ino` |
 | `.selfcheck/make_serial_single.ps1` | 只把串口通信部分（`protocol_constants.*` + `serial_protocol.*`）拼成 `single/serial/serial_protocol_single.h` |
+| `.selfcheck/make_keypad_single.ps1` | 由 `arduino_keypad/arduino_keypad.ino` 生成按键板单文件交付稿 `single/arduino_keypad/arduino_keypad.ino` |
 | `.selfcheck/make_nocomment.ps1 [-ProbeCheck]` | 生成去注释版，并做严格编译与预处理一致性校验 |
 | `.selfcheck/gh_release.ps1` | 发 Release（走 REST，不需要 `gh` CLI） |
 
@@ -584,6 +591,8 @@ v1.6.7 换模型 + 重标点位后比 v1.6.6 时代大 180 B；v1.6.8 的版本�
 | `weArm_config.h` | 功能开关与容量记录 |
 | `single/meArm/meArm.ino` | 单文件**生成物**（不要手改） |
 | `single/serial/serial_protocol_single.h` | 串口部分的单文件**生成物**（不要手改，也不是给人 include 的） |
+| `single/arduino_keypad/arduino_keypad.ino` | 第二块 Arduino（按键板）的**可直接上传**交付稿（生成物） |
+| `arduino_keypad/` | 按键板源码 `arduino_keypad.ino` + 说明 `README.md` + PC 端状态机复核 `keysim.js` |
 | `.selfcheck/` | 自检设施与权威设计说明 `README.md` |
 
 ## 常见坑
