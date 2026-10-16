@@ -169,6 +169,20 @@
 #define WEARM_CONFIG_H
 
 /* ---------------------------------------------------------------------------
+ * 0) 固件版本号（只用在开机横幅里）
+ *
+ * 为什么要有它：开机横幅从 v1.1.0 起就没变过（"CMD OSHL ABC NRPM0 …"），
+ * 于是**从串口看不出板子上烧的是哪一版固件**——判"我是不是忘了重新上传"
+ * 只能靠猜。把版本号放进横幅后，插上串口一眼就能确认。
+ *
+ * 约定：发版时这里跟着 tag 一起改（tag v1.6.8 -> "1.6.8"）。
+ * 只写数字，别写 'v' 前缀，横幅自己拼 "v"。
+ * ------------------------------------------------------------------------ */
+#ifndef WEARM_FW_VERSION
+#  define WEARM_FW_VERSION "1.6.8"
+#endif
+
+/* ---------------------------------------------------------------------------
  * 1) 串口调试日志总开关
  *    打开后 constant_and_positions / joystick_control / serial_protocol /
  *    pick_place / button_control / draw_control 六个模块都会打印日志。
@@ -857,6 +871,9 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 //                                 超出 0~180 的值在这里硬夹取（x200 最终写 180）
 //                                 语法：字母、可选 '='、逗号分隔、支持小数
 //   A / B / C                     启动物体 A/B/C 的自动取放序列，序列执行期间只有调速指令仍然有效、其它动作指令返回 BUSY
+//                                 【v1.6.8】回复分三态：能启动回 OK；上一段序列还在跑回 BUSY；
+//                                 本次启动被拒（当前位姿/路径校验不过、物体高度或飞行高度
+//                                 规划不出来）回 REJECTED —— 三种情况原因不同，不再混成一个 BUSY
 //   N / R / P / M / 0             四个实体按键的串口孪生（需要「按键」模块已编译且启用，默认已启用）：
 //                                 N=循环取放  R=录制（第一次按下开始，再按一次结束并保存）
 //                                 P=播放录制轨迹  M 或 0=回中。R 不会"无反应"：
@@ -896,8 +913,10 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
  * sees what happened even when the verbose WEARM_DEBUG_SERIAL traces are off:
  *
  *   OK           命令已执行（F 的回复带上图形模式：OK F=<模式>）
- *   BUSY         命令看懂了但机械臂正忙（取放序列/录放/绘图进行中）
- *   REJECTED     这台固件没编进该模块；或绘图轨迹校验不过
+ *   BUSY         命令看懂了但机械臂正忙（取放序列/录放/绘图进行中；
+ *                v1.6.8 起 A/B/C 只在"上一段取放还在跑"时回 BUSY）
+ *   REJECTED     这台固件没编进该模块；或绘图轨迹校验不过；或
+ *                v1.6.8 起 A/B/C 本次启动被拒（位姿/路径/高度）
  *                （x/y/z 角度指令只会按行程夹取，不会因为数值大小被拒）
  *   OFF          固件里有该模块，但被 !P/!B/!D 关掉了
  *   DISCARD      R 结束录制时数据不合格（没位移/没有动作/缓冲满），已丢弃
@@ -925,6 +944,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define PROTO_RES_BAD_SYNTAX    9  /* 像角度指令但语法错（未改动任何状态） */
 #define PROTO_RES_PICK_STARTED 10 /* A/B/C 取放序列已启动 */
 #define PROTO_RES_BUSY         11 /* 动作指令被序列挡下：序列正在执行，或本次请求无法启动 */
+#define PROTO_RES_PICK_REJECTED 28 /* A/B/C 本次启动被拒（当前位姿/路径校验/飞行高度），未改动任何状态 */
 
 /* 按键命令的返回值（N/R/P/M，实现见 button_control.cpp） */
 #define PROTO_RES_REC_STARTED    12 /* R：开始录制 */
@@ -1143,7 +1163,8 @@ void buttonLoop(void);
 
 /* 串口等价命令入口（单个字符）。
  * 返回 PROTO_RES_* （见 serial_protocol.h）：
- *   N -> PROTO_RES_PICK_STARTED / PROTO_RES_BUSY
+ *   N -> PROTO_RES_PICK_STARTED / PROTO_RES_BUSY / PROTO_RES_PICK_REJECTED
+ *        （v1.6.8 起区分：另一段序列还在跑 = BUSY；本次启动被拒 = PICK_REJECTED）
  *   R -> PROTO_RES_REC_STARTED / PROTO_RES_REC_SAVED / PROTO_RES_REC_REJECTED / PROTO_RES_BUSY
  *   P -> PROTO_RES_PLAY_STARTED / PROTO_RES_PLAY_NO_RECORD / PROTO_RES_BUSY
  *   M、0 -> PROTO_RES_HOME_STARTED / PROTO_RES_BUSY
@@ -5866,7 +5887,9 @@ static int btnActionCycle(void) {
     Serial.print(F("[btn] 取放启动失败 rc="));
     Serial.println(rc);
 #endif
-    return PROTO_RES_BUSY;
+    /* 【v1.6.8】-2 = 另一段序列还在跑，回 BUSY；其余（-1/-3/-4/-5）是
+     * 本次启动被拒，回 REJECTED，与串口 A/B/C 的回复口径一致。 */
+    return (rc == -2) ? PROTO_RES_BUSY : PROTO_RES_PICK_REJECTED;
   }
 
 #if WEARM_DEBUG_SERIAL
@@ -6346,12 +6369,18 @@ static const char s_rRej[] PROGMEM = "REJECTED";
  * DISCARD = 录制被丢弃（位移不够 / 没有动作 / 缓冲满），
  * EMPTY = P 时没有任何录制数据。
  * OFF = 固件里有该模块，但用户用 !P/!B/!D 关掉了它；
- * 而 REJECTED 则表示该模块从未被编译进来。 */
+ * 而 REJECTED 则表示该模块从未被编译进来。
+ * 【v1.6.8】A/B/C 也按这条原则拆开：序列正在跑 -> BUSY，
+ * 本次启动被拒（当前位姿/路径校验/飞行高度） -> REJECTED。 */
 static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
+/* 开机横幅：第一段就是固件版本号（WEARM_FW_VERSION，见 weArm_config.h）。
+ * 横幅从 v1.1.0 到 v1.6.7 一直没变，光看串口分不清板子上是哪一版；
+ * 现在插上串口一眼就能确认"我到底重新上传了没有"。 */
+static const char s_rBoot[] PROGMEM = "CMD v" WEARM_FW_VERSION
+    " OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -6569,12 +6598,16 @@ static uint8_t protoCompiledFeatures(void)
 }
 
 /* 按键族结果（N/R/P/M/0）的统一回复，让这几条命令都用同一种方式回答：
- * OK / BUSY / DISCARD / EMPTY / ERR。 */
+ * OK / BUSY / DISCARD / EMPTY / ERR / REJECTED。 */
 static void protoReplyButtonResult(int result)
 {
   (void)result; /* 关闭响应层时用来压掉 -Wunused-parameter 警告 */
   if (result == PROTO_RES_BUSY) {
     R_BUSY();
+  } else if (result == PROTO_RES_PICK_REJECTED) {
+    /* N（=按键1 循环取放）本次启动被拒：与 A/B/C 用同一个回复，
+     * 否则"按键1 没反应"又变成一个看不出原因的 BUSY。 */
+    R_REJ();
   } else if (result == PROTO_RES_REC_REJECTED) {
     R_DISCARD();
   } else if (result == PROTO_RES_PLAY_NO_RECORD) {
@@ -6757,15 +6790,23 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_PICK_C) {
         int object = PICK_OBJECT_A + (cmd - PROTO_CMD_PICK_A);
         int rc = pickPlaceStart(object);
-        /* 0 = 已启动；-2 = 忙；-1/-3 = 这一次启动不了（编号非法 /
-         * 路径校验失败）。这两种都回 BUSY，让主机知道命令被看懂了，
-         * 但序列没有跑起来。 */
+        /* 0 = 已启动；-2 = 忙（另一段序列还在跑）；
+         * -1/-3/-4/-5 = 这一次启动不了（编号非法 / 当前位姿或路径校验不过 /
+         * 物体高度或飞行高度规划不出来）。
+         * 【v1.6.8】这两类必须分开回：以前都回 BUSY，实机上"取放不动"时
+         * 操作者根本分不清是"上一段还在跑"还是"这段压根没通过校验"。
+         * 现在 -2 回 BUSY（机械臂在动），其余的"看懂了但没启动"回 REJECTED，
+         * 与按键族 DISCARD/EMPTY、绘图族 REJECTED 的原则一致。 */
         if (rc == 0) {
           R_OK();
           return PROTO_RES_PICK_STARTED;
         }
-        R_BUSY();
-        return PROTO_RES_BUSY;
+        if (rc == -2) {
+          R_BUSY();
+          return PROTO_RES_BUSY;
+        }
+        R_REJ();
+        return PROTO_RES_PICK_REJECTED;
 
     /* N/R/P/M 与 '0'：四个物理按键的串口孪生。
      * 能不能立刻执行（录制/播放/取放中）由 button_control.cpp 内部判定，

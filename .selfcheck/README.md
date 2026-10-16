@@ -117,6 +117,56 @@ vp1\~vp4 哪一步）。**上机仍须用 `p<z>` 重标纸面高度**（纸铺�
 （`### 当前实测包络`、各轮"本轮实测 / 探针同步 / 上机待确认"小节、末节
 `## 初始位姿改回 (40,0,0)`）都只代表 **v1.6.7 之前**，不要照抄那些数字。
 
+### v1.6.8 串口可诊断性（版本号 + 取放回复三态，工具 `.selfcheck/serialpick.cpp`）
+
+**起因**：用户发来一张 Arduino IDE 串口监视器截图（COM3 / Arduino UNO），四行是
+开机横幅 + `BUSY` + `BUSY` + `REJECTED`。
+
+**查出来的两件事**：
+
+1. **横幅认不出固件版本**。`serial_protocol.cpp` 的 `s_rBoot[]` 是唯一横幅，
+   `git log --all -S"CMD OS" -- serial_protocol.cpp` 只命中 v1.1.0 的那次提交
+   ⇒ 从 v1.1.0 到 v1.6.7 横幅一字未改，**插上串口也看不出板子上是哪一版**。
+   于是截图里那两条 `BUSY` 无法判断是新固件（点位已修好）还是旧固件（点位全不可达）。
+   v1.6.8 起横幅最前面加 `v<版本>`（宏 `WEARM_FW_VERSION`，见 `weArm_config.h` 第 0 节）：
+   `CMD v1.6.8 OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE`。
+2. **`A`/`B`/`C` 把两种完全不同的情况合并成一个 `BUSY`**：`pickPlaceStart()` 返回
+   −2（另一段序列还在跑）与 −1/−3/−4/−5（本次启动被拒：编号非法 / 当前位姿不在自身
+   坐标的 IK 分支上或路径校验不过 / 物体高度出窗、飞行高度规划不出来）以前都回 `BUSY`。
+   v1.6.8 起前者仍回 `BUSY`，后者回 `REJECTED`，新增返回码常量
+   **`PROTO_RES_PICK_REJECTED` = 28**（`serial_protocol.h`）；按键孪生 `N`（按键1 循环取放）
+   走 `button_control.cpp` 的 `btnActionCycle()`，用同一套口径（经
+   `protoReplyButtonResult()` 映射）。截图里第三行的 `REJECTED` 很可能就是本分支
+   没编进绘图模块（`WEARM_ENABLE_DRAW 0`）时绘图族命令（`F`/`D`/`p`/`n`/`o`/`!D`）的回复。
+
+**工具 `.selfcheck/serialpick.cpp`**（链接固件本体，走**真正的串口链路**
+`protoHandleLine()` + 忙守卫，而不是直接调 `pickPlaceStart()`；按 `meArm.ino` 的
+`setup()` 逐条初始化，打印固件真正吐出的那一行、`Pos.rec`/`Pos.ser` 与三个 busy 标志）：
+
+```
+C:\ProgramData\mingw64\mingw64\bin\g++.exe -std=gnu++17 -O2 -Wall -Wextra -I. -I.\.selfcheck\mock `
+  -DWEARM_ENABLE_PICK_PLACE=1 -DWEARM_ENABLE_BUTTONS=1 `
+  .\.selfcheck\serialpick.cpp .\serial_protocol.cpp .\pick_place.cpp .\constant_and_positions.cpp `
+  .\move.cpp .\servo_drive.cpp .\button_control.cpp .\joystick_control.cpp .\draw_control.cpp `
+  .\protocol_constants.cpp .\.selfcheck\mock\Arduino.cpp -o .\.selfcheck\out\serialpick.exe
+```
+
+场景参数 `boot | idle | jog | refuse | draw | all`（默认 `all`）。实测结论
+（**当前固件冷启动时 `A`/`B`/`C` 都回 `OK`**）：
+
+| 场景 | 实测 |
+|---|---|
+| `boot` | `!` → `P=1 B=1 D=0`；`A` → `OK`（rc=10，pick busy 变 1、夹爪 t 105→150）；A 还在跑时 `B` → `BUSY`（rc=11，**这条 BUSY 是合法的**）；排空 40 s 后 `C` → `OK` |
+| `idle` | 空转 30 s（摇杆噪声）后 `A` → 仍然 `OK` |
+| `jog` | `x100` → `rec(-13.89,78.78,118)`、`y100` → `rec(-16.09,91.27,102.89)`；随后 `A` → `OK`（**当前位姿不卡取放**） |
+| `refuse` | 先用角度指令摆到极端位姿再发 `A`（**这就是新加的 `REJECTED` 路径**）：`y45`（r 压到 45 ⇒ `rec(0,0,151.14)`）→ `REJECTED`（rc=28）；`z30`（`rec(0,40,48.72)`）→ `REJECTED`；`y45,z30`（`rec(0,20.71,73.86)`）→ `REJECTED`；`y160,z110`（`rec(0,126.60,4.08)`）→ `REJECTED`；`y160`（`rec(0,102.54,-9.81)`）与 `z110`（`rec(0,75.18,145.36)`）→ `OK` |
+| `draw` | `F`/`D`/`p-6`/`!D` 全部 `REJECTED`（本分支 `WEARM_ENABLE_DRAW 0`，绘图没编进来） |
+
+⇒ 截图那两条 `BUSY` 在当前源码上**从冷启动复现不出来**：最可能是板上烧的还是
+**重选点位之前**的那一版（那时三个物体点位全不可达，每条取放命令都 `BUSY`），
+或当时已经有一段序列在跑。**上机判断顺序：先看横幅里的 `v<版本>`，再确认 `!` 回
+`P=1 B=1 D=0`，然后 `A`。**
+
 ## 为什么需要它
 
 `arduino-cli` 没有装，无法做真正的 AVR 编译；而历史上真正致命的错误
@@ -2009,6 +2059,16 @@ go-home → idle`
 > 仍未标定：纸面高度 `p<z>`（默认 −6 只是"能放进 50×50mm 图形的最低平面"，纸必须垫块）、
 > `DRAW_JOG_INVERT_X/Y/Z`、摇杆方向语义、`KIN_RARM/FARM` 行程真值、调速手感；
 > 绘图 V 字是否正立（`draw` 分支）也还没上机看过。
+>
+> **v1.6.8 更新**（只动可诊断性，运动逻辑一字未改）：容量四个组合各 +36 B ——
+> `pick_place` 默认 **22770 B / 1236 B**（单文件布局 22790 / 1236）、
+> `draw` **28870 B / 1447 B**、取放 + 绘图（按键关）31250 B / 569 B、
+> 三开 34688 B（105.9%，装不进）/ 1486 B、三开 + `-mrelax` 34168 B；
+> `make_single.ps1` 生成 **350550 字节 / 7378 行**。
+> 开机横幅从这一版起带版本号（`CMD v1.6.8 …`），`A`/`B`/`C`/`N` 的
+> "被拒"改回 `REJECTED`（只有"上一段还在跑"才回 `BUSY`）——
+> 见本文件上半部分的「v1.6.8 串口可诊断性」一节与工具 `.selfcheck/serialpick.cpp`。
+> **v1.6.8 尚未打标签**（等上机用横幅确认版本后再发）。
 
 ## PowerShell / 脚本的几个坑
 

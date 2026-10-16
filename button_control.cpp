@@ -525,7 +525,9 @@ static int btnActionCycle(void) {
     Serial.print(F("[btn] 取放启动失败 rc="));
     Serial.println(rc);
 #endif
-    return PROTO_RES_BUSY;
+    /* 【v1.6.8】-2 = 另一段序列还在跑，回 BUSY；其余（-1/-3/-4/-5）是
+     * 本次启动被拒，回 REJECTED，与串口 A/B/C 的回复口径一致。 */
+    return (rc == -2) ? PROTO_RES_BUSY : PROTO_RES_PICK_REJECTED;
   }
 
 #if WEARM_DEBUG_SERIAL

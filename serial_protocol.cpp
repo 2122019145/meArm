@@ -217,12 +217,18 @@ static const char s_rRej[] PROGMEM = "REJECTED";
  * DISCARD = 录制被丢弃（位移不够 / 没有动作 / 缓冲满），
  * EMPTY = P 时没有任何录制数据。
  * OFF = 固件里有该模块，但用户用 !P/!B/!D 关掉了它；
- * 而 REJECTED 则表示该模块从未被编译进来。 */
+ * 而 REJECTED 则表示该模块从未被编译进来。
+ * 【v1.6.8】A/B/C 也按这条原则拆开：序列正在跑 -> BUSY，
+ * 本次启动被拒（当前位姿/路径校验/飞行高度） -> REJECTED。 */
 static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
+/* 开机横幅：第一段就是固件版本号（WEARM_FW_VERSION，见 weArm_config.h）。
+ * 横幅从 v1.1.0 到 v1.6.7 一直没变，光看串口分不清板子上是哪一版；
+ * 现在插上串口一眼就能确认"我到底重新上传了没有"。 */
+static const char s_rBoot[] PROGMEM = "CMD v" WEARM_FW_VERSION
+    " OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -440,12 +446,16 @@ static uint8_t protoCompiledFeatures(void)
 }
 
 /* 按键族结果（N/R/P/M/0）的统一回复，让这几条命令都用同一种方式回答：
- * OK / BUSY / DISCARD / EMPTY / ERR。 */
+ * OK / BUSY / DISCARD / EMPTY / ERR / REJECTED。 */
 static void protoReplyButtonResult(int result)
 {
   (void)result; /* 关闭响应层时用来压掉 -Wunused-parameter 警告 */
   if (result == PROTO_RES_BUSY) {
     R_BUSY();
+  } else if (result == PROTO_RES_PICK_REJECTED) {
+    /* N（=按键1 循环取放）本次启动被拒：与 A/B/C 用同一个回复，
+     * 否则"按键1 没反应"又变成一个看不出原因的 BUSY。 */
+    R_REJ();
   } else if (result == PROTO_RES_REC_REJECTED) {
     R_DISCARD();
   } else if (result == PROTO_RES_PLAY_NO_RECORD) {
@@ -628,15 +638,23 @@ int protoHandleLine(const char *line)
                cmd == PROTO_CMD_PICK_C) {
         int object = PICK_OBJECT_A + (cmd - PROTO_CMD_PICK_A);
         int rc = pickPlaceStart(object);
-        /* 0 = 已启动；-2 = 忙；-1/-3 = 这一次启动不了（编号非法 /
-         * 路径校验失败）。这两种都回 BUSY，让主机知道命令被看懂了，
-         * 但序列没有跑起来。 */
+        /* 0 = 已启动；-2 = 忙（另一段序列还在跑）；
+         * -1/-3/-4/-5 = 这一次启动不了（编号非法 / 当前位姿或路径校验不过 /
+         * 物体高度或飞行高度规划不出来）。
+         * 【v1.6.8】这两类必须分开回：以前都回 BUSY，实机上"取放不动"时
+         * 操作者根本分不清是"上一段还在跑"还是"这段压根没通过校验"。
+         * 现在 -2 回 BUSY（机械臂在动），其余的"看懂了但没启动"回 REJECTED，
+         * 与按键族 DISCARD/EMPTY、绘图族 REJECTED 的原则一致。 */
         if (rc == 0) {
           R_OK();
           return PROTO_RES_PICK_STARTED;
         }
-        R_BUSY();
-        return PROTO_RES_BUSY;
+        if (rc == -2) {
+          R_BUSY();
+          return PROTO_RES_BUSY;
+        }
+        R_REJ();
+        return PROTO_RES_PICK_REJECTED;
 
     /* N/R/P/M 与 '0'：四个物理按键的串口孪生。
      * 能不能立刻执行（录制/播放/取放中）由 button_control.cpp 内部判定，
