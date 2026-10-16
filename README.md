@@ -271,9 +271,9 @@ r = 90° − α ,  c = β + 90°                      # 再按 360° 周期折�
 | 宏 | 默认 | 作用 |
 | --- | --- | --- |
 | `WEARM_DEBUG_SERIAL` | 0 | 1 = 6 个模块的中文调试日志（+9260 B flash），并退回 HardwareSerial |
-| `WEARM_ENABLE_PICK_PLACE` | 1 | 取放 A/B/C |
+| `WEARM_ENABLE_PICK_PLACE` | **0** | 取放 A/B/C（本分支默认关；取放在 `pick_place` 分支，见下） |
 | `WEARM_ENABLE_BUTTONS` | 1 | 录制 / 播放 / 回中 / 循环取放（串口 `N/R/P/M/0`） |
-| `WEARM_ENABLE_DRAW` | **0** | 绘图与纸面标定（本分支默认关；绘图在 `draw` 分支，见下） |
+| `WEARM_ENABLE_DRAW` | 1 | 绘图与纸面标定（本分支默认开） |
 | `WEARM_MIRROR_BASE` | 1 | 基座反向装配（`180 − b`） |
 | `WEARM_MIRROR_TOOL` | 1 | 夹爪反向装配（`210 − f`） |
 | `WEARM_BUTTON_PINS` | 0 | 0 = 完全不读 D2\~D5；1 = 四键 INPUT_PULLUP |
@@ -304,13 +304,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
 
 取放模块按"8 步取放路径 + 物体高度 ±10cm 自适应"重写后，**三个功能全开是 34542 B，
 比 Uno 可用的 32256 B 多 2286 B**，Arduino IDE 会直接报 `Sketch too big`。
-所以绘图模块被独立到 `draw` 分支，两边源码完全相同，只有 `weArm_config.h` 第 2 节
+所以绘图与取放被拆成两个分支，两边源码完全相同，只有 `weArm_config.h` 第 2 节
 的两行开关数字不同：
 
 | 分支 | 配置 | flash | SRAM |
 | --- | --- | --- | --- |
-| `pick_place`（本分支） | 取放 + 按键，绘图关 | **22554 B（68.8%）**，余 9702 B | 1235 B（60.3%） |
-| `draw` | 绘图 + 按键，取放关 | **29048 B（88.6%）**，余 3208 B | 1447 B（70.7%） |
+| `pick_place` | 取放 + 按键，绘图关 | **22554 B（68.8%）**，余 9702 B | 1235 B（60.3%） |
+| `draw`（本分支） | 绘图 + 按键，取放关 | **29048 B（88.6%）**，余 3208 B | 1447 B（70.7%） |
 
 切分支 → 重新编译 → 重新烧写即可切换功能（一块板子一次只能装一套）。
 想在一个固件里同时要取放和绘图：关掉按键模块（取放 + 绘图 = 31092 B，装得下），
@@ -322,8 +322,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
 | --- | --- | --- |
 | 取放 + 按键 + 绘图 | 34542 B（105.4%）**装不进 Uno** | 1485 B（72.5%） |
 | 取放 + 绘图 + 按键关 | 31092 B（94.9%） | 568 B（27.7%） |
-| 取放 + 按键 + 绘图关（本分支默认） | **22554 B（68.8%）** | 1235 B（60.3%） |
-| 绘图 + 按键 + 取放关（`draw` 分支默认） | 29048 B（88.6%） | 1447 B（70.7%） |
+| 取放 + 按键 + 绘图关（`pick_place` 分支默认） | **22554 B（68.8%）** | 1235 B（60.3%） |
+| 绘图 + 按键 + 取放关（本分支默认） | **29048 B（88.6%）** | 1447 B（70.7%） |
 | 三开 + `-mrelax`（仅供参考） | 34022 B（103.8%）**仍超限** | 1485 B（72.5%） |
 
 各分支都用 Arduino IDE 原样的链接参数就装得下，**不需要 `-mrelax`**。
@@ -331,8 +331,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
 把 `validatePath()` 曲线段的采样改走共用的 `pathCoreSegmentOk()` 等清理腾出了空间；
 本轮取放重写又花掉 2516 B —— 增量花在新路径本身，不是内联或冗余。）
 
-单文件版与多文件版几乎相同（本分支实测 22574 B / 1235 B，差 20 B —— 合并成单个 TU 后
-LTO 的内联结果略有不同，属正常）。
+单文件版与多文件版几乎相同（本分支实测 29048 B / 1447 B，与多文件完全相同 —— 合并成单个 TU 后
+LTO 的内联结果略有不同，两个分支各差 0~20 B，属正常）。
 **本工程尚未在实体 Uno 上烧录验证过**，
 上机确认清单见 `.selfcheck/README.md`。
 

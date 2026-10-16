@@ -43,17 +43,18 @@
  *   WEARM_DEBUG_SERIAL        1 -> 在串口上打印各模块的中文调试日志
  *                             （实测 +9260 B，很占 flash，排故时才开；
  *                              打开后会退回 Arduino Serial，见上面 1)）
- *   WEARM_ENABLE_PICK_PLACE   1 -> 取放序列（串口 A/B/C、按键1 循环取放）
+ *   WEARM_ENABLE_PICK_PLACE   0 -> 取放序列（串口 A/B/C、按键1 循环取放；
+ *                             **本分支 draw 默认 0**，在 pick_place 分支里是 1）
  *   WEARM_ENABLE_BUTTONS      1 -> 按键模块（录制/播放/回中/循环取放，串口 N/R/P/M/0）
- *   WEARM_ENABLE_DRAW         1 -> 绘图（铅笔轨迹，v1.0.0 的功能；**本分支默认 0**）
+ *   WEARM_ENABLE_DRAW         1 -> 绘图（铅笔轨迹，v1.0.0 的功能；本分支**默认 1**）
  *   WEARM_BUTTON_PINS         0 -> 不读 D2~D5 的物理按键（默认，本机没有独立按键）
  *                             1 -> 四个独立按键接 D2~D5（INPUT_PULLUP、按下接地）
  *   WEARM_REC_TICK_MS       200 -> 录制采样周期（ms）；越小回放越顺、录得越短
  *   WEARM_REC_ENTRIES       192 -> 录制缓冲条数（× 4 字节 SRAM）＝ 单次录制上限
  *                                  （192 × 200 ms = 38.4 秒、768 B SRAM，见第 5 节）
  *
- * 【本分支 pick_place】取放 + 按键 开、绘图**关**（= 22554 B，装得下）。
- * 绘图在 draw 分支（绘图 + 按键 开、取放**关**，29048 B）。两个分支的源码完全一样，
+ * 【本分支 draw】绘图 + 按键 开、取放**关**（= 29048 B，装得下）。
+ * 取放在 pick_place 分支（取放 + 按键 开、绘图**关**，22554 B）。两个分支的源码完全一样，
  * 差别只有下面第 2 节里 WEARM_ENABLE_DRAW / WEARM_ENABLE_PICK_PLACE 这两行数字。
  * 想在一个构里同时要两个功能：关掉按键模块（取放 + 绘图 + 按键关 = 31092 B，装得下），
  * 代价是串口 N/R/P/M/0（录制/回放/回中/循环取放）全没了。
@@ -184,9 +185,11 @@
  * 2) 功能裁剪开关
  * ------------------------------------------------------------------------ */
 
-/* 取放序列：把 A/B/C 三个物体夹到各自的放置点（串口 A/B/C，按键1 循环） */
+/* 取放序列：把 A/B/C 三个物体夹到各自的放置点（串口 A/B/C，按键1 循环）。
+ * 【本分支 draw 默认 0】取放模块在 pick_place 分支里编（那边绘图 0、取放 1，22554 B）；
+ * 取放模块体积大（边际量 5494 B），和绘图放一起会超出 Uno 的 flash。 */
 #ifndef WEARM_ENABLE_PICK_PLACE
-#  define WEARM_ENABLE_PICK_PLACE 1
+#  define WEARM_ENABLE_PICK_PLACE 0
 #endif
 
 /* 按键模块：录制 / 播放 / 回中 / 循环取放。
@@ -197,12 +200,12 @@
 #endif
 
 /* 绘图：铅笔轨迹绘制（v1.0.0 新增，串口 F/D/G/E/Q/U/W/p/n/o）。
- * 【本分支 pick_place 默认 0】"取放 + 按键 + 绘图"三开是 34542 B，比 Uno 可用的
- * 32256 B 多 2286 B（Arduino IDE 报 Sketch too big），所以绘图模块独立到 draw
- * 分支去编：那边取放 0、绘图 1，实编 29048 B。代码都在，只是不在这一版里。
+ * 【本分支 draw 默认 1】"取放 + 按键 + 绘图"三开是 34542 B，比 Uno 可用的
+ * 32256 B 多 2286 B（Arduino IDE 报 Sketch too big），所以取放模块独立到
+ * pick_place 分支去编：那边绘图 0、取放 1，实编 22554 B。代码都在，只是不在这一版里。
  * PC 端自检不受影响：run_all.ps1 用 -D 把三个开关全部覆盖回 1 再编探针。 */
 #ifndef WEARM_ENABLE_DRAW
-#  define WEARM_ENABLE_DRAW 0
+#  define WEARM_ENABLE_DRAW 1
 #endif
 
 /* ---------------------------------------------------------------------------
