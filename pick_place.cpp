@@ -212,6 +212,15 @@ static double s_toX = 0.0, s_toY = 0.0, s_toZ = 0.0;         /* 移动段终点 
  * 由 pickPlaceStart() 写入；见 planTravelZ()。 */
 static double s_travelZ = 0.0;
 
+/* 首段（PICK_ST_RISE_SRC）的终点选哪一处：
+ *   0 = "起点正上方"（当前 x/y + 飞行高度），常规情况；
+ *   1 = "物体正上方"（物体 x/y + 飞行高度），起点正上方在飞行高度上无解时用。
+ * 后者出现在"起点完全伸直"的姿态上 —— 上电初始位姿 (b,r,c)=(90,90,90) 对应
+ * (40,0,0)，rho 已取到最大值 L1+L2=40，而 rho=40 只在 z=0 成立，所以任何抬升
+ * 都无解。此时直接关节插值到物体上方（实测末端全程不低于飞行高度，不会蹭到
+ * 物体顶面），再接原有的"水平移到物体后方"等后续段。由 planTravelZ() 写入。 */
+static bool s_riseAtSrc = false;
+
 /* ==================== 小工具 ==================== */
 
 /* Fetch one coordinate of a table point.
@@ -294,8 +303,9 @@ durationMs(double degrees, double rateDps) {
  * sqrt(rho² + z²) ≤ 40，物体越高可达的水平半径越小：+10cm（z=+25）的物体，
  * 5cm 的飞行高度要求 rho ≤ 13.9 单位，绝大多数取放点都做不到。这时按
  * PICK_TRAVEL_STEP 逐档降低飞行高度，直到下面七个关键点全部可解：
- *     起点正上方 / 物体后方(飞行高度) / 物体正上方(飞行高度) /
- *     目标点正上方 / 物体后方(物体同高) / 物体同高 / 目标同高
+ *     起点正上方(不可达时改"物体正上方") / 物体后方(飞行高度) /
+ *     物体正上方(飞行高度) / 目标点正上方 / 物体后方(物体同高) /
+ *     物体同高 / 目标同高
  * 因为每一段只在一个 z 上（或一根竖直线上）走，而判据对 rho、|z| 单调，
  * 端点可解就等价于整段可解，所以先只查端点，确认后再由调用方做整段采样校验。
  *
@@ -311,13 +321,17 @@ static bool planTravelZ(const double *src, const double *dst, const double *behi
     const double z = top + PICK_LIFT_DZ - (double)i * PICK_TRAVEL_STEP;
     if (z < zMin - 1e-9) break;
     double b = 0.0, r = 0.0, c = 0.0;
-    if (!pathCorePointOk(fromX, fromY, z, &b, &r, &c)) continue;
+    /* 首段终点：优先"起点正上方"，起点位于可达边界（上电初始位姿 (40,0,0)）
+     * 时它在任何 z != 0 都无解，退化为"物体正上方"（见 s_riseAtSrc）。 */
+    const bool riseInPlace = pathCorePointOk(fromX, fromY, z, &b, &r, &c);
+    if (!riseInPlace && !pathCorePointOk(src[0], src[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(behind[0], behind[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(src[0], src[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(dst[0], dst[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(behind[0], behind[1], src[2], &b, &r, &c)) continue;
     if (!pathCorePointOk(src[0], src[1], src[2], &b, &r, &c)) continue;
     if (!pathCorePointOk(dst[0], dst[1], dst[2], &b, &r, &c)) continue;
+    s_riseAtSrc = !riseInPlace;
     *outZ = z;
     return true;
   }
@@ -618,9 +632,13 @@ int pickPlaceStart(int object) {
    *      起点 -> 起点正上方(飞行高度) -> 物体后方(飞行高度) -> 物体后方(物体同高)
    *      -> 物体同高 -> 物体正上方(飞行高度) -> 目标正上方(飞行高度) -> 目标同高
    *    返回 HOME 那一段走关节插值，不需要也不该做笛卡尔校验。 */
+  /* 首段终点必须与 planTravelZ 的选择一致：常规是"起点正上方"，起点位于
+   * 可达边界（上电初始位姿 (40,0,0)）时是"物体正上方"，见 s_riseAtSrc。 */
   double path[8][3];
   path[0][0] = Pos.rec.x; path[0][1] = Pos.rec.y; path[0][2] = Pos.rec.z;
-  path[1][0] = Pos.rec.x; path[1][1] = Pos.rec.y; path[1][2] = travelZ;
+  path[1][0] = s_riseAtSrc ? src[0] : Pos.rec.x;
+  path[1][1] = s_riseAtSrc ? src[1] : Pos.rec.y;
+  path[1][2] = travelZ;
   path[2][0] = behind[0]; path[2][1] = behind[1]; path[2][2] = travelZ;
   path[3][0] = behind[0]; path[3][1] = behind[1]; path[3][2] = src[2];
   path[4][0] = src[0];    path[4][1] = src[1];    path[4][2] = src[2];
@@ -671,10 +689,13 @@ int pickPlaceStart(int object) {
    * 之后（向前 2cm 把物体送进两爪之间）才开始。 */
   (void) posSetAngle4(PICK_TOOL_OPEN_ANGLE);
 
-  /* 第一段：垂直上移到飞行高度（x/y 不动），也就是"先上移到物体高度+5cm" */
+  /* 第一段：抬到飞行高度，也就是"先上移到物体高度+5cm"。
+   * 常规是原地垂直上移（x/y 不动）；起点已经伸到可达边界（上电初始位姿
+   * (40,0,0)）时改为一站直接到"物体正上方"——关节插值的末端轨迹实测全程
+   * 不低于飞行高度，不会蹭到物体顶面，见 s_riseAtSrc。 */
   double up[3];
-  up[0] = Pos.rec.x;
-  up[1] = Pos.rec.y;
+  up[0] = s_riseAtSrc ? src[0] : Pos.rec.x;
+  up[1] = s_riseAtSrc ? src[1] : Pos.rec.y;
   up[2] = travelZ;
   beginMove(PICK_ST_RISE_SRC, up);
   return 0;

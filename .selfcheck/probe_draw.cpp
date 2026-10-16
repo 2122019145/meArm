@@ -747,10 +747,10 @@ int main(void) {
     {
       double first[3];
       bool has = firstSampleOf(DRAW_PHASE_TRAVEL, first);
-      snprintf(d, sizeof d, "抬笔起点 (%.2f,%.2f,%.2f)（待机位 20,0,-10）",
+      snprintf(d, sizeof d, "抬笔起点 (%.2f,%.2f,%.2f)（初始位姿 40,0,0）",
                has ? first[0] : 0.0, has ? first[1] : 0.0, has ? first[2] : 0.0);
-      check("先回待机位再走向第一个目标点",
-            has && fabs(first[0] - 20.0) < 1.0 && fabs(first[1]) < 1.0 && fabs(first[2] + 10.0) < 1.0, d);
+      check("先回初始位姿再走向第一个目标点",
+            has && fabs(first[0] - 40.0) < 1.0 && fabs(first[1]) < 1.0 && fabs(first[2]) < 1.0, d);
     }
     check("画完并回到待机", done && drawGetPhase() == DRAW_PHASE_IDLE, drawStateName());
 

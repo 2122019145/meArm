@@ -1515,8 +1515,8 @@ int drawLastResult(void);
 //     b (angle1) 90° -> 基座朝 +x 方向；b 行程 0~180° 使可达空间只占 x >= 0 一侧
 //     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下
 //     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上
-//   初始位姿 POS_HOME = (20, 0, -10) -> (b,r,c,f) ≈ (90, 60.55, 7.43, 105)
-//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   初始位姿 POS_HOME = (40, 0, 0) -> (b,r,c,f) = (90, 90, 90, 105)
+//   （两节水平朝前、完全伸直，落在可达外边界 rho = 40 上；这是上电姿态）。
 //   正运动学: alpha = 90 - r, beta = c - 90,
 //             x_planar = L1 cos alpha + L2 cos beta,
 //             z = L1 sin alpha + L2 sin beta + armheight,
@@ -1763,12 +1763,18 @@ void servoDriveWrite(uint8_t ch, double deg) {
   #define WEARM_LOG(msg)   ((void)0)
 #endif
 
-/* 复位目标点：工作空间内部的安全点。
- * 选 (20,0,-10)：折叠回缩的安全位姿，末端在绘图区正上方、纸面（z=-20）之上。
- * 反解为 (b,r,c)=(90, 60.55, 7.43)：上臂上抬 29.45°、小臂下垂 82.57°，
- * 开机即收拢、不占桌面也不甩臂。x=20 落在 z=-10 的可达半径 [17.2, 38.7] 内部，
- * 三个方向 x+/y+/z- 都能继续点动（避开 x≈40 的外边界与 x≈17 的内边界）。 */
-static const REC POS_HOME = { 20, 0, -10 };
+/* 复位目标点 = **上电初始位姿**（用户标定：初始状态下三个位姿舵机的角度必须是
+ * x90, y90, z90，即 (b,r,c) = (90,90,90)；旧版 v1.6.5 的注释也是这么写的）。
+ * 修正模型（alpha = 90 - r、beta = c - 90）下这个姿态对应末端 (40, 0, 0)：
+ * alpha = beta = theta = 0，两节都水平朝前 —— 完全伸直的姿态，恰好落在可达
+ * 外边界 rho = L1 + L2 = 40 上（probe_rt 的 anchor "(40.00, 0.00, 0.00) PASS"）。
+ * 落在边界上的代价只有一条：从这一点**无法再向外伸**（rho 已经取到最大），
+ * 因此"就地垂直抬升"也无解 —— rho = 40 只在 z = 0 成立。取放模块为此改成
+ * 起点不可达就直接插值到"物体正上方(飞行高度)"，见 pick_place.cpp 的 s_riseAtSrc。
+ * x = 40 同时在 limit 盒子的边界上，判据是闭区间，仍算"在盒内"。
+ * 【历史】曾改成 (20,0,-10)（反解 b=90、r=60.55、c=7.43 的折叠位姿）以避开边界，
+ * 但那会让上电姿态偏离 x90,y90,z90，已按用户要求改回。 */
+static const REC POS_HOME = { 40, 0, 0 };
 
 /* 机械臂几何参数（上臂长 / 下臂长 / 末端伸出量） */
 struct arm arm1 = { 20, 20, 0 };
@@ -2139,10 +2145,10 @@ int rangeLimitConfig(void) {
   return bad;
 }
 
-/* 复位到工作空间内的安全初始点。
+/* 复位到初始位姿 POS_HOME（= 上电姿态，三个位姿舵机 x90,y90,z90）。
  * 【本版本恢复】开机先跑 rangeLimitConfig() 对 limit 配置做一次自检；
  * rangeClampConfig()、servoSelfCheck()、clampToRange() 仍是删除状态
- * （servoLimit 那套没恢复，POS_HOME 本身就在工作空间内部，不需要夹取）。 */
+ * （servoLimit 那套没恢复，POS_HOME 本身就能反解，不需要夹取）。 */
 void posInit(void) {
   (void) rangeLimitConfig();
 
@@ -2184,7 +2190,7 @@ void posInit(void) {
 
 /* 取"开机初始位姿"对应的关节角，写给按键4 回中用。
  * 【本版本已删除 clampToRange() 调用】：坐标范围限制已整体移除，
- * POS_HOME 本身就在工作空间内部，直接反解即可。 */
+ * POS_HOME 直接反解即可（它在可达外边界上，属于闭区间内，能解出 90/90/90）。 */
 bool posGetHomeAngles(SER *ser) {
   if (ser == NULL) return false;
 
@@ -3254,6 +3260,15 @@ static double s_toX = 0.0, s_toY = 0.0, s_toZ = 0.0;         /* 移动段终点 
  * 由 pickPlaceStart() 写入；见 planTravelZ()。 */
 static double s_travelZ = 0.0;
 
+/* 首段（PICK_ST_RISE_SRC）的终点选哪一处：
+ *   0 = "起点正上方"（当前 x/y + 飞行高度），常规情况；
+ *   1 = "物体正上方"（物体 x/y + 飞行高度），起点正上方在飞行高度上无解时用。
+ * 后者出现在"起点完全伸直"的姿态上 —— 上电初始位姿 (b,r,c)=(90,90,90) 对应
+ * (40,0,0)，rho 已取到最大值 L1+L2=40，而 rho=40 只在 z=0 成立，所以任何抬升
+ * 都无解。此时直接关节插值到物体上方（实测末端全程不低于飞行高度，不会蹭到
+ * 物体顶面），再接原有的"水平移到物体后方"等后续段。由 planTravelZ() 写入。 */
+static bool s_riseAtSrc = false;
+
 /* ==================== 小工具 ==================== */
 
 /* Fetch one coordinate of a table point.
@@ -3336,8 +3351,9 @@ durationMs(double degrees, double rateDps) {
  * sqrt(rho² + z²) ≤ 40，物体越高可达的水平半径越小：+10cm（z=+25）的物体，
  * 5cm 的飞行高度要求 rho ≤ 13.9 单位，绝大多数取放点都做不到。这时按
  * PICK_TRAVEL_STEP 逐档降低飞行高度，直到下面七个关键点全部可解：
- *     起点正上方 / 物体后方(飞行高度) / 物体正上方(飞行高度) /
- *     目标点正上方 / 物体后方(物体同高) / 物体同高 / 目标同高
+ *     起点正上方(不可达时改"物体正上方") / 物体后方(飞行高度) /
+ *     物体正上方(飞行高度) / 目标点正上方 / 物体后方(物体同高) /
+ *     物体同高 / 目标同高
  * 因为每一段只在一个 z 上（或一根竖直线上）走，而判据对 rho、|z| 单调，
  * 端点可解就等价于整段可解，所以先只查端点，确认后再由调用方做整段采样校验。
  *
@@ -3353,13 +3369,17 @@ static bool planTravelZ(const double *src, const double *dst, const double *behi
     const double z = top + PICK_LIFT_DZ - (double)i * PICK_TRAVEL_STEP;
     if (z < zMin - 1e-9) break;
     double b = 0.0, r = 0.0, c = 0.0;
-    if (!pathCorePointOk(fromX, fromY, z, &b, &r, &c)) continue;
+    /* 首段终点：优先"起点正上方"，起点位于可达边界（上电初始位姿 (40,0,0)）
+     * 时它在任何 z != 0 都无解，退化为"物体正上方"（见 s_riseAtSrc）。 */
+    const bool riseInPlace = pathCorePointOk(fromX, fromY, z, &b, &r, &c);
+    if (!riseInPlace && !pathCorePointOk(src[0], src[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(behind[0], behind[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(src[0], src[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(dst[0], dst[1], z, &b, &r, &c)) continue;
     if (!pathCorePointOk(behind[0], behind[1], src[2], &b, &r, &c)) continue;
     if (!pathCorePointOk(src[0], src[1], src[2], &b, &r, &c)) continue;
     if (!pathCorePointOk(dst[0], dst[1], dst[2], &b, &r, &c)) continue;
+    s_riseAtSrc = !riseInPlace;
     *outZ = z;
     return true;
   }
@@ -3660,9 +3680,13 @@ int pickPlaceStart(int object) {
    *      起点 -> 起点正上方(飞行高度) -> 物体后方(飞行高度) -> 物体后方(物体同高)
    *      -> 物体同高 -> 物体正上方(飞行高度) -> 目标正上方(飞行高度) -> 目标同高
    *    返回 HOME 那一段走关节插值，不需要也不该做笛卡尔校验。 */
+  /* 首段终点必须与 planTravelZ 的选择一致：常规是"起点正上方"，起点位于
+   * 可达边界（上电初始位姿 (40,0,0)）时是"物体正上方"，见 s_riseAtSrc。 */
   double path[8][3];
   path[0][0] = Pos.rec.x; path[0][1] = Pos.rec.y; path[0][2] = Pos.rec.z;
-  path[1][0] = Pos.rec.x; path[1][1] = Pos.rec.y; path[1][2] = travelZ;
+  path[1][0] = s_riseAtSrc ? src[0] : Pos.rec.x;
+  path[1][1] = s_riseAtSrc ? src[1] : Pos.rec.y;
+  path[1][2] = travelZ;
   path[2][0] = behind[0]; path[2][1] = behind[1]; path[2][2] = travelZ;
   path[3][0] = behind[0]; path[3][1] = behind[1]; path[3][2] = src[2];
   path[4][0] = src[0];    path[4][1] = src[1];    path[4][2] = src[2];
@@ -3713,10 +3737,13 @@ int pickPlaceStart(int object) {
    * 之后（向前 2cm 把物体送进两爪之间）才开始。 */
   (void) posSetAngle4(PICK_TOOL_OPEN_ANGLE);
 
-  /* 第一段：垂直上移到飞行高度（x/y 不动），也就是"先上移到物体高度+5cm" */
+  /* 第一段：抬到飞行高度，也就是"先上移到物体高度+5cm"。
+   * 常规是原地垂直上移（x/y 不动）；起点已经伸到可达边界（上电初始位姿
+   * (40,0,0)）时改为一站直接到"物体正上方"——关节插值的末端轨迹实测全程
+   * 不低于飞行高度，不会蹭到物体顶面，见 s_riseAtSrc。 */
   double up[3];
-  up[0] = Pos.rec.x;
-  up[1] = Pos.rec.y;
+  up[0] = s_riseAtSrc ? src[0] : Pos.rec.x;
+  up[1] = s_riseAtSrc ? src[1] : Pos.rec.y;
   up[2] = travelZ;
   beginMove(PICK_ST_RISE_SRC, up);
   return 0;
@@ -3880,7 +3907,7 @@ bool pickPlacePlanZ(int object, double *z) {
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
 /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z。
- * 待机位末端是 (20,0,-10)（折叠回缩姿态），纸面在肩轴**下方**
+ * 初始位姿末端是 (40,0,0)（两节水平朝前、完全伸直），纸面在肩轴**下方**
  * （z < 0）才可能被笔尖碰到。默认取 -20（肩轴下方 20 单位 ≈ 80 mm 的台面）。
  * 上机可用 p<z> 随时重标（注意新模型下 x 越小、可达的竖向深度越浅，纸面别离肩轴太近）。 */
 #define DRAW_PEN_Z_DEFAULT    -20.0
@@ -7137,8 +7164,9 @@ void serialProtocolBegin(void)
 //     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下；
 //     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上。
 //   alpha = 90 - r、beta = c - 90（肩轴反转、肘轴正转，见 RC-robot-hand 标定）。
-//   初始位姿 POS_HOME = (20, 0, -10)，即 (b,r,c,f) ≈ (90, 60.55, 7.43, f 中位)
-//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   初始位姿 POS_HOME = (40, 0, 0)，即 (b,r,c,f) = (90, 90, 90, f 中位)：
+//   上臂、下臂都水平朝前，完全伸直的姿态，落在可达外边界 rho = L1+L2 = 40 上
+//   （不能也不需要在开机时避开边界：这是用户标定的上电姿态）。
 //   关节限位内的实测可达包络（probe_axes 扫组合，余量由探针打印）:
 //     x[0.00, 40.00] y[-40.00, 40.00] z[-40.00, 40.00]
 //   limit 本版取 x/y ±40、z -40~40（与可达包络一致，两杆各 20、关节 0~180°）。

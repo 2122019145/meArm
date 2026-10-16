@@ -63,14 +63,17 @@ int main(void) {
 
   printf("=== 0) 起点核对 ===\n");
   {
-    double d = dist(&Pos.rec, 20.0, 0.0, -10.0);
+    double d = dist(&Pos.rec, 40.0, 0.0, 0.0);
     snprintf(buf, sizeof(buf), "Pos=(%.2f,%.2f,%.2f) b=%.2f r=%.2f c=%.2f f=%.2f 自洽=%d",
              Pos.rec.x, Pos.rec.y, Pos.rec.z,
              Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3, Pos.ser.angle4,
              selfConsistent() ? 1 : 0);
-    check("home=(20,0,-10)、在 limit 内、坐标与角度自洽",
+    check("home=(40,0,0)、在 limit 内（±40 闭区间边界）、坐标与角度自洽",
           d < 1e-6 && selfConsistent() &&
           Pos.ser.angle4 >= TOOL_ANGLE_MIN && Pos.ser.angle4 <= TOOL_ANGLE_MAX, buf);
+    check("home 的三个位姿舵机角 = 90/90/90（用户标定的上电初始状态）",
+          fabs(Pos.ser.angle1 - 90.0) < 1e-6 && fabs(Pos.ser.angle2 - 90.0) < 1e-6 &&
+          fabs(Pos.ser.angle3 - 90.0) < 1e-6, buf);
   }
 
   printf("=== 1) 六个定长方向各走一步：目标关节正好 ±1 度，其它关节不动 ===\n");
@@ -195,7 +198,10 @@ int main(void) {
             "越界点在采样阶段就被 limit 挡掉");
       check("x=41（超出 maxX=40）被点校验拒绝",
             !pathCorePointOk(41.0, 0.0, 20.0, &bb, &rr, &cc), "x 越界同样拒");
-      check("盒内的 home(20,0,-10) 被接受",
+      check("位于可达边界的 home(40,0,0) 被点校验接受（±40 是闭区间）",
+            pathCorePointOk(40.0, 0.0, 0.0, &bb, &rr, &cc),
+            "边界点必须能解 —— 上电初始位姿就落在这里");
+      check("盒内的普通点 (20,0,-10) 被接受",
             pathCorePointOk(20.0, 0.0, -10.0, &bb, &rr, &cc),
             "在盒子内 + 可达 + 反解不被吸附");
     }

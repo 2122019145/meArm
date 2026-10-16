@@ -16,12 +16,18 @@
   #define WEARM_LOG(msg)   ((void)0)
 #endif
 
-/* 复位目标点：工作空间内部的安全点。
- * 选 (20,0,-10)：折叠回缩的安全位姿，末端在绘图区正上方、纸面（z=-20）之上。
- * 反解为 (b,r,c)=(90, 60.55, 7.43)：上臂上抬 29.45°、小臂下垂 82.57°，
- * 开机即收拢、不占桌面也不甩臂。x=20 落在 z=-10 的可达半径 [17.2, 38.7] 内部，
- * 三个方向 x+/y+/z- 都能继续点动（避开 x≈40 的外边界与 x≈17 的内边界）。 */
-static const REC POS_HOME = { 20, 0, -10 };
+/* 复位目标点 = **上电初始位姿**（用户标定：初始状态下三个位姿舵机的角度必须是
+ * x90, y90, z90，即 (b,r,c) = (90,90,90)；旧版 v1.6.5 的注释也是这么写的）。
+ * 修正模型（alpha = 90 - r、beta = c - 90）下这个姿态对应末端 (40, 0, 0)：
+ * alpha = beta = theta = 0，两节都水平朝前 —— 完全伸直的姿态，恰好落在可达
+ * 外边界 rho = L1 + L2 = 40 上（probe_rt 的 anchor "(40.00, 0.00, 0.00) PASS"）。
+ * 落在边界上的代价只有一条：从这一点**无法再向外伸**（rho 已经取到最大），
+ * 因此"就地垂直抬升"也无解 —— rho = 40 只在 z = 0 成立。取放模块为此改成
+ * 起点不可达就直接插值到"物体正上方(飞行高度)"，见 pick_place.cpp 的 s_riseAtSrc。
+ * x = 40 同时在 limit 盒子的边界上，判据是闭区间，仍算"在盒内"。
+ * 【历史】曾改成 (20,0,-10)（反解 b=90、r=60.55、c=7.43 的折叠位姿）以避开边界，
+ * 但那会让上电姿态偏离 x90,y90,z90，已按用户要求改回。 */
+static const REC POS_HOME = { 40, 0, 0 };
 
 /* 机械臂几何参数（上臂长 / 下臂长 / 末端伸出量） */
 struct arm arm1 = { 20, 20, 0 };
@@ -392,10 +398,10 @@ int rangeLimitConfig(void) {
   return bad;
 }
 
-/* 复位到工作空间内的安全初始点。
+/* 复位到初始位姿 POS_HOME（= 上电姿态，三个位姿舵机 x90,y90,z90）。
  * 【本版本恢复】开机先跑 rangeLimitConfig() 对 limit 配置做一次自检；
  * rangeClampConfig()、servoSelfCheck()、clampToRange() 仍是删除状态
- * （servoLimit 那套没恢复，POS_HOME 本身就在工作空间内部，不需要夹取）。 */
+ * （servoLimit 那套没恢复，POS_HOME 本身就能反解，不需要夹取）。 */
 void posInit(void) {
   (void) rangeLimitConfig();
 
@@ -437,7 +443,7 @@ void posInit(void) {
 
 /* 取"开机初始位姿"对应的关节角，写给按键4 回中用。
  * 【本版本已删除 clampToRange() 调用】：坐标范围限制已整体移除，
- * POS_HOME 本身就在工作空间内部，直接反解即可。 */
+ * POS_HOME 直接反解即可（它在可达外边界上，属于闭区间内，能解出 90/90/90）。 */
 bool posGetHomeAngles(SER *ser) {
   if (ser == NULL) return false;
 
