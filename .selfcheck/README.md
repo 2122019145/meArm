@@ -2425,6 +2425,48 @@ GitHub Release：
 owner）+ GitHub Release 列表 + 本地交付物（`rel_*.md`、`single/meArm/meArm.ino`、
 `make_single.ps1`）+ `git status`。`-Watch -IntervalSec 60` 每 60 秒刷一次。
 
+## 串口部分单文件整合 —— `.selfcheck/make_serial_single.ps1`
+
+需求是"把**串口通信部分**单独打包成一个文件"（不是整个固件，那个是上面的
+`make_single.ps1`）。`.selfcheck/make_serial_single.ps1` 把串口子系统的 4 个文件按依赖
+顺序拼成 `single/serial/serial_protocol_single.h`（本机实测 56281 B / 1345 行）：
+
+| 顺序 | 文件 | 原行数 | 拼接时丢掉的行 |
+| --- | --- | --- | --- |
+| 1/4 | `protocol_constants.h` | 91 | 0 |
+| 2/4 | `protocol_constants.cpp` | 30 | 2 |
+| 3/4 | `serial_protocol.h` | 137 | 1 |
+| 4/4 | `serial_protocol.cpp` | 1055 | 4 |
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\make_serial_single.ps1
+
+拼接规则（比 `make_single.ps1` 保守得多）：
+
+- 只丢掉这 4 个文件**互相**的 `#include`（`protocol_constants.h` / `serial_protocol.h`），
+  因为它们的内容已经在同一文件里；其它 `#include` **原样保留** —— 那是串口层对仓库
+  其余部分的真实依赖（`<Arduino.h>`、`"weArm_config.h"`、`constant_and_positions.h`、
+  `move.h`、`servo_drive.h`、`pick_place.h`、`button_control.h`、`draw_control.h`、
+  `joystick_control.h`、`<avr/interrupt.h>`），读者需要看见。
+- 保留下来的依赖**只留第一次出现**的地方（重复 include 虽无害，单文件稿里重复列很吵）；
+  源码里写成 `"Arduino.h"` 的统一改写成 `#include <Arduino.h>`。
+- 每段前加 `// ===== <文件名> （N 行，去掉 M 行重复/内部 include）` 分隔注释。
+- 写盘 LF-only，与 `.gitattributes` 的 `* text=auto eol=lf` 一致（同 `make_single.ps1`）。
+
+**校验方式**：把它当成一个独立的编译单元严格编译过
+
+    g++ -x c++ -std=gnu++17 -O2 -I. -I.\.selfcheck\mock -Wall -Wextra -Wshadow -Wconversion ^
+        -c .\single\serial\serial_protocol_single.h -o .\.selfcheck\out\serial_single.o
+
+⇒ 零警告（产物 21030 B 目标文件）。`-x c++` 是必须的：`-c *.h` 会被 g++ 当成预处理头
+（`.gch`）而不是源码。链接成固件当然还需要上面那些模块。
+
+> ⚠️ **`write`/`edit` 工具写出的 `.ps1` 没有 BOM**，而本机工具 shell 是 Windows
+> PowerShell 5.1：无 BOM 的带中文脚本会按 CP936 解码，中文变 `鏂逛究` 而且会**吃掉
+> 一个引号**导致整脚本 `表达式或语句中包含意外的标记`。**改完任何 `.selfcheck\*.ps1`
+> 都要跑一次** `powershell -ExecutionPolicy Bypass -File .selfcheck\ensure_bom.ps1`
+> （`-Check` 只报告）。v1.6.8 这次做串口打包稿时就是先手工补 `EF BB BF` 才让新脚本
+> 跑起来的，顺手用 `ensure_bom.ps1` 把 `avr_build.ps1` 缺的 BOM 也补上了。
+
 ## 初始位姿改回 (40,0,0) —— 上电仍是 x90,y90,z90
 
 > **（v1.6.7 之前的历史，运动模型已被整体替换，见 README 的对应章节）**

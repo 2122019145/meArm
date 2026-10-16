@@ -18,12 +18,16 @@ v1.6.8 只动**可诊断性与默认组合**，运动逻辑一行未改：① �
 三个功能全开 35162 B 装不进 Uno，只能裁一个，详见
 [功能裁剪与容量](#功能裁剪与容量v166-起)。
 
-**一套源码，两种交付形态：**
+**一套源码，三种交付形态：**
 
 - **多文件版**：仓库根目录 21 个文件（`meArm.ino` + 9 个 `.cpp` + 11 个 `.h`），工程形态，日常开发只改这里；
 - **单文件版**：`single/meArm/meArm.ino`（LF 换行），由 `.selfcheck/make_single.ps1` 从多文件版
   **生成**，交作业/考试直接交这一个文件。v1.6.7 换模型后已重新生成过一次；字节数与行数
   以在本机实跑 `make_single.ps1` 的结果为准（不在文档里写死，免得又对不上）。
+- **串口部分单文件版**：`single/serial/serial_protocol_single.h`，由 `.selfcheck/make_serial_single.ps1`
+  只把"协议常量层 + 串口协议层"这 4 个文件按依赖顺序拼成一个文件，方便整段阅读或拷给别人。
+  它保留对外的 `#include`（`weArm_config.h`、各模块头），因此能单独编译成一个编译单元，
+  但要链成固件仍需其它模块 —— 它是打包稿，**不是给人 `#include` 的**（定义与实现都在里面）。
 
 > 单文件版是生成物，不要手改。改完根目录源码后必须重跑 `make_single.ps1`，
 > 否则 `.selfcheck` 里的 `wearm_ino_test` 探针会立刻失败。
@@ -489,6 +493,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .selfcheck\run_all.ps1
 | `.selfcheck/compile_only.ps1` | 只做上面那 9 个编译单元（**探针已按 v1.6.7 停用**，见下） |
 | `.selfcheck/avr_build.ps1 [-SketchDir ...] [-ExtraDefs @(...)] [-Relax]` | AVR 真编（avr-gcc 7.3.0 + core 1.8.8，`-Os -flto`）并打印 flash/SRAM；`-ExtraDefs` 用来做功能开关消融 |
 | `.selfcheck/make_single.ps1` | 由多文件版生成 `single/meArm/meArm.ino` |
+| `.selfcheck/make_serial_single.ps1` | 只把串口通信部分（`protocol_constants.*` + `serial_protocol.*`）拼成 `single/serial/serial_protocol_single.h` |
 | `.selfcheck/make_nocomment.ps1 [-ProbeCheck]` | 生成去注释版，并做严格编译与预处理一致性校验 |
 | `.selfcheck/gh_release.ps1` | 发 Release（走 REST，不需要 `gh` CLI） |
 
@@ -578,6 +583,7 @@ v1.6.7 换模型 + 重标点位后比 v1.6.6 时代大 180 B；v1.6.8 的版本�
 | `protocol_constants.{h,cpp}` | 协议常量与集中式不变量 |
 | `weArm_config.h` | 功能开关与容量记录 |
 | `single/meArm/meArm.ino` | 单文件**生成物**（不要手改） |
+| `single/serial/serial_protocol_single.h` | 串口部分的单文件**生成物**（不要手改，也不是给人 include 的） |
 | `.selfcheck/` | 自检设施与权威设计说明 `README.md` |
 
 ## 常见坑

@@ -1,4 +1,4 @@
-#
+﻿#
 # avr_build.ps1 -- build the meArm sketch exactly the way the Arduino IDE does,
 # with the locally installed AVR toolchain, and report flash/SRAM usage.
 #
