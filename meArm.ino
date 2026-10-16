@@ -72,9 +72,11 @@
 //     按键功能一律用上面那四条串口命令 N / R / P / M（或 0）触发。
 //     要恢复"四个独立按键接 D2~D5"的老接线：把 weArm_config.h 里
 //     WEARM_BUTTON_PINS 改成 1，别的文件一行都不用动。
-//     按键模块本身（录制/播放/回中/循环取放）仍然编译在里面（WEARM_ENABLE_BUTTONS=1），
-//     因为串口 N/R/P/M 走的就是它；录制期间摇杆照常可用，播放/回中期间摇杆让位，
-//     忙让位规则详见 button_control.h。
+//     按键模块本身（录制/播放/回中/循环取放）由 weArm_config.h 的 WEARM_ENABLE_BUTTONS
+//     控制，v1.6.8 起默认 = 0（关掉，给绘图腾 flash）：串口 N/R/P/M/0 全回 REJECTED，
+//     **回中改用等价指令 `x90,y90,z90`**（初始位姿的舵机角就是 90/90/90，两者只写这三个轴）。
+//     要恢复按键功能就把 WEARM_ENABLE_BUTTONS 改回 1（并同时关掉 DRAW，否则装不下）；
+//     录制期间摇杆照常可用，播放/回中期间摇杆让位，忙让位规则详见 button_control.h。
 //
 //   绘图（铅笔固定在末端夹具上，详见 draw_control.h；实现只有 draw_control.cpp 一个文件。
 //   每个采样点都交给 move.h 的 moveToPoint()：反解、关节速率限制、写 Pos 与正解刷新都在

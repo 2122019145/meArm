@@ -18,7 +18,7 @@
  *       .\protocol_constants.cpp .\.selfcheck\mock\Arduino.cpp `
  *       -o .\.selfcheck\out\serialpick.exe
  *
- * 用法：serialpick.exe [场景]   场景 = boot | idle | jog | draw | all（默认 all）
+ * 用法：serialpick.exe [场景]   场景 = boot | idle | jog | refuse | nobtn | draw | all（默认 all）
  */
 
 #include <stdio.h>
@@ -151,6 +151,20 @@ int main(int argc, char **argv)
       state("after A");
       pump(2000);
     }
+  }
+
+  if (!strcmp(scene, "nobtn") || !strcmp(scene, "all")) {
+    printf("\n########## 场景 nobtn：按键模块被裁掉时 M/0 与 x90,y90,z90 ##########\n");
+    boot();
+    feed("y120"); /* 先走开（上臂舵机角 120），便于看"回中"是不是真的回去了 */
+    pump(2000);
+    state("after y120");
+    feed("M");
+    state("after M");
+    feed("0");
+    state("after 0");
+    feed("x90,y90,z90"); /* 与 M 等价的家位角 */
+    state("after x90,y90,z90");
   }
 
   if (!strcmp(scene, "draw") || !strcmp(scene, "all")) {

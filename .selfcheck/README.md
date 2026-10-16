@@ -151,7 +151,7 @@ C:\ProgramData\mingw64\mingw64\bin\g++.exe -std=gnu++17 -O2 -Wall -Wextra -I. -I
   .\protocol_constants.cpp .\.selfcheck\mock\Arduino.cpp -o .\.selfcheck\out\serialpick.exe
 ```
 
-场景参数 `boot | idle | jog | refuse | draw | all`（默认 `all`）。实测结论
+场景参数 `boot | idle | jog | refuse | nobtn | draw | all`（默认 `all`）。实测结论
 （**当前固件冷启动时 `A`/`B`/`C` 都回 `OK`**）：
 
 | 场景 | 实测 |
@@ -160,12 +160,44 @@ C:\ProgramData\mingw64\mingw64\bin\g++.exe -std=gnu++17 -O2 -Wall -Wextra -I. -I
 | `idle` | 空转 30 s（摇杆噪声）后 `A` → 仍然 `OK` |
 | `jog` | `x100` → `rec(-13.89,78.78,118)`、`y100` → `rec(-16.09,91.27,102.89)`；随后 `A` → `OK`（**当前位姿不卡取放**） |
 | `refuse` | 先用角度指令摆到极端位姿再发 `A`（**这就是新加的 `REJECTED` 路径**）：`y45`（r 压到 45 ⇒ `rec(0,0,151.14)`）→ `REJECTED`（rc=28）；`z30`（`rec(0,40,48.72)`）→ `REJECTED`；`y45,z30`（`rec(0,20.71,73.86)`）→ `REJECTED`；`y160,z110`（`rec(0,126.60,4.08)`）→ `REJECTED`；`y160`（`rec(0,102.54,-9.81)`）与 `z110`（`rec(0,75.18,145.36)`）→ `OK` |
-| `draw` | `F`/`D`/`p-6`/`!D` 全部 `REJECTED`（本分支 `WEARM_ENABLE_DRAW 0`，绘图没编进来） |
+| `nobtn` | 见下一节（按键模块被裁掉时的替代回中） |
+| `draw` | 在 `-DWEARM_ENABLE_DRAW=0` 的编译下 `F`/`D`/`p-6`/`!D` 全部 `REJECTED`；同一份源码用 `-DWEARM_ENABLE_DRAW=1 -DWEARM_ENABLE_BUTTONS=0` 重编后 `F` → `OK F=N`、`D` → `OK`、`p-6` → `OK`（详见下一节） |
 
 ⇒ 截图那两条 `BUSY` 在当前源码上**从冷启动复现不出来**：最可能是板上烧的还是
 **重选点位之前**的那一版（那时三个物体点位全不可达，每条取放命令都 `BUSY`），
-或当时已经有一段序列在跑。**上机判断顺序：先看横幅里的 `v<版本>`，再确认 `!` 回
-`P=1 B=1 D=0`，然后 `A`。**
+或当时已经有一段序列在跑。**上机判断顺序：先看横幅里的 `v<版本>`，再确认 `!` 回的
+`P/B/D` 三位（v1.6.8 默认组合是 `P=1 B=0 D=1`），然后 `A`。**
+
+### v1.6.8 默认组合改成「取放 + 绘图（按键关）」（`nobtn` 场景）
+
+**起因**：用户只发来一句 **"绘图返回 rejected"**。查下来那条 `REJECTED` 不是绘图失败，
+而是**那一版固件根本没编进绘图模块**（`WEARM_ENABLE_DRAW 0`）：`serial_protocol.cpp`
+里登记功能位用的是 `(WEARM_ENABLE_DRAW ? PROTO_FEATURE_DRAW : 0u)`，没编进绘图时
+`F`/`D`/`p`/`n`/`o`/`!D` 全部走"功能没编译"分支回 `REJECTED`。三个功能全开是
+**34688 B**，超过 Uno 可用的 **32256 B**，所以必须裁掉一个 —— 用户裁决裁掉**按键模块**，
+默认组合改成 **`PICK 1 / BUTTONS 0 / DRAW 1` = 31250 B（95.4%）/ 569 B**。
+
+**代价**（不需要额外写代码，但要知道）：`button_control.h:119-136` 的空桩让
+`buttonHandleCommand()` 返回 −1 → `serial_protocol.cpp:663-667` 回 `REJECTED`，
+即 `N/R/P/M/0` 全被拒，**回中也没有了**。替代方案是轴角度指令
+（`serial_protocol.cpp:709-732` → `protoApplyAngles()`，x→b、y→r、z→c，超程夹取不拒绝）：
+初始位姿的舵机角本来就是 `(90,90,90)`，而 `posGetHomeAngles()` 也只写这三个轴、
+不动夹爪 ⇒ **`x90,y90,z90` 与 `M` 等价**。
+
+**★ `nobtn` 场景实测**（编译：把上面的工具命令换成
+`-DWEARM_ENABLE_PICK_PLACE=1 -DWEARM_ENABLE_DRAW=1 -DWEARM_ENABLE_BUTTONS=0`，
+输出 `serialpick_new.exe`）：`!` → `P=1 B=0 D=1`；`y120` → `OK`（`rec(0,109.28,67.28)`）；
+`M` → `REJECTED`、`0` → `REJECTED`；`x90,y90,z90` → `OK` 且 `rec` 精确回到
+`(0.00,80.00,118.00)`、`ser(b90 r90 c90)`。同一组合下 `boot` 场景 `A`/`C` 仍 `OK`、
+A 在跑时 `B` 仍合法 `BUSY`（**用户自己改过的点位表 A{69,58,20} B{-69,58,60}
+C{0,105,20} / DST A{36,77,20} B{-36,77,60} C{36,75,20} 三条都能跑完**），
+`draw` 场景 `F` → `OK F=N`、`D` → `OK`、`p-6` → `OK`、`!D` → 运行时把绘图 toggle 成 `D=0`。
+
+**另一个真踩到的坑**：`D:\dsh1\meArm\single\meArm\meArm.ino` 是 `make_single.ps1`
+生成的**快照**，里面有自己的一份开关副本（生成时是 `PICK_PLACE 1 / BUTTONS 1 / DRAW 0`）；
+在 Arduino IDE 里编译**单文件版**时改 `D:\dsh1\meArm\weArm_config.h` 不会生效，
+必须重跑 `make_single.ps1`。改完开关后单文件版实编 **31252 B / 569 B**、
+`make_single.ps1` 生成 **351709 字节 / 7392 行**；`compile_only.ps1` 9 个 TU 零警告。
 
 ## 为什么需要它
 
@@ -2060,14 +2092,16 @@ go-home → idle`
 > `DRAW_JOG_INVERT_X/Y/Z`、摇杆方向语义、`KIN_RARM/FARM` 行程真值、调速手感；
 > 绘图 V 字是否正立（`draw` 分支）也还没上机看过。
 >
-> **v1.6.8 更新**（只动可诊断性，运动逻辑一字未改）：容量四个组合各 +36 B ——
-> `pick_place` 默认 **22770 B / 1236 B**（单文件布局 22790 / 1236）、
-> `draw` **28870 B / 1447 B**、取放 + 绘图（按键关）31250 B / 569 B、
+> **v1.6.8 更新**（只动可诊断性与默认组合，运动逻辑一字未改）：容量四个组合各 +36 B ——
+> 取放 + 按键（绘图关）22770 B / 1236 B、`draw`（绘图 + 按键）28870 B / 1447 B、
+> **默认组合「取放 + 绘图（按键关）」31250 B / 569 B**、
 > 三开 34688 B（105.9%，装不进）/ 1486 B、三开 + `-mrelax` 34168 B；
-> `make_single.ps1` 生成 **350550 字节 / 7378 行**。
+> **默认组合已改成「取放 + 绘图、按键关」**（`weArm_config.h` 第 2 节），
+> 单文件版实编 31252 B / 569 B，`make_single.ps1` 生成 **351709 字节 / 7392 行**。
 > 开机横幅从这一版起带版本号（`CMD v1.6.8 …`），`A`/`B`/`C`/`N` 的
 > "被拒"改回 `REJECTED`（只有"上一段还在跑"才回 `BUSY`）——
-> 见本文件上半部分的「v1.6.8 串口可诊断性」一节与工具 `.selfcheck/serialpick.cpp`。
+> 见本文件上半部分的「v1.6.8 串口可诊断性」与「v1.6.8 默认组合改成…（`nobtn` 场景）」
+> 两节，以及工具 `.selfcheck/serialpick.cpp`。
 > **v1.6.8 尚未打标签**（等上机用横幅确认版本后再发）。
 
 ## PowerShell / 脚本的几个坑
@@ -2254,10 +2288,11 @@ go-home → idle`
     翻转 v 符号。**只能 5 张表一起翻**，只翻一两个会让字形之间自相矛盾。
     （这一条是因为用户上一轮反馈"画 V 字是在竖直平面上画"才改的，PC 探针只能证明
     "(u,v)→(x,y) 的映射一致"，证明不了纸面朝向，必须上纸看。）
-20. **绘图与取放不在同一个固件里**（本轮新增）：`pick_place` 分支的绘图模块被编译掉，
-    `F/D/G/E/Q/U/W` 与 `p/n/o` 没有绘图动作；`draw` 分支反之（没有 `A/B/C` 取放，
-    发 `A` 不会有动作）。烧写前先确认自己在哪个分支，烧完发 `!` 看功能位。
-    想一个固件里同时要两者：关掉按键模块（取放 + 绘图 + 按键关 = 31092 B，装得下）。
+20. **三个功能只能同时装两个**（v1.6.8 起默认 = 取放 + 绘图、按键关）：三开 34688 B
+    超过 Uno 的 32256 B；`WEARM_ENABLE_DRAW 0` 时绘图族 `F/D/G/E/Q/U/W` 与 `p/n/o`
+    不会动作（回 `REJECTED`）；`WEARM_ENABLE_BUTTONS 0` 时 `N/R/P/M/0` 全回 `REJECTED`
+    （**回中用等价的 `x90,y90,z90`**）。烧写前先确认 `weArm_config.h` 第 2 节（**单文件版
+    还要注意它是 `make_single.ps1` 生成的快照**），烧完发 `!` 看功能位。
 21. **上一轮的镜像/方向项仍然有效**：见第 15 条（基座/夹爪镜像、上臂/下臂方向可就地
     用串口 `mS`/`mE` 验证）。本轮取放重写没有改变任何镜像开关的语义。
 
@@ -2298,7 +2333,7 @@ go-home → idle`
 
 需求是"把全部代码放进一个 .ino"。`.selfcheck/make_single.ps1` 把 11 个头文件
 （先声明）、9 个实现文件（后定义）、最后根目录 `meArm.ino` 依次拼接，生成自包含的
-`single/meArm/meArm.ino`（338092 B / 7344 行，带
+`single/meArm/meArm.ino`（本机 v1.6.8 实测 351709 B / 7392 行，带
 `// Generated by .selfcheck/make_single.ps1. Do not edit this file directly.` 头）。
 
 **模块化版本仍是唯一手写源，单文件是生成物，不要直接编辑**——改完源码重跑：
