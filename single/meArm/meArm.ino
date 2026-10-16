@@ -20,12 +20,17 @@
  *      "serial backend" 段）。只要还链接 Serial 对象，它的 vtable 就会把
  *      整个 HardwareSerial 拖进来，逐函数裁剪做不到；整块换掉省了
  *      852 B flash 和 109 B SRAM。想退回官方串口库：-DWEARM_SERIAL_ARDUINO=1。
- *   2) 自研 servo_drive（Timer1 硬件 PWM）取代 Servo 库，省 550 B。
+ *   2) 自研 servo_drive（Timer1 顺序脉冲，30 ms 一帧）曾经省下 550 B；
+ *      v1.6.6 为夹爪握持力又换回了 Arduino 原生 Servo 库（标准 20 ms 一帧，
+ *      刷新更快 → 堵转保持力矩更稳，见 servo_drive.h 的说明），代价是
+ *      **多花约 1200 B flash**（见下面的容量表）。servo_drive 仍是唯一出口，
+ *      以后换实现只改 servo_drive.cpp，别的文件一行都不用动。
  *
- * 三功能全开现在是 32114 B / 1457 B，离可用 flash 只剩 142 B、
- * SRAM 也到了 71% —— 已经很挤了（摇杆手感修正那一轮又花掉 202 B flash，
- * 见下面的容量表），
- * 后面再加功能之前，先用下面的容量表挑一个开关关掉，或者重新做一轮瘦身。
+ * 【v1.6.6 取放重写之后】三功能全开是 34542 B / 1485 B —— **已经装不进 Uno**：
+ * ATmega328P 有 32768 B flash，减去 512 B 的 optiboot 引导区，可用 32256 B，
+ * 三开超了 2286 B，Arduino IDE 会直接报 "Sketch too big"。
+ * 因此从这一版起，工程按功能**分分支**：所有代码都留在树上，靠第 2 节的编译期
+ * 开关决定这一版编进什么，每个分支都单独装得下（见下面的容量表）。
  *
  * 这里提供两个维度的编译期开关：
  *   1) WEARM_DEBUG_SERIAL -- 关掉全部串口调试日志（默认关）
@@ -44,15 +49,18 @@
  *                              打开后会退回 Arduino Serial，见上面 1)）
  *   WEARM_ENABLE_PICK_PLACE   1 -> 取放序列（串口 A/B/C、按键1 循环取放）
  *   WEARM_ENABLE_BUTTONS      1 -> 按键模块（录制/播放/回中/循环取放，串口 N/R/P/M/0）
- *   WEARM_ENABLE_DRAW         1 -> 绘图（铅笔轨迹，v1.0.0 的功能）
+ *   WEARM_ENABLE_DRAW         1 -> 绘图（铅笔轨迹，v1.0.0 的功能；**本分支默认 0**）
  *   WEARM_BUTTON_PINS         0 -> 不读 D2~D5 的物理按键（默认，本机没有独立按键）
  *                             1 -> 四个独立按键接 D2~D5（INPUT_PULLUP、按下接地）
  *   WEARM_REC_TICK_MS       200 -> 录制采样周期（ms）；越小回放越顺、录得越短
  *   WEARM_REC_ENTRIES       192 -> 录制缓冲条数（× 4 字节 SRAM）＝ 单次录制上限
  *                                  （192 × 200 ms = 38.4 秒、768 B SRAM，见第 5 节）
  *
- * 三个功能开关默认都是 1（全功能）。万一以后代码又长胖到装不下，
- * 照下面的容量表关掉最不常用的那一个即可。
+ * 【本分支 pick_place】取放 + 按键 开、绘图**关**（= 22554 B，装得下）。
+ * 绘图在 draw 分支（绘图 + 按键 开、取放**关**，29048 B）。两个分支的源码完全一样，
+ * 差别只有下面第 2 节里 WEARM_ENABLE_DRAW / WEARM_ENABLE_PICK_PLACE 这两行数字。
+ * 想在一个构里同时要两个功能：关掉按键模块（取放 + 绘图 + 按键关 = 31092 B，装得下），
+ * 代价是串口 N/R/P/M/0（录制/回放/回中/循环取放）全没了。
  *
  * 摇杆、串口协议解析、反解/限位、舵机驱动这些底层能力没有开关，永远编译进去。
  *
@@ -64,17 +72,54 @@
  * 把多个 -D 塞进一个带空格的字符串会被当成一个参数，报
  * "token "=" is not valid in preprocessor expressions"。
  *
- * 实测容量（Program / Data，**v1.6.5 定版实编**；百分比按 32768 / 2048 算）：
- *     取放 + 按键 + 绘图       : 30800 B (94.0%) / 1419 B (69.3%)  <- 出厂默认
- *     取放 + 绘图   + 按键关   : 27214 B (83.1%) /  502 B (24.5%)
- *     取放 + 按键   + 绘图关   : 18162 B (55.4%) / 1168 B (57.0%)
- *     绘图 + 按键   + 取放关   : 27912 B (85.2%) / 1385 B (67.6%)
- * 默认配置相对 Uno 可用 flash（32256 B）剩 **1456 B** 余量（单文件同为 30800 B /
- * 94.0%，本轮两者完全相同）。相对 v1.6.4（32016 / 28814 / 19260 / 29114、
- * Data 1475 / 558 / 1224 / 1441）四行 **−1216 / −1600 / −1098 / −1202 B**、
- * Data 四行全部 **−56 B**：去配置化两轮删掉 servoLimit / rangeLimit 两块全局与
- * 5 个辅助函数、DEBUG_PRINT* 调试打印、f 的 60~150 与纸面 z 的范围限制代码，
- * 新增的只有 TOOL_* 常量（宏，不占 RAM）与每帧夹紧的重申调用。
+ * 实测容量（Program / Data，**本轮工作区实编**；百分比按 32768 / 2048 算）：
+ *     取放 + 按键 + 绘图       : 34542 B (105.4%) / 1485 B (72.5%)  <- 装不进 Uno
+ *     取放 + 绘图   + 按键关   : 31092 B (94.9%)  /  568 B (27.7%)  ✓（两功能须关按键）
+ *     取放 + 按键   + 绘图关   : 22554 B (68.8%)  / 1235 B (60.3%)  <- pick_place 分支
+ *     绘图 + 按键   + 取放关   : 29048 B (88.6%)  / 1447 B (70.7%)  <- draw 分支
+ * 三开那行比 Uno 可用 flash（32256 B）**多 2286 B**，Arduino IDE 会直接报
+ * "Sketch too big"。所以从 v1.6.6 起工程**按功能分分支**：
+ *     pick_place 分支 = 取放 + 按键（绘图关，22554 B，余量 9702 B）
+ *     draw 分支       = 绘图 + 按键（取放关，29048 B，余量 3208 B）
+ * 两个分支源码完全一样，只有第 2 节的 WEARM_ENABLE_DRAW / WEARM_ENABLE_PICK_PLACE
+ * 两行数字不同；要用另一套功能就切分支重编、重烧。三个开关全开的构建仍然保留
+ * （PC 端自检 run_all.ps1 就是这么编的），但只能烧进 flash 更大的板子。
+ * 单文件（single/meArm/meArm.ino）实编与多文件只差几字节 —— 合并成单个 TU 后
+ * LTO 的内联结果会略有不同，属正常。
+ *
+ * 本轮（取放模块按"先抬到物体高度+5cm → 退到物体后方 2cm → 下降到物体同高 →
+ * 向前 2cm → 合爪夹紧 → 抬回 → 平移到目标正上方 → 降 5cm 放开 → 回初始位姿"
+ * 全量重写，并让物体高度兼容 −10cm~+10cm）相对上一版
+ * （32026 / 28434 / 19628 / 29048，Data 1481 / 564 / 1231 / 1447）
+ * 四行 flash **+2516 / +2658 / +2926 / 0 B**，Data 四行 **+4 B**。
+ * 增量全部来自取放重写本身：`-DWEARM_ENABLE_PICK_PLACE=0` 的边际量从 2950 B
+ * 涨到 5494 B，花在"后方 2cm 径向退让点、自适应飞行高度 planTravelZ()、
+ * 7 段路径采样校验、关节插值回 POS_HOME、搬运全程保持夹紧"这些新路径上。
+ * 顺手试的两种"免费"瘦身都无效：给 planTravelZ / advanceStage 加 noinline 只省
+ * 42 / 62 B；把 planTravelZ 里三个与候选高度无关的判据提到循环外，反而**多花
+ * 306 B** —— 这个工程的体积对 LTO 内联决策非常敏感，改结构前必须实测。
+ *
+ * 本轮（手写舵机驱动 → Arduino 原生 Servo 库 + 一轮冗余清理）相对上一版记录
+ * （32002 / 28416 / 19286 / 29098，Data 1445 / 528 / 1194 / 1411）：
+ * 四行 flash **+24 / +18 / +342 / −50 B**，Data 四行 **+36 / +36 / +37 / +36 B**。
+ * Data 齐涨 36~37 B 就是原生 Servo 库自己的静态量；flash 那一列方向不一致，来自
+ * LTO 重新分配内联结果叠加本轮这些有增有减的改动 —— 删掉串口回复层的
+ * protoWriteInt()/"OK #" 分支、把被展开两次的 R_FEATURE() 收敛成一个出线函数、
+ * 缩短开机横幅，再把 validatePath() 曲线段那套自写的逐点采样换成共用的
+ * pathCoreSegmentOk()（这一项单项约 −300 B）；同时加了取放前先开爪、beginDwell()
+ * 在窄化转换前钳位、取放阶段名越界检查三处修正，并删掉两行够不着的死代码与三个
+ * 多余的局部量。那一版**不再需要 `-mrelax`**（Arduino IDE 原样的链接参数就装得下）；
+ * 本轮取放重写把体积又推回超限，`-mrelax` 也只省 520 B（34022 B），补不上 2286 B 的缺口。
+ *
+ * 上一版（32002 那一版）相对 v1.6.5 定版（30800 / 27214 / 18162 / 27912、
+ * Data 1419 / 502 / 1168 / 1385）
+ * 四行 **+1202 / +1202 / +1124 / +1186 B**、Data 四行 **+26 B**：恢复工作空间盒子
+ * rangeLimit（6 个 double = 24 B 的 .data）与三条越界判据（pathCorePointOk() 的
+ * 三次比较、move.cpp 的 posOutOfRange() 整步回退、rangeLimitConfig() 配置自检）。
+ * 而 v1.6.5 定版那一版相对 v1.6.4（32016 / 28814 / 19260 / 29114、Data 1475 / 558 / 1224 / 1441）
+ * 四行 **−14 / −398 / +26 / −16 B**、Data 四行 **−30 B** —— v1.6.5 那轮"去配置化"
+ * 删掉的 servoLimit / rangeLimit 两块全局与 5 个辅助函数、DEBUG_PRINT* 调试打印、
+ * f 的 60~150 与纸面 z 的范围限制代码，其中 rangeLimit 现在又回来了。
  * v1.6.4 轮（删掉"偏转越大走得越快"的动态步间间隔 + 施密特迟滞 + 中位跟踪时间门控）相对上一轮
  * 【四行为 32114 / 28922 / 19280 / 29240，Data 1457 / 540 / 1206 / 1423】分别
  * **−98 / −108 / −20 / −126 B**，Data 四行 **+18 B**：删掉 `speedIntervalMs()` 与
@@ -155,9 +200,13 @@
 #  define WEARM_ENABLE_BUTTONS 1
 #endif
 
-/* 绘图：铅笔轨迹绘制（v1.0.0 新增，串口 F/D/G/E/Q/U/W/p/n/o） */
+/* 绘图：铅笔轨迹绘制（v1.0.0 新增，串口 F/D/G/E/Q/U/W/p/n/o）。
+ * 【本分支 pick_place 默认 0】"取放 + 按键 + 绘图"三开是 34542 B，比 Uno 可用的
+ * 32256 B 多 2286 B（Arduino IDE 报 Sketch too big），所以绘图模块独立到 draw
+ * 分支去编：那边取放 0、绘图 1，实编 29048 B。代码都在，只是不在这一版里。
+ * PC 端自检不受影响：run_all.ps1 用 -D 把三个开关全部覆盖回 1 再编探针。 */
 #ifndef WEARM_ENABLE_DRAW
-#  define WEARM_ENABLE_DRAW 1
+#  define WEARM_ENABLE_DRAW 0
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -181,6 +230,24 @@
 #ifndef WEARM_MIRROR_TOOL
 #  define WEARM_MIRROR_TOOL 1   /* 1 = 末端夹爪（通道 3 / f）反向装配，输出镜像 */
 #endif
+#ifndef WEARM_MIRROR_SHOULDER
+#  define WEARM_MIRROR_SHOULDER 0   /* 1 = 上臂舵机（通道 1 / r）反向装配。
+                                     * 上臂/下臂都是按正向装配接的（只有基座与夹爪反向，
+                                     * 见 README「硬件与接线」），所以这里必须是 0 才与正解
+                                     * α = 90° − r 一致。置 1 只会把上臂的**竖直**分量取反
+                                     * （水平分量 cos(90°−r) 不变），症状恰好就是"上下搞反、
+                                     * 其余正常"—— 这正是上一版默认 1 时的问题。 */
+#endif
+#ifndef WEARM_MIRROR_ELBOW
+#  define WEARM_MIRROR_ELBOW 0   /* 1 = 下臂舵机（通道 2 / c）反向装配 */
+#endif
+
+/* 运行时换向（串口 'm' 查询 / 'mS' 切换上臂 / 'mE' 切换下臂；默认取上面编译期值，
+ * 掉电不保存）。只被 meArm.ino 的 writeServo() 读取：上机标定方向时用，
+ * 找到正确组合后应把结果回写上面的 WEARM_MIRROR_SHOULDER / WEARM_MIRROR_ELBOW
+ * 并删掉这段运行时覆盖。 */
+extern bool g_mirrorShoulder;
+extern bool g_mirrorElbow;
 
 /* ---------------------------------------------------------------------------
  * 4) 物理按键引脚开关（默认不用物理按键）
@@ -268,19 +335,22 @@
 // 坐标轴约定（全工程统一）:
 //   x: 左右 (右为正)   y: 前后 (前为正)   z: 上下 (上为正)
 //
-// 【本版本删去的范围限制】
-//   - 笛卡尔坐标范围：struct rangeLimit / limit、rangeClampConfig()、
-//     clampToRange() 全部移除。末端 x/y/z 只是角度正解出来的派生量。
+// 【范围限制现状】
+//   - 笛卡尔坐标范围（"工作空间盒子"）：struct rangeLimit / limit 已恢复
+//     （定义在 constant_and_positions.cpp）：x/y/z 都是 ±40。
+//     越界点由 path_core.h 的点校验与 move.cpp 的关节步进拒绝，详见 meArm.ino
+//     的"安全边界"一节。注意盒子比真实可达包络（x[0,40]、y[-40,40]、z[-40,40]）
+//     更宽（x<0 半边够不到），拦不住任何可达姿态 —— 它是一份声明式的配置，
+//     不是当前的有效边界；真正的可达性由反解残差与路径校验把关。
 //   - 可配置的关节硬限位：struct servoLimitCfg / servoLimit、servoSelfCheck()、
-//     isServoInRange()、clampServoAngles() 全部移除。
-//   - 【本版本新增删除】夹爪 f 的 60~150 硬限位：getAngleEx() 里的越限吸附、
-//     posSetAngle4() 的夹取、button_control 录制/回放里的夹取全部删掉，
-//     f 现在只受舵机电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，
-//     于是"夹紧"（压到 60 以下）才可能做到。
-//   - 【本版本新增删除】纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
-//   - 【本版本新增删除】isReachable() 的竖向边界 |z - armheight| <= L1+L2：
+//     isServoInRange()、clampServoAngles() 仍然是删除状态；b/r/c 三轴的物理
+//     行程 0~180 硬编码在 moveJointStep() 内。
+//   - 夹爪 f 的 60~150 硬限位：已删除（见下面的 TOOL_ANGLE_*）。f 只受舵机
+//     电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，于是"夹紧"
+//     （压到 60 以下）才可能做到。
+//   - 纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)：已删除。
+//   - isReachable() 的竖向边界 |z - armheight| <= L1+L2：已删除，
 //     可达性只看水平半径，竖向交给反解残差与路径校验把关。
-//   - b/r/c 三轴的物理行程 0~180 在 moveJointStep() 内硬编码。
 //
 #ifndef WEARM_CONSTANT_AND_POSITIONS_H
 #define WEARM_CONSTANT_AND_POSITIONS_H
@@ -288,12 +358,17 @@
 #include <math.h>
 #include <stdbool.h>
 
-#define RADtoDEG (180 / 3.1415926535)
+/* 【v1.6.6 修正】原来写的是 180/3.1415926535（π 只截了 10 位），相对误差
+ * ~3.5e-11，换算到 90° 是 ~3.2e-9 度的偏差。当时行程容差是 1e-9，偏差比容差还大
+ * —— r/c 恰好落在 180/0 的端点解会被 0~180 的行程判据误杀（probe_rt 里
+ * (0,0,-40) => r=180,c=0 这一条就是这么被拒的）。π 改成完整精度（常量、编译期
+ * 折叠，不占 flash）；行程容差也统一成下面的 ANGLE_EPS(1e-6)，两头都不再留隐患。 */
+#define RADtoDEG (180.0 / 3.14159265358979323846)
 /* 避免与 Arduino 核心的 PI 宏冲突 */
 #ifndef PI
 #define PI 3.1415926535
 #endif
-/* 关节角容差（度）：小于它的微小负角按 0 处理 */
+/* 关节角容差（度）：反解的回代残差判据与 r/c 行程边界判据共用这一个口径 */
 #define ANGLE_EPS 1e-6
 
 /* 机械臂几何参数：上臂长、下臂长、臂高（单位与坐标一致） */
@@ -332,18 +407,62 @@ typedef struct position {
 extern pos Pos;
 extern struct arm arm1;
 
+/* ---------- 末端笛卡尔坐标范围（"工作空间盒子"）----------
+ * 末端坐标 x/y/z 的上下限，每个轴都必须 min <= max（写反由 rangeLimitConfig()
+ * 在开机时自动交换回来）。数值在 constant_and_positions.cpp 里，
+ * 【本版】x/y/z 都是 ±40（修正小臂模型 beta=c-90 后包络变成 x[0,40] 半空间）。
+ *
+ * 越界怎么处理（两条"整步/整条回退"路径）:
+ *   - 取放与绘图：轨迹采样点越界 -> 整条轨迹校验不过，取放启动被拒（BUSY）、
+ *     绘图启动/绘制中被拒（见 path_core.h 的 pathCorePointOk()）；
+ *   - 摇杆 / 按键 / 示教的关节步进：走完一步后正解出的末端越界 -> 这一步整步
+ *     回退（返回 MOVE_AT_LIMIT，摇杆表现为"推到头了"，见 move.cpp）。
+ *
+ * 【为什么盒子拦不住任何可达姿态】关节 0~180 真正能走到的末端包围盒是
+ * x[0,40] y[-40,40] z[-40,40]（probe_axes 扫 5929741 个组合实测，x<0 半边
+ * 因为基座只能朝前半空间扫而够不到），盒子比它宽，所以没有任何可达姿态落在
+ * 盒子外 —— 这份配置改的是"允许声明的工作空间"，不是可达性；想让末端真的到
+ * x<0 或更大范围必须加长两臂（arm1）。 */
+struct rangeLimit {
+  double minX, maxX;
+  double minY, maxY;
+  double minZ, maxZ;
+};
+extern struct rangeLimit limit;
+
+/* 校验并修正 limit 配置：把每个轴写反的 (min,max) 交换回来，返回被修正的轴数。
+ * 在 posInit() 里开机调用一次（配置自检，与调速/行程的自检同一风格）：
+ * 盒子写反会让每个点都被判越界，必须当场纠正。 */
+int rangeLimitConfig(void);
+
 /* ---------- 末端夹爪（f）关节角：逻辑角，单位度 ----------
  * 【本版本已删除 60~150 的"夹爪范围限制"】现在只剩舵机自身的电气行程
  * 0~180（与 b/r/c 同一套边界），夹爪可以一直往里压到 0 也不会被软件拦下。
- * TOOL_ANGLE_TIGHT 是"夹紧"角：比名义合拢角再往里压几度，靠舵机的保持力矩
- * 把物体/笔夹住——取放序列与绘图循环每一帧都会重申这个角（见 pick_place.cpp
- * 的 pickHoldingStage() 与 draw_control.cpp 的 drawLoop()）。
- * 注意：压得越深堵转电流越大，舵机最好单独供电；夹不住再一点点调小。 */
+ *
+ * 三个角的分工（能不能夹住东西，全靠最后这一个差值）：
+ *   TOOL_ANGLE_OPEN   150   完全张开
+ *   TOOL_ANGLE_CLOSE   60   名义合拢角（= 串口 'S'）：夹爪“刚碰到物体”时大致的位置
+ *   TOOL_ANGLE_TIGHT   45   夹紧角：在名义合拢角的基础上**再往里压 15 度**
+ *
+ * 舵机是位置伺服：它只会一直朝目标角使劲，直到堵转。所以"夹得紧不紧"在固件里
+ * 只有一个可调量 —— 目标角比接触点再往里压多少度：
+ *   · 压得太少（v1.6.5 的 55 只有 5 度）：稍小一点的物体，夹爪还没碰到它，
+ *     舵机就已经"到位"了；此时看着是合上了，其实两爪之间是空的，一抬臂就掉。
+ *     这就是取物容易松开的直接原因。
+ *   · 压得够多（本版 15 度）：不管物体大小，夹爪都必然压到物体上并继续用力。
+ *     夹持力 = 舵机的堵转力矩，与压进去几度无关（多压只是多走一段行程，
+ *     保证"一定碰上"）。
+ *   · 压得太多（逼近 0）：两爪先自己顶死，物体反而可能被斜面挤出去，
+ *     而且堵转电流最大、发热最快。
+ * 调法：夹不住就按 5 度一档往下调本值；舵机发烫 / 供电掉压就往回调大。
+ * 取放序列也是按这个思路走的：先快速合到 TOOL_ANGLE_CLOSE，再用很慢的速度
+ * 蠕动到本角（见 pick_place.cpp 的 SQUEEZE_TOOL），免得一上来就用力把物体顶飞。
+ * 取放与绘图每一帧都会重申这个角（pickHoldingStage() / drawLoop()）。 */
 #define TOOL_ANGLE_MIN   0.0     /* f 逻辑角下限（舵机电气行程） */
 #define TOOL_ANGLE_MAX   180.0   /* f 逻辑角上限 */
 #define TOOL_ANGLE_OPEN  150.0   /* 张开到位，与串口 'O' 一致 */
 #define TOOL_ANGLE_CLOSE 60.0    /* 名义合拢，与串口 'S' 一致 */
-#define TOOL_ANGLE_TIGHT 55.0    /* 夹紧：再往里压 5 度 */
+#define TOOL_ANGLE_TIGHT 45.0    /* 夹紧：在名义合拢角 60 的基础上再往里压 15 度 */
 /* 夹爪的装配镜像：physical = TOOL_MIRROR_SUM - logical（与基座的 180- 同理）。
  * 210 是这台机器上舵机摆臂的装配角，与"行程"无关，换装配才需要改。 */
 #define TOOL_MIRROR_SUM  210.0
@@ -420,16 +539,18 @@ int  speedStepDown(void);
 //   上位机的命令文档要改时，只改这一个文件即可。
 //
 // 【不重复定义真值】
-//   1. 每个关节的机械行程（例如爪子的 60/150）唯一真值是
-//      constant_and_positions.cpp 里的 servoLimit，本文件不写死，
-//      只通过 protoAxisGetLimit() 转发，避免出现两处真值。
+//   1. 三个关节 b/r/c 的行程就是舵机的电气行程 0~180，真值写在落地那一层：
+//      serial_protocol.cpp 的 protoApplyAngles()（夹取）与 constant_and_positions.cpp
+//      的 getAngleEx()（行程判据），舵机驱动层再兜一次。（旧的 servoLimit 配置表已删除。）
+//      注意 constant_and_positions.h 的 TOOL_ANGLE_MIN/MAX 是**夹爪**(angle4/f) 的
+//      0~180，不是这三个关节的 —— 数值碰巧一样，别当成同一个真值引用。
 //   2. 速度档位的具体参数（0.5/20/80 等）唯一真值在 adjustSpeed()，
 //      本文件只引用档位号。
 //
-// 【角度上下限只在 servoLimit 里定义】
+// 【角度上下限不在这里定义】
 //   本文件不定义角度上下限（没有 PROTO_ANGLE_MIN/MAX 这类名义区间）。解析
 //   阶段不会因为角度超出某个区间而拒绝指令（那样 "x200" 就变成废指令了），
-//   而是在落地前按该关节真实的 servoLimit 行程夹取，例如 x200 最终写 180。
+//   而是在落地前把角度硬夹到 0~180，例如 x200 最终写 180。
 //
 */
 
@@ -449,7 +570,9 @@ int  speedStepDown(void);
 #define PROTO_CMD_PICK_C    'C'
 
 /* 四个物理按键的串口等价命令（效果与按下按键完全一样）。
- * 用字母而不是数字：数字键留给将来扩展，且与绘图任务的弹点时序无关。 */
+ * 用字母而不是数字：原先占用数字位的 '1'/'2'/'3' 档位直达键已删（与题目命令集
+ * 无关，同时给 Uno 腾 flash），数字位留空；字母也不会和 x/X/y/Y/z/Z 三个角度轴
+ * 字母冲突。 */
 #define PROTO_CMD_BTN_CYCLE    'N'   /* 按键1 循环执行：下一次按顺序夹 A/B/C */
 #define PROTO_CMD_BTN_RECORD   'R'   /* 按键2 录制：第一次开始，第二次结束并保存 */
 #define PROTO_CMD_BTN_PLAY     'P'   /* 按键3 播放上一次录制的动作 */
@@ -467,7 +590,7 @@ int  speedStepDown(void);
 #define PROTO_CMD_DRAW_RESUME  'U'   /* 继续（等价于绘制中按按键2） */
 #define PROTO_CMD_DRAW_CANCEL  'W'   /* 取消（等价于绘制中按按键3） */
 
-/* 纸面标定命令（多字符，形如 p12.5 / n6 / o20,0），用于上机时把"纸面"告诉固件 */
+/* 纸面标定命令（多字符，形如 p-20 / n6 / o27,0），用于上机时把"纸面"告诉固件 */
 #define PROTO_CMD_DRAW_PAPER_Z 'p'   /* p<纸面高度>：铅笔尖落在纸上时的 z */
 #define PROTO_CMD_DRAW_HALF    'n'   /* n<半宽>：内置图形的半宽 */
 #define PROTO_CMD_DRAW_CENTER  'o'   /* o<中心x>,<中心y>：内置图形的中心 */
@@ -476,9 +599,6 @@ int  speedStepDown(void);
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */
 extern const char protoAxisChar[PROTO_AXIS_COUNT];
-/* 轴对应的关节字母：b = 基座(angle1) r = 上臂(angle2) c = 下臂(angle3)，
- * 只用于串口提示；写入本身按"轴 a 写 angle(a+1)"进行。 */
-extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 
 /* ---------- 3) 解析与缓冲区 ---------- */
 #define PROTO_LINE_BUF_SIZE 40
@@ -495,85 +615,55 @@ extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 /* 把 x/X/y/Y/z/Z 转成轴下标 0..2，其它字符返回 -1 */
 int protoAxisIndexFromChar(int c);
 
-/* 取第 axis 个轴（0..2）的关节行程上下限，直接转发 servoLimit。
- * axis 越界或指针为空时返回 false。 */
-bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle);
+/* 三个关节 b/r/c 的行程真值（0~180）在 protoApplyAngles() 与 getAngleEx()：
+ * 数值上正好等于 TOOL_ANGLE_MIN/MAX，但后者是夹爪(angle4)的，别混用。 */
 
 #endif
 
 // ===== servo_drive.h =====
 /*
- * servo_drive.h —— 4 路舵机驱动（Timer1 顺序脉冲，替代 Arduino Servo 库）
+ * servo_drive.h —— 4 路舵机驱动的统一接口（v1.6.6 起封装 Arduino 官方 Servo 库）
  *
- * 【为什么要自己写（v1.3.0 容量整合）】
- *   Servo 库是全平台通用实现：它要为"任意通道数、任意引脚、运行期 attach/detach、
- *   读回角度、多定时器实例"付出代价。本工程只用到其中极小一部分
- *   （固定 4 路、固定引脚、只写 0~180°、不 detach、不读回）。在 ATmega328P 上
- *   Servo 库实际占用 flash：
- *       __vector_11 (Timer1 ISR) 376 B
- *       Servo::write             248 B
- *       Servo::attach            240 B
- *       turnOffPWM                82 B
- *       Servo 全局数组静态构造     40 B
- *       合计约 986 B
- *   本文件用同一套 Timer1 机制重写等价功能，约 300 B，净省约 650 B。
+ * 【为什么改用官方 Servo 库】
+ *   v1.3.0~v1.6.5 这里是一份自研的 Timer1 顺序脉冲驱动（省 flash）。
+ *   改回官方库的两个原因：
+ *     1) 刷新周期：自研版为塞进 flash 把帧长改到了 30ms，夹爪的保持刚度
+ *        直接受刷新率影响（舵机只在收到脉冲时被"顶"住）；官方库是标准
+ *        20ms 帧。夹物易松的问题里，这是固件侧能改的第一个杠杆。
+ *     2) 一致性：others/ 下的全部参考工程（MeArm-Arduino / Spark-MeArm /
+ *        meArm / meArm_MovementRecorder）用的都是官方 Servo 库 —— 同一套
+ *        脉宽映射（544~2400us，map(angle,0,180,544,2400)，TRIM 2us），
+ *        实机行为可直接与参考工程对表。
+ *   代价是 flash（实测见 weArm_config.h 顶部容量表），换来的是标准时序
+ *   与久经实机验证的实现。
  *
- * 【脉宽映射与 Servo 库逐位一致（这是不改变机械行为的硬要求）】
- *   meArm.ino（当时还叫 wearm.ino）原来是 servos[i].write((int)angle)，走 Servo::write(int)：
- *     1) angle < 544 视为角度 -> 夹到 0~180 -> map(angle, 0, 180, 544, 2400)
- *                              = angle * 1856 / 180 + 544  （32 位长整型运算）
- *     2) writeMicroseconds(): 夹到 [544, 2400] -> 减去 TRIM_DURATION(2us)
- *                              -> usToTicks(): (16MHz * us) / 8 = us * 2
- *   所以最终比较值 = ((us - 2) * 2) 个 Timer1 tick，tick = 0.5us（预分频 8）。
- *   本文件的 servoDriveTicksForDeg() 逐位复刻上式；另外本工程四个关节角由
- *   servoLimit 保证恒在 0~180 内，不会落进">= 544 视为微秒"的分支，
- *   故只实现角度分支（少一处判断，也少一处歧义）。
+ * 【接口】保持与自研版完全相同的三个函数，调用方（meArm.ino）一行不用改：
+ *   servoDriveBegin()          预留的初始化钩子（官方库在 attach() 里自备时序，
+ *                              这里保留空实现以维持 setup() 的调用序）
+ *   servoDriveAttach(ch, pin)  把通道 ch 绑到引脚 pin（Servo::attach）
+ *   servoDriveWrite(ch, deg)   写目标角度（度）：整数部分截断 + 夹到 0~180，
+ *                              与原来 write((int)angle) 的行为一致
  *
- * 【时序（与 Servo 库相同的 20ms 帧）】
- *   每个 20ms 帧：先按通道 0,1,2,3 顺序连续输出 4 个脉冲（脉冲之间无空隙，
- *   与 Servo 库 handle_interrupts() 一致），4 路发完后等帧尾。
- *   Timer1 跑**普通模式**（WGM12 = 0，比较匹配不清零 TCNT1），所有比较值都是
- *   绝对计数：帧边界把 TCNT1 清零，并在**同一次中断**里拉起第 0 路 ——
- *   即"帧边界 = 第 0 路脉冲上升沿"，帧长因此严格 40 000 tick = 20ms。
- *   （帧尾的比较值在"4 路都发完"那一次中断里就算好 = 绝对计数 SERVO_FRAME_TICKS，
- *   那时计数器只有一万多，一定还在未来。**不能**等到帧尾中断里现算
- *   "还差多少"：中断入口读到的 TCNT1 已越过 40000，uint16 下溢会把下一帧
- *   推到约 52.8ms 之后 —— 帧长变成 19Hz 并抖动。见 servo_drive.cpp 的长注释。）
- *
- * 【可测性】
- *   硬件相关代码只有 servoDriveBegin() 里的 5 行寄存器操作和 ISR 壳子
- *   （用 #if defined(__AVR__) 隔开）。脉冲状态机 servoDriveStep() 是纯函数：
- *   给定"当前计数器值"，它决定本次事件做什么（拉高/拉低哪个引脚）并返回
- *   下一次比较值。PC 端自检（probe_servo_drive）直接按 tick 步进这个状态机，
- *   用 mock 的 digitalWrite 记录验证"引脚顺序 + 脉宽 + 帧长"，
- *   所以时序逻辑不是"只能上硬件才能验证"。
+ * 【通道与引脚】通道 0/1/2/3 依次对应关节 b/r/c/f；接线（meArm.ino 的
+ *   setup()）：D9 = 基座、D8 = 上臂、D7 = 下臂、D6 = 夹爪。
+ *   官方库在 Uno 上用 Timer1（与旧自研版相同），D9/D10 的 analogWrite 会被
+ *   禁用 —— 本工程没有用到它们，无影响。
  */
 #ifndef SERVO_DRIVE_H
 #define SERVO_DRIVE_H
 
 
-/* 通道数。通道 0/1/2/3 依次对应关节 b/r/c/f（原来的 servos[1..4]）。 */
+/* 通道数。通道 0/1/2/3 依次对应关节 b/r/c/f。 */
 #define SERVO_CH_COUNT 4u
 
-/* 启动 Timer1 顺序脉冲发生器。必须在 servoDriveAttach() 之前调用一次。 */
+/* 初始化钩子（保留调用序；官方 Servo 库无需预初始化）。 */
 void servoDriveBegin(void);
 
-/* 把通道 ch 绑到引脚 pin（内部 pinMode(OUTPUT) + 拉低）。未绑定的通道不会被驱动。 */
+/* 把通道 ch 绑到引脚 pin（内部 Servo::attach）。重复绑定同一路是允许的。 */
 void servoDriveAttach(uint8_t ch, uint8_t pin);
 
-/* 写入目标角度（度）。整数部分截断，与原来的 write((int)angle) 一致。 */
+/* 写入目标角度（度）。整数部分截断并夹到 0~180，与原来的 write((int)angle) 一致。 */
 void servoDriveWrite(uint8_t ch, double deg);
-
-/* 纯函数：角度 -> Timer1 比较值（0.5us/tick）。与 Servo 库逐位一致，供自检比对。 */
-uint16_t servoDriveTicksForDeg(double deg);
-
-/* 纯函数：脉冲状态机。推进一个事件：
- *   nowTicks   当前 TCNT1 计数（上一次事件若返回 1，调用者已把 TCNT1 清零）
- *   nextDelayTicks 出参，下一次比较值：
- *                  返回 1 时 —— 先 TCNT1 = 0，再 OCR1A = *nextDelayTicks
- *                  返回 0 时 —— OCR1A = *nextDelayTicks（已经是绝对计数）
- *   返回 1 表示"本次是帧起点（需要把计数器清零）"，返回 0 表示其它事件。 */
-uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 
 #endif /* SERVO_DRIVE_H */
 
@@ -586,8 +676,9 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 //   被控量（状态量）: Pos.ser.angle1..angle3（b / r / c）与 angle4（f）
 //   派生量（显示量）: Pos.rec.x/y/z —— 由正运动学实时算出，不是目标值
 //   软件边界        : b/r/c 三轴的物理行程 0~180（硬编码），
-//                     f 的 60~150（在 posSetAngle4() 内硬编码）；
-//                     本版本已删除可配置的 servoLimit 与笛卡尔坐标的 rangeLimit。
+//                     f 的 0~180 舵机电气行程（在 posSetAngle4() 内硬编码），
+//                     末端笛卡尔坐标范围 limit（x/y ±40、z -40~40，见
+//                     constant_and_positions.h）；可配置的 servoLimit 仍未恢复。
 //
 // 设计说明:
 //   - moveJointStep 是主接口：把某个关节角加减一个步长，返回三态结果，
@@ -606,6 +697,8 @@ uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks);
 //        尽头 -> MOVE_AT_LIMIT。
 //     2) 正运动学自检：由新角度算出的末端坐标必须是有限数，否则
 //        -> MOVE_UNREACHABLE（几何上不可达）。
+//     3) 位置边界：由新角度算出的末端坐标越出 limit（"工作空间盒子"）就整步
+//        回退 -> MOVE_AT_LIMIT（角度模式下坐标是派生量，算"这个方向到头了"）。
 //
 #ifndef WEARM_MOVE_H
 #define WEARM_MOVE_H
@@ -643,7 +736,7 @@ enum JointDir {
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
-  MOVE_AT_LIMIT    = 2,  /* 方向被关节硬限位挡住（b/r/c 的 0~180） */
+  MOVE_AT_LIMIT    = 2,  /* 方向被挡住：关节硬限位（b/r/c 的 0~180）或末端坐标越出 limit */
   MOVE_UNREACHABLE = 3   /* 目标姿态正运动学自检失败，已整步回退 */
 };
 
@@ -657,7 +750,8 @@ enum MoveResult {
  *   2. b/r/c 三轴硬编码夹到 0~180 —— 夹完等于原值说明这个方向已到限位，
  *      返回 MOVE_AT_LIMIT；
  *   3. 用正运动学 recFromServo() 重算末端坐标，失败返回 MOVE_UNREACHABLE；
- *   4. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
+ *   4. 坐标越出 limit（工作空间盒子）返回 MOVE_AT_LIMIT（整步回退）；
+ *   5. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
  *
  *   dir 取 JointDir 的值。stepSize 传 <= 0 时使用全局 speed.stepSize（随调速档位变化）。
  *   返回 enum MoveResult；返回 MOVE_OK 以外的值时 Pos 完全不变。 */
@@ -726,7 +820,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 //                                              z = 下臂舵机(angle3/c)
 //                                 一行里写到的轴在同一次正解刷新中一起写入（同步控制）
 //                                 可只写其中一部分（如 y30），未写出的关节保持不动
-//                                 超出机械行程的值按 servoLimit 夹取（x200 最终写 180）
+//                                 超出 0~180 的值在这里硬夹取（x200 最终写 180）
 //                                 语法：字母、可选 '='、逗号分隔、支持小数
 //   A / B / C                     启动物体 A/B/C 的自动取放序列，序列执行期间只有调速指令仍然有效、其它动作指令返回 BUSY
 //   N / R / P / M / 0             四个实体按键的串口孪生（需要「按键」模块已编译且启用，默认已启用）：
@@ -735,16 +829,18 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 //                                 能开始时回 OK，正忙回 BUSY，没走出位移被丢弃回 DISCARD。
 //   F / D / G / E / Q / U / W     绘图（需要「绘图」模块已编译且启用，默认已启用）：
 //                                 选图形 / 开始 / 记一个示教点 / 撤销示教点 / 暂停 / 继续 / 取消
-//   p / n / o                     绘图标定：纸面高度 / 图形半宽 / 图形中心（如 p12.5、n6、o20,0）
+//   p / n / o                     绘图标定：纸面高度 / 图形半宽 / 图形中心（如 p-20、n6、o27,0）
 //   !                             查询编译且当前启用的功能 (P=取放 B=按键 D=绘图)
 //   !P / !B / !D                  切换已编译的对应功能；未编译的功能不能运行时开启
+//   m                             查询上臂/下臂换向（回复 S=0 E=1）
+//   mS / mE                       切换上臂(r)/下臂(c)的物理换向（上机方向标定，掉电不保存）
 //
 // 每条命令都会回一行短回复（OK / BUSY / OFF / DISCARD / EMPTY / ERR / REJECTED），
 // 含义见下面 WEARM_SERIAL_RESPONSES 的说明。
 //
 // 【x/y/z 就是三个舵机的角度，不做逆解】
 //   一条 x10,y30,z20 直接写基座/上臂/下臂三个舵机的角度（单位：度），
-//   写入前按各关节的真实机械行程 servoLimit 夹取，写完后做一次正解刷新
+//   写入前把每个角硬夹到 0~180（protoApplyAngles()），写完后做一次正解刷新
 //   Pos.rec，所以"给出的角度"与"机械臂的位置"始终是同一件事。
 //   一行里出现多个轴 = 三个舵机在同一轮 PWM 输出里同步到位。
 //   历史：v1.3.0 ~ v1.6.3 曾把同一串指令当作末端空间坐标（内部做逆解），
@@ -765,7 +861,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
  * answer every command with a very short UPPERCASE line, so the host still
  * sees what happened even when the verbose WEARM_DEBUG_SERIAL traces are off:
  *
- *   OK           命令已执行（O/S 带夹爪角度：OK #；F 带图形模式：OK F=<模式>）
+ *   OK           命令已执行（F 的回复带上图形模式：OK F=<模式>）
  *   BUSY         命令看懂了但机械臂正忙（取放序列/录放/绘图进行中）
  *   REJECTED     这台固件没编进该模块；或绘图轨迹校验不过
  *                （x/y/z 角度指令只会按行程夹取，不会因为数值大小被拒）
@@ -814,6 +910,7 @@ int moveToPoint(const double *goal, uint8_t seen, double maxDps, double dtSec, i
 #define PROTO_RES_DRAW_TEACH_UNDO    24 /* E：撤销一个示教点 */
 #define PROTO_RES_DRAW_REJECTED      25 /* 绘图请求被拒：轨迹校验不过 / 示教点不够 / 标定值非法 */
 #define PROTO_RES_DRAW_CALIBRATED    26 /* p/n/o：纸面高度、图形半宽、图形中心已更新 */
+#define PROTO_RES_MIRROR             27 /* m：查询/切换上臂(r)与下臂(c)的物理换向 */
 
 /* 初始化串口：Serial.begin(PROTO_BAUD) 并打印命令表。
  * 在 setup() 里调用一次，要放在其它会往串口打印的初始化之前。 */
@@ -835,13 +932,23 @@ int protoHandleLine(const char *line);
 /*
  * pick_place.h -- 物体 A / B / C 的自动取放序列
  *
- * 上位机在串口里发单个字母 A / B / C，本模块用一条非阻塞状态机自动完成整套动作：
- *     移动到物体上方 -> 垂直下降 -> 合爪 -> 停顿 -> 垂直抬起
- *     -> 平移到放置点上方 -> 垂直下降 -> 松爪 -> 停顿 -> 垂直撤离
+ * 上位机在串口里发单个字母 A / B / C，本模块用一条非阻塞状态机自动完成整套动作。
+ * 路径按用户口径：以物体高度为基准（1 工作区单位 = 4 mm，5cm = 12.5、2cm = 5.0）
+ *     先上移到「物体高度 + 5cm」-> 沿水平方向移到「物体后方 2cm」
+ *     -> 下降到与物体同高 -> 沿水平方向「向前 2cm」把物体送进两爪之间
+ *     -> 合爪（快合到名义合拢角，再慢压到夹紧角）-> 停顿
+ *     -> 抬回「物体高度 + 5cm」-> 沿水平方向移到「目标点正上方」
+ *     -> 下降到目标高度（名义上正好 5cm）-> 张爪 -> 停顿
+ *     -> 抬回飞行高度 -> 回到开机初始位姿 POS_HOME
+ *
+ * 合爪之后到张爪之前的每一帧都重申夹紧角，搬运途中不会松开（见 pickHoldingStage）。
+ * 「后方 / 向前」取的是基座的水平半径方向，不是固定 ±x（见 pickBehindPoint）。
  *
  * 位置表（每个物体的初始位置与放置位置）写在 pick_place.cpp 顶部，可直接改。
- * 三个物体的初始位置互不相同，三个放置位置也互不相同；而且对每个物体来说，
- * 放置位置相对它的初始位置在 x 与 y 两个方向上都有明显位移（表里逐条标了 Δx/Δy）。
+ * 物体与目标的放置高度允许 -10cm ~ +10cm（±25 单位）；物体越高可达的水平半径越小，
+ * 所以「+5cm 的飞行高度」在物体很高时会整个落在可达包络之外，这时
+ * planTravelZ() 会逐档降低飞行高度，最低不低于「最高物体 + 1cm」。
+ * 飞行高度是否被降过可以用 pickPlacePlanZ() 查（探针用它断言取值区间）。
  *
  * 【与摇杆、串口的关系】
  *  - 序列执行期间由本模块独占 b/r/c 三个关节角，摇杆步进被让位
@@ -852,8 +959,9 @@ int protoHandleLine(const char *line);
  *    期间串口接收与指示灯照常工作。
  *
  * 【为什么序列要用反解走直线】
- * 每个阶段都是在 x/y/z 上线性插值（所以下降/抬起是垂直的），插值点用固件自己的
- * getAngleEx() 反解成关节角，写进 Pos.ser 后只刷新一次 Pos.rec。
+ * 每个移动阶段都是在 x/y/z 上线性插值（所以下降/抬起是垂直的），插值点用固件自己的
+ * getAngleEx() 反解成关节角，写进 Pos.ser 后只刷新一次 Pos.rec。最后回初始位姿
+ * 那一段走的是关节空间插值（POS_HOME 本身就是关节姿态，不必再反解）。
  * 启动前会把整条路径采样验证一遍（在 limit 内、isReachable()、关节角没被吸附、
  * 相邻采样点的反解分支不跳变），有一条不满足就拒绝启动、一个字节都不改。
  */
@@ -874,8 +982,9 @@ int protoHandleLine(const char *line);
  *    0  已开始（pickPlaceIsBusy() 变为 true）
  *   -1  物体编号非法
  *   -2  已经有一个序列在执行（本次忽略）
- *   -3  路径校验失败（当前位姿到物体、或物体到放置点的路径上有不可达/越界点），
- *       拒绝启动，Pos 一个字节都不改                                 */
+ *   -3  路径校验失败（当前位姿不可用 / 不在自己的反解分支上，或路径上有不可达、
+ *       越界、分支跳变的点），拒绝启动，Pos 一个字节都不改
+ *   -4  位置表高度超出 -10cm~+10cm，或整段区间都找不到可达的飞行高度       */
 int pickPlaceStart(int object);
 
 /* 每轮 loop() 调用一次，推动序列前进（非阻塞，空闲时立即返回）。 */
@@ -896,9 +1005,17 @@ const char *pickPlaceStageName(void);
 bool pickPlaceGetSource(int object, double *x, double *y, double *z);
 bool pickPlaceGetTarget(int object, double *x, double *y, double *z);
 
-/* 接近 / 撤离高度（相对取放点的 z 抬升量，也是平移时的飞行高度）。
- * 单值真值在 pick_place.cpp 的 PICK_APPROACH_DZ，探针与上位机靠这个取，不要各自写死。 */
+/* 理想的接近 / 撤离高度（相对取放点的 z 抬升量，即「物体高度 + 5cm」）。
+ * 单值真值在 pick_place.cpp 的 PICK_LIFT_DZ，探针与上位机靠这个取，不要各自写死。
+ * 物体很高时实际用的飞行高度会比它低（被 planTravelZ 降过），要用 pickPlacePlanZ()。 */
 double pickPlaceApproachDz(void);
+
+/* 「物体后方 2cm」的水平退让距离（单值真值 PICK_BACK_DZ）。 */
+double pickPlaceBackDz(void);
+
+/* 按当前位置与物体 object 的位置表，算出这次序列实际会用的飞行高度（工作区 z）。
+ * 只做规划、不改变任何状态；找不到可达的飞行高度时返回 false。 */
+bool pickPlacePlanZ(int object, double *z);
 #else
 /* 取放功能已关闭，这里是空实现 */
 static inline int  pickPlaceStart(int object)   { (void)object; return -1; }
@@ -911,6 +1028,9 @@ static inline bool pickPlaceGetSource(int object, double *x, double *y, double *
 static inline bool pickPlaceGetTarget(int object, double *x, double *y, double *z)
     { (void)object; (void)x; (void)y; (void)z; return false; }
 static inline double pickPlaceApproachDz(void)  { return 0.0; }
+static inline double pickPlaceBackDz(void)      { return 0.0; }
+static inline bool pickPlacePlanZ(int object, double *z)
+    { (void)object; (void)z; return false; }
 #endif
 
 #endif
@@ -1112,9 +1232,9 @@ static inline const char *buttonStateName(void)     { return ""; }
  *     U  继续（= 按键2）
  *     W  取消（= 按键3）
  *   标定命令（都是在"上机对纸面"时用的，可随时发）：
- *     p<数字>        纸面高度（铅笔尖刚好落在纸上时的 Pos.rec.z），例 p12.5
+ *     p<数字>        纸面高度（铅笔尖刚好落在纸上时的 Pos.rec.z），例 p-20
  *     n<数字>        内置图形的半宽（工作区单位，默认 6.0），例 n7
- *     o<x>,<y>       内置图形的中心（工作区单位，默认 20,0），例 o22,-2
+ *     o<x>,<y>       内置图形的中心（工作区单位，默认 27,0），例 o22,-2
  *
  * 【谁让位给谁】
  *   本模块忙（示教/绘制/暂停/回待机）时：
@@ -1391,15 +1511,20 @@ int drawLastResult(void);
 //
 // 【坐标模型（用于显示与工作空间校验）】
 //   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机中立位 90° 的含义:
+//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
 //     b (angle1) 90° -> 基座朝 +x 方向；b 行程 0~180° 使可达空间只占 x >= 0 一侧
-//     r (angle2) 90° -> 上臂竖直向上
-//     c (angle3) 90° -> 下臂水平朝前（与上臂成 90°）
-//   初始位姿 (b,r,c,f) = (90,90,90,0) == 末端 (20, 0, 20)。
-//   正运动学: alpha = r, beta = r - c,
+//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下
+//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上
+//   初始位姿 POS_HOME = (20, 0, -10) -> (b,r,c,f) ≈ (90, 60.55, 7.43, 105)
+//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   正运动学: alpha = 90 - r, beta = c - 90,
 //             x_planar = L1 cos alpha + L2 cos beta,
 //             z = L1 sin alpha + L2 sin beta + armheight,
 //             theta = 90 - b  ->  x = x_planar cos theta, y = x_planar sin theta。
+//   【修正】肩轴反转（alpha = 90 - r）、肘轴正转（beta = c - 90），依据
+//   RC-robot-hand 参考工程实测位姿：R↑=末端降、F↑=末端升。旧 beta = c - 180 把
+//   下臂多算 90°，导致取放时"该下反上"。详见 .selfcheck/README.md 的
+//   "运动学标定"一节。
 //
 // 【调速参数】存在全局 speedCfg (speed) 中，所有移动源共用：
 //     speed.stepSize    满偏（推到底）时每格的关节角（度）；实际每格 = stepSize × 偏转比例
@@ -1489,10 +1614,11 @@ void joystickLoop(void);
  *
  * 只有 C++11 裸机 AVR 代码；本文件不产生任何数据段，也不打印任何东西。
  *
- * 【本版本已删除】pathCorePointOk() 里的 limit 范围检查。笛卡尔坐标范围
- * 限制（rangeLimit/limit）已按需求整体移除；b/r/c 的物理行程 0~180 在
- * moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
- * （原有的 f 60~150 夹爪软限位也已删除）。
+ * 【本版本恢复】pathCorePointOk() 里的 limit 范围检查（"工作空间盒子"，
+ * 见 constant_and_positions.h 的 struct rangeLimit）：取放与绘图的轨迹校验
+ * 就是靠它把越界点整条拒掉。b/r/c 的物理行程 0~180 在 moveJointStep() 内
+ * 硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码（原有的 f 60~150
+ * 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
@@ -1517,12 +1643,15 @@ inline bool pathCoreSolveJoint(double x, double y, double z,
   return true;
 }
 
-/* 这个工作区点能不能用：几何可达 + 反解成功且没被吸附。
- * 【本版本已删除】原来的 limit 三轴范围检查。笛卡尔坐标范围限制已按需求
- * 整体移除；剩下的几何可达性 isReachable() 属于反解的数学前提（acos 定义域），
- * 不是"范围限制"，仍然保留。 */
+/* 这个工作区点能不能用：在 limit 盒内 + 几何可达 + 反解成功且没被吸附。
+ * limit 检查放在最前面：三次纯比较（6 个 double 比较）比 isReachable() 与
+ * 反解都便宜，越界的轨迹能在采样阶段就整条失败。 */
 inline bool pathCorePointOk(double x, double y, double z,
                             double *b, double *r, double *c) {
+  if (x < limit.minX || x > limit.maxX) return false;
+  if (y < limit.minY || y > limit.maxY) return false;
+  if (z < limit.minZ || z > limit.maxZ) return false;
+
   REC rec;
   rec.x = x;
   rec.y = y;
@@ -1585,133 +1714,38 @@ inline bool pathCoreSegmentOk(const double *p0, const double *p1,
 
 // ===== servo_drive.cpp =====
 /*
- * servo_drive.cpp —— 4 路舵机驱动实现（见 servo_drive.h 的完整说明）
+ * servo_drive.cpp —— 4 路舵机驱动实现（Arduino 官方 Servo 库的薄封装）
  *
  * 结构：
- *   servoDriveBegin()          初始化 Timer1（预分频 8、普通模式、比较中断）
- *   servoDriveAttach()         绑定引脚
- *   servoDriveWrite()          写目标角度（换算成 tick，临界区里存入 s_ticks）
- *   servoDriveTicksForDeg()    纯函数：角度 -> tick（复刻 Servo 库映射）
- *   servoDriveStep()           纯函数：脉冲状态机（PC 端可步进验证）
- *   ISR(TIMER1_COMPA_vect)     硬件壳子：调用状态机 + 写 OCR1A
+ *   servoDriveBegin()          初始化钩子（空：Servo::attach 自带时序初始化）
+ *   servoDriveAttach()         绑定引脚（Servo::attach）
+ *   servoDriveWrite()          写目标角度（(int) 截断 + 夹取 0~180 + Servo::write）
+ *
+ * 脉宽映射与时序全部由官方库负责（20ms 帧、544~2400us、TRIM 2us），
+ * 本文件不再持有任何时序状态 —— 旧的 servoDriveTicksForDeg() / servoDriveStep()
+ * 随自研驱动一起删除，probe_servo_drive 已改测本封装的行为。
  */
+#include <Servo.h>
 
-/* ---- 与 Arduino Servo 库逐位一致的脉宽映射参数 ---- */
-#define SERVO_MIN_US      544     /* MIN_PULSE_WIDTH  */
-#define SERVO_MAX_US      2400    /* MAX_PULSE_WIDTH  */
-#define SERVO_TRIM_US     2       /* TRIM_DURATION：补偿 ISR 开销，Servo 库同值 */
-#define SERVO_TICKS_PER_US 2u     /* 预分频 8 => 0.5us/tick => 1us = 2 tick */
-#define SERVO_FRAME_TICKS 60000u  /* 帧周期 = 60000 tick × 0.5us = 30ms（Servo 库是 20ms） */
-#define SERVO_FIRST_TICKS 1000u   /* 上电后 0.5ms 发第一个事件（等寄存器稳定） */
-#define SERVO_DEFAULT_TICKS 3000u /* usToTicks(1500us)：与 Servo 库 attach 的默认脉宽一致 */
-#define SERVO_PIN_NONE    0xFFu   /* 未 attach 的通道哨兵（引脚号 0~19 不会撞上） */
-
-static uint8_t  s_pin[SERVO_CH_COUNT];          /* 通道 -> 引脚号，0xFF = 未绑定 */
-static volatile uint16_t s_ticks[SERVO_CH_COUNT]; /* 通道 -> 脉冲宽度（tick） */
-/* 事件游标：0..3 表示"该通道的脉冲正在输出，下一次事件是把它拉低"；
- * == SERVO_CH_COUNT 表示"4 路都发完了，下一次事件就是下一帧的帧边界"。 */
-static uint8_t  s_ch;
-
-uint16_t servoDriveTicksForDeg(double deg) {
-  int a = (int)deg;                     /* 与原代码 (int) angle 的截断一致 */
-  if (a < 0) { a = 0; } else if (a > 180) { a = 180; }
-  /* map(a, 0, 180, 544, 2400) = a * (2400-544) / 180 + 544（Servo 库用 long 运算） */
-  uint16_t us = (uint16_t)(SERVO_MIN_US + (int)(((long)a * (SERVO_MAX_US - SERVO_MIN_US)) / 180L));
-  us = (uint16_t)(us - SERVO_TRIM_US);
-  return (uint16_t)(us * SERVO_TICKS_PER_US);
-}
+/* 官方库的 Servo 对象每通道一个。Uno 上共用 Timer1（20ms 帧）。 */
+static Servo s_servo[SERVO_CH_COUNT];
 
 void servoDriveBegin(void) {
-  for (uint8_t i = 0; i < SERVO_CH_COUNT; i++) {
-    s_pin[i]   = SERVO_PIN_NONE;
-    s_ticks[i] = SERVO_DEFAULT_TICKS;   /* 未写过角度时保持 1500us 中位（Servo 库 attach 同值） */
-  }
-  s_ch    = SERVO_CH_COUNT;   /* 第一次中断就当成帧边界：清零 TCNT1 并起第 0 路脉冲 */
-#if defined(__AVR__)
-  TCCR1A = 0;
-  /* 普通模式（WGM12 = 0，比较匹配**不**清零 TCNT1）+ 预分频 8：16MHz/8 = 2MHz => 0.5us/tick。
-   * 普通模式正是这里需要的：状态机排的是"绝对比较值"（当前计数 + 脉宽，以及帧长 40000），
-   * 计数器只在帧边界被软件清零，所以每个比较值都落在未来的确定时刻上，不会漂移。 */
-  TCCR1B = _BV(CS11);
-  TCNT1  = 0;
-  TIFR1 |= _BV(OCF1A);        /* 清掉可能挂起的比较中断标志 */
-  OCR1A  = SERVO_FIRST_TICKS;
-  TIMSK1 |= _BV(OCIE1A);      /* 打开 Timer1 比较中断 */
-#endif
+  /* Servo 库在 attach() 里完成定时器与引脚初始化，无需预处理。
+   * 保留本函数是为了维持 meArm.ino 里"Begin 必须在 Attach 之前"的调用序。 */
 }
 
 void servoDriveAttach(uint8_t ch, uint8_t pin) {
   if (ch >= SERVO_CH_COUNT) { return; }
-  s_pin[ch] = pin;
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);
+  s_servo[ch].attach(pin);
 }
 
 void servoDriveWrite(uint8_t ch, double deg) {
   if (ch >= SERVO_CH_COUNT) { return; }
-  uint16_t t = servoDriveTicksForDeg(deg);
-#if defined(__AVR__)
-  uint8_t s = SREG;           /* 16 位变量被中断读到"半新半旧"会输出一个错误脉冲，故进临界区 */
-  cli();
-  s_ticks[ch] = t;
-  SREG = s;
-#else
-  s_ticks[ch] = t;
-#endif
+  int a = (int)deg;                     /* 与原代码 (int) angle 的截断一致 */
+  if (a < 0) { a = 0; } else if (a > 180) { a = 180; }
+  s_servo[ch].write(a);
 }
-
-/* 脉冲状态机（纯函数，PC 端可逐步验证时序） */
-uint8_t servoDriveStep(uint16_t nowTicks, uint16_t *nextDelayTicks) {
-  if (s_ch >= SERVO_CH_COUNT) {
-    /* 帧边界：上一次中断已经排好的 20ms 比较值到点了。
-     * 这里做两件事：把 TCNT1 清零（由调用者写寄存器），并**在同一次中断里**开始本帧
-     * 第 0 路的脉冲 —— 也就是"帧边界 = 第 0 路上升沿"。
-     *
-     * 【为什么帧尾的比较值必须在上一次中断里就算好】中断入口读到的 TCNT1 已经
-     * 越过比较值几个 tick。本分支真正被执行时计数器刚刚到达帧尾（≈40000），
-     * 若在这里现算"还差多少"：remain = (uint16_t)(SERVO_FRAME_TICKS - nowTicks)
-     * 会下溢成 65530 附近（uint16），于是 OCR1A 被排到一个**计数器刚刚过去的
-     * 值**上，要等 16 位计数器绕整整一圈（约 32.8ms）才会再次匹配 —— 帧长会变成
-     * 约 52.8ms（19Hz）、舵机刷新忽快忽慢。
-     * 所以帧尾比较值在"4 路都发完"那一次中断里就算成绝对计数 SERVO_FRAME_TICKS
-     * （见下面最后一段，那时 nowTicks 只有一万多，一定还在未来），
-     * 帧边界分支只负责清零 TCNT1 并起下一帧。 */
-    s_ch = 0u;
-    if (s_pin[0] != SERVO_PIN_NONE) { digitalWrite(s_pin[0], HIGH); }
-    *nextDelayTicks = s_ticks[0];
-    return 1u;
-  }
-
-  /* 结束当前通道的脉冲 */
-  if (s_pin[s_ch] != SERVO_PIN_NONE) { digitalWrite(s_pin[s_ch], LOW); }
-  s_ch++;
-  if (s_ch < SERVO_CH_COUNT) {
-    /* 紧接着输出下一路（和 Servo 库一样：脉冲之间不留大空隙，只隔一次 ISR 的开销） */
-    if (s_pin[s_ch] != SERVO_PIN_NONE) { digitalWrite(s_pin[s_ch], HIGH); }
-    *nextDelayTicks = (uint16_t)(nowTicks + s_ticks[s_ch]);
-    return 0u;
-  }
-
-  /* 4 路都发完：把帧长本身写成比较值（相对本帧 TCNT1 清零点，即绝对计数 40000）。
-   * 此刻 nowTicks 只是四路脉宽之和（默认 4×3000 = 12000，最宽也不到 19184），
-   * 离 40000 还很远，所以这次比较一定命中、不会绕回；到点后由上面的帧边界分支
-   * 接着发下一帧，帧长因此严格是 40000 + 一次中断响应开销 ≈ 20ms。
-   * 注意这里**不能**写 nowTicks + remain 这种"现算剩余量"的等价形式：
-   * 一旦哪天这个分支被移动到帧尾中断里执行（那时 nowTicks ≈ 40006），
-   * uint16 减法下溢就会把下一帧推到 52.8ms 之后（见上面的长注释）。 */
-  *nextDelayTicks = SERVO_FRAME_TICKS;
-  return 0u;
-}
-
-#if defined(__AVR__)
-ISR(TIMER1_COMPA_vect) {
-  uint16_t next;
-  if (servoDriveStep((uint16_t)TCNT1, &next) != 0u) {
-    TCNT1 = 0;            /* 帧起点：计数器清零，20ms 帧从 0 起算 */
-  }
-  OCR1A = next;
-}
-#endif
 
 // ===== constant_and_positions.cpp =====
 //
@@ -1730,17 +1764,29 @@ ISR(TIMER1_COMPA_vect) {
 #endif
 
 /* 复位目标点：工作空间内部的安全点。
- * 选 (20,0,20)：
- *   ① 是用户标定的初始位姿 —— 舵机 (b,r,c)=(90,90,90) 时末端正好在这里；
- *   ② 远离边界，开机不会撞限位；
- *   ③ 避免 x=0 的轴线退化点（rho=0 时回转角无法确定）。 */
-static const REC POS_HOME = { 20, 0, 20 };
+ * 选 (20,0,-10)：折叠回缩的安全位姿，末端在绘图区正上方、纸面（z=-20）之上。
+ * 反解为 (b,r,c)=(90, 60.55, 7.43)：上臂上抬 29.45°、小臂下垂 82.57°，
+ * 开机即收拢、不占桌面也不甩臂。x=20 落在 z=-10 的可达半径 [17.2, 38.7] 内部，
+ * 三个方向 x+/y+/z- 都能继续点动（避开 x≈40 的外边界与 x≈17 的内边界）。 */
+static const REC POS_HOME = { 20, 0, -10 };
 
 /* 机械臂几何参数（上臂长 / 下臂长 / 末端伸出量） */
 struct arm arm1 = { 20, 20, 0 };
 
 /* 全局位姿实例（头文件里 Pos 是 extern 声明，定义必须放这里） */
 pos Pos = { { 0, 0, 0, 0 }, { POS_HOME.x, POS_HOME.y, POS_HOME.z } };
+
+/* 末端笛卡尔坐标范围（"工作空间盒子"，见头文件里的用法说明）。
+ * 【本版】三轴统一 ±40。这只是给外部的**粗坐标范围**（画布/取放点的合法性判据），
+ * 不是真实包络：修正小臂模型为 beta = c - 90 后 r、c 各 0~180，使
+ * alpha、beta 都落在 [-90,90]，两节 cos 都 ≥ 0，所以真实可达集在平面上是
+ * x ≥ 0 的一枚"透镜"（两杆夹角由余弦定理定），不是圆盘、更不是球。
+ * 盒子比真实包络大一圈是有意的：真正的可达性判据是 getAngleEx() 的回代残差。 */
+struct rangeLimit limit = {
+  .minX = -40.0, .maxX = 40.0,
+  .minY = -40.0, .maxY = 40.0,
+  .minZ = -40.0, .maxZ = 40.0
+};
 
 /* 全局调速默认值：中速（1.0 度/格、固定 40ms 一格 = 25°/s） */
 struct speedCfg speed = {
@@ -1776,14 +1822,13 @@ static double __attribute__((noinline)) clampDouble(double v, double lo, double 
  * 【本版本再删一刀】竖向边界 |z - armheight| <= L1+L2 也已按需求删除：
  * z 方向不再单独设卡，能不能到由 getAngleEx() 的残差判据与路径校验决定。
  *
- * 【为什么是圆柱】机械臂的实际可达空间是一个球（球心在肩关节），
- * 圆柱是它的外接柱状包围盒。改用的直接效果：
- *   - 球内的点（R ≤ 40）→ 水平半径 ≤ R ≤ 40，必然放行，**不会误杀**；
- *   - 圆柱内、球外的点（角落区域，例如 (35, 0, 25)），
- *     isReachable 会放行，但下游 getAngleEx() 用余弦定理反解时
- *     仍会因为 R > 40 被拒（残差检查）。所以这一改对最终行为
- *     影响很小，主要作用是"圆柱内的点不再被提前拒掉，让反解
- *     去说能不能到"。
+ * 【为什么是圆柱】"末端到肩关节的距离不会超过两杆之和"对任何姿位都成立，是一条
+ * 与模型无关的必要条件，所以"水平半径 ≤ 40 的圆柱"是真实可达集的外包围盒。
+ *   - 真实可达集内的点必然满足水平半径 ≤ R ≤ 40，**不会误杀**；
+ *   - 圆柱内、真实包络外的点（例如 (35, 0, 25)：R=43 > 40），isReachable 会放行，
+ *     但下游 getAngleEx() 用余弦定理反解时仍会因为 R > 40 被拒（残差检查）。
+ *     所以这一改对最终行为影响很小，主要作用是"圆柱内的点不再被提前拒掉，
+ *     让反解去说能不能到"。
  *
  * 【与反解的分工】本函数只做粗粒度的工作空间外边界检查，
  * 用来尽早拒掉明显不可达的点；能不能真正反解出 b/r/c 由
@@ -1824,9 +1869,18 @@ static void __attribute__((noinline)) fkPlanar(double alpha, double beta,
 }
 
 /* 正运动学：四个舵机角度 -> 末端笛卡尔坐标。
- *   alpha = r, beta = r - c
+ *   alpha = 90 - r     （上臂：r=0 竖直朝上、r=90 水平朝前、r=180 竖直朝下）
+ *   beta  = c - 90     （下臂绝对角：c=0 竖直朝下、c=90 水平朝前、c=180 竖直朝上）
  *   theta = 90 - b
- * f 只转末端夹具，不影响被控点。 */
+ * f 只转末端夹具，不影响被控点。
+ *
+ * 【两轴方向相反：肩轴反转、肘轴正转】依据 RC-robot-hand 参考工程（与真机同型号）
+ * 里记录的真实任务位姿：提臂只改 F(D7) 且 F↑=末端上升（COIN_A 提起 F 20→80、
+ * PEN_B 提起 F 34→79），下降只改 F 且 F↓=末端下降 —— 即小臂舵机"角度↑=末端升"，
+ * 故 beta = c - 90（c=90 → beta=0 水平朝前）。上臂 R(D8) 相反：descend 时 R↑
+ * （COIN 93→107、OBJECT 78→95→102），lift 时 R↓（OBJECT 102→72）—— 即
+ * "角度↑=末端降"，故 alpha = 90 - r。旧式子 beta = c - 180 把"下降"反解成
+ * "上升"，正是取放过程中上下方向搞反的根因（详见 .selfcheck/README.md）。 */
 bool recFromServo(REC *rec, const SER *ser) {
   if (rec == NULL || ser == NULL) return false;
 
@@ -1835,8 +1889,8 @@ bool recFromServo(REC *rec, const SER *ser) {
   double c = ser->angle3;
   if (!isFiniteNum(b) || !isFiniteNum(r) || !isFiniteNum(c)) return false;
 
-  double alpha = r / RADtoDEG;
-  double beta  = (r - c) / RADtoDEG;
+  double alpha = (90.0 - r) / RADtoDEG;
+  double beta  = (c - 90.0) / RADtoDEG;
   double xPlanar;
   double z;
   fkPlanar(alpha, beta, &xPlanar, &z);
@@ -1854,11 +1908,20 @@ bool recFromServo(REC *rec, const SER *ser) {
 }
 
 /* 反解一个平面分支并计算残差。
- * delta 本身就是舵机角 c（弧度）。 */
+ * delta = alpha - beta 是两杆的**几何夹角**（±acos，弧度），不是某个舵机角；
+ * 舵机角由调用方按 alpha = 90 - r、beta = c - 90 换算。 */
 static void ikBranch(double rhoP, double zv, double delta, double L1, double L2,
                      double *beta, double *err) {
   double phiBase = atan2(zv, rhoP);
-  double argW    = atan2(L2 * sin(delta), L1 + L2 * cos(delta));
+  /* 【勘误】这里原先是 atan2(L2*sin(d), L1 + L2*cos(d))，把两杆的角色写反了。
+   * 正解是 R = e^{i·beta}·(L1·e^{i·delta} + L2)，所以
+   *   beta = phiBase - atan2(L1·sin(delta), L2 + L1·cos(delta))
+   * 只有当 L1 == L2 时两种写法的 atan2 结果才恰好互补
+   * （atan2(sin, 1+cos) 恒等于 delta/2），所以本工程 arm1 = {20,20,0}
+   * 一直没暴露；一旦按 constant_and_positions.h 的说明把某一节做长，
+   * 四个候选的残差全都会超限、getAngleEx() 恒返回 false（手臂卡死）。
+   * 依据：L2==L1 时两式恒等，故本修正不改变当前任何一条已验行为。 */
+  double argW    = atan2(L1 * sin(delta), L2 + L1 * cos(delta));
   *beta = phiBase - argW;
   double alpha = *beta + delta;
   double fx, fz;
@@ -1896,13 +1959,24 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   double zv  = pos1->rec.z - arm1.armheight;
   double R2  = rho * rho + zv * zv;
 
-  /* 肘角 |c| 由余弦定理唯一确定 */
+  /* 两杆几何夹角 |alpha - beta| 由余弦定理唯一确定 */
   double cosC = (R2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
   if (cosC >  1.0) cosC =  1.0;
   if (cosC < -1.0) cosC = -1.0;
   double cAbs = acos(cosC);
 
-  const double EPS = 1e-9;
+#ifdef WEARM_IK_TRACE
+  Serial.print(F("[ik] tgt rho=")); Serial.print(rho, 6);
+  Serial.print(F(" zv=")); Serial.print(zv, 6);
+  Serial.print(F(" R2=")); Serial.print(R2, 6);
+  Serial.print(F(" cosC=")); Serial.print(cosC, 12);
+  Serial.print(F(" cAbs=")); Serial.println(cAbs, 12);
+#endif
+
+  /* 行程判据的容差：必须显著大于"弧度<->角度换算"的舍入误差
+   * （~180 * 1e-16 ≈ 2e-14），否则恰好落在行程端点（0/180）的解会被误杀。
+   * 统一用 ANGLE_EPS(1e-6)，与后面负角归零的口径一致。 */
+  const double EPS = ANGLE_EPS;
 
   /* 【硬编码的关节行程】b/r/c 三轴物理行程都是 0~180。
    * 原版本从 servoLimit 结构体读取；本版本已删除该结构体，改为本地常量。
@@ -1922,31 +1996,101 @@ bool getAngleEx(pos *pos1, bool *clamped) {
   bRev = normRevAngle(bRev);
 
   double bestB = 0.0, bestR = 0.0, bestC = 0.0, bestErr = 1e30;
+  int bestPrio = 99;
   int pick = -1;
 
-  /* 四个候选分支：正/反平面 × 肘上/肘下 */
+  /* 四个候选分支，**按优先级**挑：δ = +cAbs 的正/反平面，然后才轮到 δ = -cAbs 的正/反平面。
+   *
+   * 【为什么不是"四个分支取残差最小"】两杆平面机构对同一个点本来就有两个镜像解
+   * （delta = +cAbs 与 -cAbs），在这个模型下两个都常常能落进 r/c 的 0~180 行程、
+   * 残差又都是 0，于是"取残差最小"会靠浮点尾数随机挑一个 —— 同一条直线上相邻
+   * 采样点来回换分支，关节角一次跳 60~80 度，取放/绘图的"段内不许换分支"校验必然
+   * 失败（修复前的固件里 c 就是 delta、且受 c ∈ [0,180] 限制，等效于只允许 +cAbs
+   * 这一族，所以历史上没有暴露过）。
+   *
+   * 【为什么还要保留 -cAbs 这一族】有些点只有镜像解落在行程里：只留 +cAbs 时
+   * probe_rt 的往返验证会多出 13% 的"反解 false"（2028 组里 273 组），绘图的
+   * 轨迹校验也会被这些点整条否掉。所以策略是"**优先级**"而不是"只留一族"：
+   * 先取 +cAbs 一族（与修复前逐位一致，保证段内不跳），只有它一个都不合格时才
+   * 退到 -cAbs（保证仍然解得出来）。同一族里正/反平面取残差小的。
+   * 注意候选必须自己满足 err <= 0.05 才算合格，否则"在行程内但解是错的"会被选中。 */
   for (int i = 0; i < 4; i++) {
-    const bool reversePlane = (i >= 2);
-    const double k = ((i & 1) == 0) ? 1.0 : -1.0;
+    const bool reversePlane = (i & 1) != 0;
+    const bool plusFamily   = (i < 2);
     const double rhoP  = reversePlane ? -rho : rho;
-    const double delta = k * cAbs;
+    const double delta = plusFamily ? cAbs : -cAbs;
+    const int    prio  = plusFamily ? 0 : 1;
     const double b = reversePlane ? bRev : bFwd;
 
     /* 舵机 b 硬限位 0~180 */
-    if (b < minB - EPS || b > maxB + EPS) continue;
+    if (b < minB - EPS || b > maxB + EPS) {
+#ifdef WEARM_IK_TRACE
+      Serial.print(F("[ik] cand ")); Serial.print(i); Serial.println(F(" reject: b out of travel"));
+#endif
+      continue;
+    }
 
     double beta, err;
     ikBranch(rhoP, zv, delta, L1, L2, &beta, &err);
-    double rDeg = RADtoDEG * (beta + delta);
-    double cDeg = RADtoDEG * delta;
+
+    /* 平面几何角 -> 舵机角（正解 recFromServo 的逆）：
+     *   alpha = 90 - r   =>   r = 90 - alpha   （alpha = beta + delta）
+     *   beta  = c - 90   =>   c = beta + 90                          */
+    const double alphaDeg = RADtoDEG * (beta + delta);
+    const double betaDeg  = RADtoDEG * beta;
+    double rDeg = 90.0 - alphaDeg;
+    double cDeg = betaDeg + 90.0;
+
+    /* 【为什么要把 r/c 折回基本区间】alpha - beta 是两杆的几何夹角，正解里周期是
+     * 360°，而本模型的 alpha - beta = 180 - r - c 取值跨到 [-180, 180] 这一侧。
+     * atan2/asin 分支给出的 betaDeg 可能落到 [0,360) 之外（例如 betaDeg = +180
+     * => cDeg = 270，或 betaDeg = -180 => cDeg = -90），它们与折回后的值对应同一
+     * 个位姿；不折回来就会有一个分支被 0~180 的行程判据直接否掉（r 同理，可能是
+     * 360 的整数倍偏移）。normRevAngle() 会把贴 360 的值折回 0、把负值折进
+     * [0,360)。 */
+    rDeg = normRevAngle(rDeg);
+    cDeg = normRevAngle(cDeg);
+
+#ifdef WEARM_IK_TRACE
+    Serial.print(F("[ik] cand ")); Serial.print(i);
+    Serial.print(F(" b=")); Serial.print(b, 6);
+    Serial.print(F(" rhoP=")); Serial.print(rhoP, 9);
+    Serial.print(F(" delta=")); Serial.print(delta, 12);
+    Serial.print(F(" betaDeg=")); Serial.print(betaDeg, 6);
+    Serial.print(F(" rDeg=")); Serial.print(rDeg, 6);
+    Serial.print(F(" cDeg=")); Serial.print(cDeg, 6);
+    Serial.print(F(" err=")); Serial.println(err, 12);
+#endif
 
     /* 舵机 r、c 硬限位 0~180 */
-    if (!(rDeg >= minR - EPS && rDeg <= maxR + EPS)) continue;
-    if (!(cDeg >= minC - EPS && cDeg <= maxC + EPS)) continue;
-    if (!isFiniteNum(err)) continue;
+    if (!(rDeg >= minR - EPS && rDeg <= maxR + EPS)) {
+#ifdef WEARM_IK_TRACE
+      Serial.println(F("[ik] reject: r out of travel"));
+#endif
+      continue;
+    }
+    if (!(cDeg >= minC - EPS && cDeg <= maxC + EPS)) {
+#ifdef WEARM_IK_TRACE
+      Serial.println(F("[ik] reject: c out of travel"));
+#endif
+      continue;
+    }
+    if (!isFiniteNum(err)) {
+#ifdef WEARM_IK_TRACE
+      Serial.println(F("[ik] reject: err not finite"));
+#endif
+      continue;
+    }
+    if (!(err <= 0.05)) {
+#ifdef WEARM_IK_TRACE
+      Serial.println(F("[ik] reject: err too big"));
+#endif
+      continue;
+    }
 
-    if (pick < 0 || err < bestErr) {
-      pick = i; bestErr = err;
+    if (pick < 0 || prio < bestPrio ||
+        (prio == bestPrio && err < bestErr)) {
+      pick = i; bestPrio = prio; bestErr = err;
       bestB = b; bestR = rDeg; bestC = cDeg;
     }
   }
@@ -1962,31 +2106,46 @@ bool getAngleEx(pos *pos1, bool *clamped) {
     return false;
   }
 
-  double angle1 = bestB;
-  double angle2 = bestR;
-  double angle3 = bestC;
-
-  /* 容差内的微小负角归零，避免 -0.0 传给舵机 */
-  if (angle2 > -ANGLE_EPS && angle2 < 0) angle2 = 0;
-  if (angle3 > -ANGLE_EPS && angle3 < 0) angle3 = 0;
-
   /* 【本函数契约：返回 false 时不修改 pos1->ser】走到这里说明 b/r/c 已经有解，
-   * 下面一次性写回。angle4(f) 不由反解决定，保持调用前已有的值不动。
+   * 下面一次性写回（bestB/bestR/bestC 是候选循环里挑出的那一组）。
+   * angle4(f) 不由反解决定，保持调用前已有的值不动。
    * f 的 60~150 硬限位与"越限就吸附/拒绝"的策略已按需求删除（见
    * constant_and_positions.h 的 TOOL_ANGLE_*），所以这里不再碰 angle4，
    * *clamped 也保持函数开头设的 false。 */
-  pos1->ser.angle1 = angle1;
-  pos1->ser.angle2 = angle2;
-  pos1->ser.angle3 = angle3;
+  pos1->ser.angle1 = bestB;
+  pos1->ser.angle2 = bestR;
+  pos1->ser.angle3 = bestC;
 
   return true;
 }
 
+/* 配置自检：把 limit 里写反的 (min,max) 交换回来，返回被修正的轴数。
+ * 盒子写反（例如 minZ = 60、maxZ = -60）会让**每个**点都被判越界，
+ * 机械臂表面上"完全不能动"，所以开机当场纠正并留一条调试日志。
+ * 与调速档位自检同一风格：只修配置，不碰 Pos。 */
+int rangeLimitConfig(void) {
+  int bad = 0;
+
+  if (limit.minX > limit.maxX) { double t = limit.minX; limit.minX = limit.maxX; limit.maxX = t; bad++; }
+  if (limit.minY > limit.maxY) { double t = limit.minY; limit.minY = limit.maxY; limit.maxY = t; bad++; }
+  if (limit.minZ > limit.maxZ) { double t = limit.minZ; limit.minZ = limit.maxZ; limit.maxZ = t; bad++; }
+
+#if WEARM_DEBUG_SERIAL
+  if (bad) {
+    WEARM_LOG("[limit] ERROR: range min>max, auto-corrected:");
+    WEARM_LOG("[limit]   X/Y/Z = [min,max] -> check constant_and_positions.cpp");
+  }
+#endif
+  return bad;
+}
+
 /* 复位到工作空间内的安全初始点。
- * 【本版本已删除】rangeClampConfig()、servoSelfCheck()、clampToRange() 的调用：
- * 三个函数都随 rangeLimit / servoLimit 配置一起被移除。
- * POS_HOME 本身就在工作空间内部，直接写入即可。 */
+ * 【本版本恢复】开机先跑 rangeLimitConfig() 对 limit 配置做一次自检；
+ * rangeClampConfig()、servoSelfCheck()、clampToRange() 仍是删除状态
+ * （servoLimit 那套没恢复，POS_HOME 本身就在工作空间内部，不需要夹取）。 */
 void posInit(void) {
+  (void) rangeLimitConfig();
+
   Pos.rec.x = POS_HOME.x;
   Pos.rec.y = POS_HOME.y;
   Pos.rec.z = POS_HOME.z;
@@ -2076,11 +2235,15 @@ const char * __attribute__((noinline)) speedLevelName(int level) {
   }
 }
 
-/* 慢 → 中 → 快 → 慢 循环降一档 */
+/* 快 → 中 → 慢 → 快 循环降一档
+ * 【勘误】这里原先是 (cur + 1) % 3，而档位 0/1/2 = 慢/中/快，于是"降一档"实际
+ * 上是 慢→中→快→慢，方向搞反了（只有 快→慢 那一跳碰巧是对的）。改成 +2：
+ * 快(2)→中(1)→慢(0)→快(2)。本函数当前无调用点（protocol 的调速走 adjustSpeed），
+ * 修好是为了让将来接入时语义与函数名一致。 */
 int speedStepDown(void) {
   int cur = speedLevel;
   if (cur < SPEED_SLOW || cur > SPEED_FAST) cur = SPEED_FAST;
-  return adjustSpeed((cur + 1) % 3);
+  return adjustSpeed((cur + 2) % 3);
 }
 
 /* ---------- 末端舵机 (angle4 / f) ---------- */
@@ -2108,10 +2271,6 @@ bool posSetAngle4(double angleDeg) {
 /* 轴字符定义：x y z */
 const char protoAxisChar[PROTO_AXIS_COUNT] = { 'x', 'y', 'z' };
 
-/* 轴对应的关节字母，用于串口提示：b r c。
- * 轴 a 写入的就是 angle(a+1)，所以这里不再单独维护一张舵机索引表。 */
-const char protoAxisJoint[PROTO_AXIS_COUNT] = { 'b', 'r', 'c' };
-
 /* 把 x/X/y/Y/z/Z 转成轴下标 0..2，其它字符返回 -1 */
 int protoAxisIndexFromChar(int c)
 {
@@ -2129,25 +2288,6 @@ int protoAxisIndexFromChar(int c)
   return -1;  /* 不认识的轴字符 */
 }
 
-/* 取第 axis 个轴（0..2）的关节行程上下限，直接转发 servoLimit。
- * axis 越界或指针为空时返回 false。 */
-/* 取第 axis 个轴（0..2）的关节行程上下限。
- * 【本版本】已删除 servoLimit 配置，统一硬编码为舵机物理行程 0~180 度。
- * axis 越界或指针为空时返回 false。 */
-bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
-{
-  /* 检查参数有效性 */
-  if (axis < 0 || axis >= PROTO_AXIS_COUNT || minAngle == NULL || maxAngle == NULL) {
-    return false;
-  }
-
-  /* b/r/c 三轴行程均为 0~180 度（硬编码，无需 switch 分支） */
-  *minAngle = 0.0;
-  *maxAngle = 180.0;
-
-  return true;
-}
-
 // ===== move.cpp =====
 //
 // move.cpp
@@ -2157,14 +2297,19 @@ bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle)
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
 //   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
+//   -> 坐标一越出 limit（"工作空间盒子"）=> 也算 MOVE_AT_LIMIT
+//      （角度模式下坐标是派生量，所以这不是"不可达"，而是"这个方向到头了"，
+//        摇杆表现为推到头了）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
 //
 // 所有失败路径都一个字节都不写 Pos —— 这正是原来"备份 + 整步回退"的等价效果，
 // 但省掉了备份变量和两处回退代码。
 //
-// 【本版本已删去】笛卡尔坐标范围检查（posOutOfRange）、可配置的关节限位
-// （clampServoAngles）。b/r/c 三轴的 0~180 物理行程改为在 moveJointStep()
-// 内部直接硬编码；angle4（f）由 posSetAngle4() 单独处理，不走本路径。
+// 【本版本恢复】笛卡尔坐标范围检查（posOutOfRange，只读 limit 盒子）。它只管
+// 关节步进这一条路；取放/绘图的坐标采样点由 path_core.h 的 pathCorePointOk()
+// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的 0~180
+// 物理行程在 moveJointStep() 内部直接硬编码；angle4（f）由 posSetAngle4()
+// 单独处理，不走本路径。
 //
 
 /* ---------- 内部: 方向码 -> 目标关节 / 步进符号 ---------- */
@@ -2208,7 +2353,8 @@ static bool samePose(const SER *a, const SER *b) {
 /* b/r/c 三轴硬编码 0~180 的物理行程夹取。
  * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
  * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
- * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 60~150。 */
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 0~180 的
+ * 舵机电气行程。 */
 static void clampBCR(SER *s) {
   if (s->angle1 < 0.0)   s->angle1 = 0.0;
   if (s->angle1 > 180.0) s->angle1 = 180.0;
@@ -2216,6 +2362,26 @@ static void clampBCR(SER *s) {
   if (s->angle2 > 180.0) s->angle2 = 180.0;
   if (s->angle3 < 0.0)   s->angle3 = 0.0;
   if (s->angle3 > 180.0) s->angle3 = 180.0;
+}
+
+/* 坐标是否越出 limit（"工作空间盒子"，只读判断，不改动 Pos）。
+ * 三轴紧凑循环：limit 的内存布局是 {minX,maxX, minY,maxY, minZ,maxZ}，
+ * REC 是 {x,y,z}，两者都是连续的 double，所以每轴走 2 个 / 1 个 double 即可。
+ *
+ * 【实测记录，别再试】曾经想复用"原地夹取 Pos.rec 并返回是否夹到过"的
+ * clampToRange() 当越界判据：move.cpp 自身能从约 300 B 降到 206 B，
+ * 但 LTO 的连锁反应让 draw_control.cpp 从 13966 B 涨到 14178 B，
+ * 全程序净增 82 B，故回退成这个独立判据。
+ * （clampToRange() 本身随 servoLimit 一起删除了，本版也没有恢复它。） */
+static bool posOutOfRange(const REC *r) {
+  const double *c = &r->x;
+  const double *l = &limit.minX;
+  for (unsigned char i = 0; i < 3; i++) {
+    if (*c < l[0] || *c > l[1]) return true;
+    c++;
+    l += 2;
+  }
+  return false;
 }
 
 /* ---------- 单步关节移动 ---------- */
@@ -2251,9 +2417,16 @@ int moveJointStep(int dir, double stepSize) {
     return MOVE_UNREACHABLE;
   }
 
-  /* 4) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。
-   *    【本版本已删除】笛卡尔坐标范围检查（posOutOfRange）；坐标范围限制
-   *    按需求一并移除，末端坐标只是由角度正解出来的派生量，不再作为软护栏。 */
+  /* 4) 位置边界：这个角度把末端带出了 limit（工作空间盒子）就整步回退。
+   *    角度模式下坐标是派生量，所以这不算"不可达"，而是"这个方向到头了"
+   *    （摇杆收到 MOVE_AT_LIMIT 会照常记录/忽略，不会去重试）。
+   *    【本版】盒子比真实包络宽，这一步现在拦不住任何姿态，但它是配置的
+   *    唯一判据，盒子收窄（例如以后加长两臂后重定边界）就立刻生效。
+   *    全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。 */
+  if (posOutOfRange(&nextRec)) {
+    return MOVE_AT_LIMIT;
+  }
+
   Pos.ser = next;
   Pos.rec = nextRec;
   return MOVE_OK;
@@ -2875,24 +3048,44 @@ void joystickLoop(void) {
 /*
  * pick_place.cpp -- 物体 A / B / C 的自动取放序列（实现）
  *
- * 上位机发单字母 A / B / C，本模块用一条非阻塞状态机走完整套动作：
+ * 上位机发单字母 A / B / C，本模块用一条非阻塞状态机走完整套动作。
+ * 【本条路径是按用户口径重写的】以物体高度为基准，1 工作区单位 = 4 mm
+ * （上臂/下臂各 20 单位 = 80 mm），所以 5 cm = 12.5 单位、2 cm = 5.0 单位：
  *
- *   TO_SRC_APPROACH  从当前位姿直线移动到「物体正上方」
- *   DESCEND_SRC      垂直下降到物体（合爪高度）
- *   CLOSE_TOOL       夹爪合拢到 TOOL_ANGLE_TIGHT（比名义合拢角 60 更紧几度）
- *   DWELL_CLOSE      停顿 PICK_DWELL_MS，等夹稳
- *   LIFT             垂直抬起回接近高度
- *   TRAVERSE         在接近高度上平移到「放置点正上方」
- *   DESCEND_DST      垂直下降到放置点
- *   OPEN_TOOL        夹爪张到 TOOL_ANGLE_OPEN = 150（与串口 'O' 同一个角度）
- *   DWELL_OPEN       停顿，等物体落稳
- *   RETREAT          垂直撤离回接近高度，序列结束
+ *   RISE_SRC      先上移到「物体高度 + 5cm」（垂直上升，x/y 不动）
+ *   TO_BEHIND     沿水平方向移到「物体后方 2cm」（与物体同半径方向后退）
+ *   DESCEND_SRC   垂直下降到与物体同高
+ *   REACH_IN      沿水平半径方向「向前 2cm」，把物体送进两爪之间
+ *   CLOSE_TOOL    夹爪快速合拢到名义合拢角 TOOL_ANGLE_CLOSE(60)
+ *   SQUEEZE_TOOL  再以很慢的速度压到夹紧角 TOOL_ANGLE_TIGHT(45)
+ *   DWELL_CLOSE   停顿 PICK_DWELL_MS，等夹稳（力矩建立 + 物体落定）
+ *   LIFT_SRC      垂直抬回「物体高度 + 5cm」
+ *   TRAVERSE      沿水平方向移到「目标点正上方」
+ *   DESCEND_DST   垂直下降到目标高度（名义上正好是下降 5cm）
+ *   OPEN_TOOL     夹爪张到 TOOL_ANGLE_OPEN = 150（与串口 'O' 同一个角度）
+ *   DWELL_OPEN    停顿，等物体落稳
+ *   RETREAT       垂直撤离回飞行高度
+ *   GO_HOME       关节空间平滑回到「开机初始位姿」POS_HOME（回到初始化的点）
  *
- * 【夹紧】CLOSE_TOOL 结束之后到 OPEN_TOOL 之前的每一帧都会重申一次夹紧角
+ * 【夹紧】合爪分两步是有意的：先用正常速度合到"刚碰到物体"的名义角，再用
+ * 12°/s 慢慢压紧。一步冲到底（尤其是用 60°/s）时，两爪的斜面会像楔子一样把
+ * 物体挤出去；慢压则让物体有时间落进两爪之间。夹持力最终等于舵机堵转力矩，
+ * 和压进去的速度无关，所以慢不会更松。
+ * SQUEEZE_TOOL 结束之后到 OPEN_TOOL 之前的每一帧都会重申一次夹紧角
  * （见 pickHoldingStage()），所以搬运途中夹爪不会因为别处的写入而松开。
- * 每个「移动」阶段都在 x/y/z 上线性插值（所以下降与抬起是垂直的），
- * 每个插值点用固件自己的 getAngleEx() 反解成 b/r/c，三个轴一次写完，
- * 再只做一次正解刷新 Pos.rec —— 与串口角度指令同一约定，坐标与关节角始终自洽。
+ *
+ * 【轴向】夹爪是沿基座的水平半径方向伸出去的，所以"后方 / 向前"都取半径方向
+ * （见 pickBehindPoint），而不是固定 ±x：物体 y 分量较大时两者的方向差很多。
+ *
+ * 【物体高度范围】-10cm ~ +10cm（对称于 z = 0，即 PICK_HEIGHT_MIN/MAX = ±25 单位）。
+ * 物体越高，可行的水平半径越窄（末端到肩的距离 sqrt(rho² + z²) ≤ 40，而且
+ * alpha = 90-r、beta = c-90 都必须落在 [-90,90]）：z = ±25（±10cm）时 rho 只能取
+ * 19.4~31.2，z = 0 时 rho 可以取 0~40。所以"物体高度 + 5cm"这个理想飞行高度，
+ * 在物体又高又远时会整个落出可达包络（比如 +10cm 的物体自身要求 rho ≥ 19.4，
+ * 而它上方 5cm 只允许 rho ≤ 13.9，两者没有交集）。planTravelZ() 于是按
+ * PICK_TRAVEL_STEP 逐档降低飞行高度，直到整条路径都成立，最低不低于
+ * "最高物体 + 1cm"。也就是说物体摆得很高时抬升量会自动变小，但序列仍然能正常
+ * 取放（探针 [2] 会断言实际飞行高度落在 [最高+1cm, 最高+5cm] 内并打印出来）。
  *
  * 启动前把整条路径采样校验一遍（在 limit 内、isReachable()、反解没被吸附、
  * 相邻采样点的反解分支不跳变），任何一条不满足就拒绝启动、一个字节都不改。
@@ -2900,6 +3093,7 @@ void joystickLoop(void) {
  *
  * 【位置表可以随便改】见下面的 PICK_SRC / PICK_DST：三个物体的初始位置互不相同，
  * 三个放置位置也互不相同；且每个物体放置点相对初始点在 x 与 y 上都有明显位移。
+ * 改高度时只要落在 ±25 单位（±10cm）以内就不会被 -4 拒绝。
  */
 
 
@@ -2907,13 +3101,14 @@ void joystickLoop(void) {
 #if WEARM_ENABLE_PICK_PLACE
 /* ==================== 可自定义的位置与参数 ==================== */
 
-/* 台面高度：物体放在这个高度上（工具点与物体同高时合爪）。
- * 上机时按实际台面 + 夹爪几何改这一个值即可，三个物体共用同一张台面。 */
-#define PICK_GRASP_Z -18.0
-
-/* 接近 / 撤离高度：取放点正上方这么高的位置，垂直下降从这里开始，
- * 抬起与撤离也回到这里；它同时是平移到另一个位置时保持的飞行高度。 */
-#define PICK_APPROACH_DZ 41.0
+/* 尺度换算：1 工作区单位 = 4 mm（arm1 = {20, 20, 0}，两节各 80 mm）。
+ * 用户口径的 5cm / 2cm / 10cm 在这里换成工作区单位。 */
+#define PICK_LIFT_DZ      12.5   /* 5 cm：物体上方的接近/撤离高度（理想飞行高度） */
+#define PICK_CLEAR_DZ      2.5   /* 1 cm：飞行高度的下限，再低就会蹭到物体 */
+#define PICK_BACK_DZ       5.0   /* 2 cm：物体"后方"的水平退让距离 */
+#define PICK_TRAVEL_STEP   1.0   /* 0.25 cm：飞行高度逐档下降的步长 */
+#define PICK_HEIGHT_MIN  (-25.0) /* -10 cm：物体放置高度下限 */
+#define PICK_HEIGHT_MAX  ( 25.0) /* +10 cm：物体放置高度上限 */
 
 struct pickPoint {
   double x;
@@ -2923,28 +3118,43 @@ struct pickPoint {
 
 /* Both tables below are read-only, so they live in flash (PROGMEM) to keep
  * 72 bytes out of RAM; every read goes through pgm_read_float(). */
-/* 物体初始位置（= 夹取点）。三个位置互不相同。 */
+/* 物体初始位置（= 夹取点）。三个位置互不相同，高度分别是 -5cm / 0 / +5cm。
+ *
+ * 【可达性】两节各 20 单位，末端到肩的距离 ≤ 40 单位，所以在高度 z 上可用的
+ * 水平半径 rho 是一条带子：
+ *     x_max(z) = sqrt(1600 - z*z)              （两节一起往外伸的极限）
+ *     x_min(z) = 20*sqrt(1 - (|z|/20 - 1)^2)   （上臂竖直、小臂水平折回来的极限）
+ * 反解要求 alpha = 90-r、beta = c-90 都落在 [-90,90]，这正是这两条边界。
+ * 举例：z=0 时 rho 可以是 0~40；z=±20（±5cm）时 rho 必须在 20~34.6；
+ * z=±25（±10cm）时必须落在 19.4~31.2。改表里的 z 时先过一遍这个判据，
+ * 否则会被 pickPlaceStart() 以 -4 拒绝（探针 [2] 会把它指出来）。
+ *
+ * 【飞行高度】理想是"物体高度 + 5cm"，但末端到肩的距离要不超 40：
+ * 物体越高、半径越大，这个高度就越做不到。planTravelZ() 会逐档降低，
+ * 最低不低于"最高物体 + 1cm"。表里 C 在 +5cm / rho=26，飞行高度只能到 29.5
+ * （抬升 2.4cm），就是这条规则在生效。 */
 static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] PROGMEM = {
-  { 24.0,  15.0, PICK_GRASP_Z },   /* A：右侧偏前 */
-  { 24.0, -12.0, PICK_GRASP_Z },   /* B：右侧偏后 */
-  { 12.0,  20.0, PICK_GRASP_Z }    /* C：左前，离基座较近 */
+  { 24.0,  16.0, -20.0 },   /* A：右侧偏前，低处（-5cm），水平半径 28.8 */
+  { 24.0, -12.0,   0.0 },   /* B：右侧偏后，肩高（0），水平半径 26.8 */
+  { 26.0,   0.0,  20.0 }    /* C：正前方，高处（+5cm），水平半径 26.0 */
 };
 
 /* 放置位置。逐条的位移（探针要求 x、y 都有明显位移，门限 5.0）：
- *   A: Δx = 16.0 - 24.0 =  -8.0    Δy = -14.0 -  12.0 = -26.0
+ *   A: Δx = 15.0 - 24.0 =  -9.0    Δy = -18.0 - 16.0 = -34.0
  *   B: Δx = 18.0 - 24.0 =  -6.0    Δy =  16.0 - (-12.0) = +28.0
- *   C: Δx = 28.0 - 12.0 = +16.0    Δy =  -6.0 -  20.0 = -26.0
- * 三个放置点两两之间的距离：A-B 30.1、A-C 14.4、B-C 24.2，都算"明显不同的位置"。
- * 还有一条约束（探针 [1] 会断言）：放置点离**别人**的初始位置不能太近，否则
- * 给某个物体放件时会蹭到还在地上的另一个物体。实测最近的距离是 7.21（√52），
- * 而且是三对并列：B 放 (18,16) 对 A 初始 (24,12)、B 放 (18,16) 对 C 初始 (12,20)、
- * C 放 (28,-6) 对 B 初始 (24,-12)，三对都是 7.2111，比夹爪宽度宽。
- * 最初选的 B 放 (14,16) 与 C 初始点只差 4.47、C 放 (26,-8) 与
- * B 初始点只差 4.47，都改掉了。 */
+ *   C: Δx = 20.0 - 26.0 =  -6.0    Δy = -16.0 -   0.0  = -16.0
+ * 三个放置点两两之间的距离：A-B 34.1、A-C 5.4、B-C 32.1。
+ * 还有一条约束（探针 [1] 会断言，门限 5.0）：放置点离**别人**的初始位置不能太近，
+ * 否则给某个物体放件时会蹭到还在地上的另一个物体。实测最近的几对：
+ *   A 放 (15,-18) 对 C 初始 (26,0)  = √445 ≈ 21.10
+ *   B 放 (18,16)  对 A 初始 (24,16) = 6.00          ← 全局最近
+ *   B 放 (18,16)  对 C 初始 (26,0)  = √320 ≈ 17.89
+ *   C 放 (20,-16) 对 B 初始 (24,-12) = √32 ≈ 5.66
+ * 都大于门限 5.0。 */
 static const struct pickPoint PICK_DST[PICK_OBJECT_COUNT] PROGMEM = {
-  { 16.0, -14.0, PICK_GRASP_Z },   /* A 放这里 */
-  { 18.0,  16.0, PICK_GRASP_Z },   /* B 放这里 */
-  { 28.0,  -6.0, PICK_GRASP_Z }    /* C 放这里 */
+  { 15.0, -18.0, -20.0 },   /* A 放这里，水平半径 23.4 */
+  { 18.0,  16.0,   0.0 },   /* B 放这里，水平半径 24.1 */
+  { 20.0, -16.0,  20.0 }    /* C 放这里，水平半径 25.6 */
 };
 
 static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
@@ -2954,9 +3164,17 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
 #define PICK_RATE_NORMAL_DPS 50.0
 #define PICK_RATE_FAST_DPS   90.0
 
-/* 夹爪开合速度（度/秒），以及开合后用来等物体夹稳 / 放稳的停顿 */
-#define PICK_TOOL_RATE_DPS 60.0
-#define PICK_DWELL_MS      400
+/* 夹爪开合速度（度/秒）：张开、以及"合到名义合拢角"这一段走这个速度。
+ * 最后压紧的那一段（SQUEEZE_TOOL）另外用下面这个慢得多的速度：
+ * 它是"取物不容易松开"的另一半——慢压让物体落进两爪之间，而不是被斜面顶飞。
+ * 两者都只影响走完这段要多久，不影响力矩（力矩是舵机堵转力矩，由夹紧角决定）。 */
+#define PICK_TOOL_RATE_DPS         60.0
+#define PICK_TOOL_SQUEEZE_RATE_DPS 12.0
+
+/* 开合后用来等物体夹稳 / 放稳的停顿。夹紧那一步压得慢，这里也要留足时间：
+ * 舵机把角度走到位 ≠ 力矩已经建立，而且物体常常在这几百毫秒里才真正落定
+ * （爪面压出一点形变、塑料件回弹），此时抬臂才最不容易掉。 */
+#define PICK_DWELL_MS      600
 
 /* 单个阶段的耗时下限 / 上限（毫秒）：太短会抖，太长会显得呆 */
 #define PICK_MIN_SEG_MS 180
@@ -2973,40 +3191,50 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
  * 直接用会让第一段开头猛跳一下，所以宁可拒绝启动。 */
 #define PICK_START_TOL_DEG 10.0
 
-/* 夹爪开 / 合的目标角度（末端 f 关节，逻辑角）。
- * 开：TOOL_ANGLE_OPEN = 150（与串口 'O' 一致，见 constant_and_positions.h）。
- * 合：TOOL_ANGLE_TIGHT —— 比名义合拢角 60 再往里压几度。60~150 的"夹爪范围
- *     限制"已删除，正是它以前让"比 60 更紧"写不进去；合爪之后到开爪之前的
- *     每一帧都会重申这个角（见 pickHoldingStage()），搬运途中不会松脱。 */
-#define PICK_TOOL_OPEN_ANGLE  TOOL_ANGLE_OPEN
-#define PICK_TOOL_CLOSE_ANGLE TOOL_ANGLE_TIGHT
+/* 夹爪在取放序列里的三个目标角（末端 f 关节，逻辑角；定义见 constant_and_positions.h）。
+ * 合爪分两步，这是"取物不容易松开"的关键：
+ *   CLOSE_TOOL    快速合到名义合拢角 TOOL_ANGLE_CLOSE(60)——把两爪送到物体附近，
+ *                 但不在这里使劲；
+ *   SQUEEZE_TOOL  用 PICK_TOOL_SQUEEZE_RATE_DPS 很慢地压到夹紧角
+ *                 TOOL_ANGLE_TIGHT(45)。慢是必须的：一步冲到底时，两爪斜面会像
+ *                 楔子一样把物体顶出去；慢慢压，物体才有时间落进两爪之间。
+ * 夹紧力最终等于舵机堵转力矩，与速度无关，所以慢不会夹得更松。
+ * 60~150 的"夹爪范围限制"已删除，正是它以前让"比 60 更紧"写不进去；
+ * 合爪之后到开爪之前的每一帧都会重申夹紧角（见 pickHoldingStage()）。 */
+#define PICK_TOOL_OPEN_ANGLE    TOOL_ANGLE_OPEN
+#define PICK_TOOL_CLOSE_ANGLE   TOOL_ANGLE_CLOSE
+#define PICK_TOOL_SQUEEZE_ANGLE TOOL_ANGLE_TIGHT
 
 /* ==================== 状态机 ==================== */
 
 enum {
   PICK_ST_IDLE = 0,
-  PICK_ST_TO_SRC_APPROACH,
-  PICK_ST_DESCEND_SRC,
+  PICK_ST_RISE_SRC,        /* 上移到 物体高度+5cm */
+  PICK_ST_TO_BEHIND,       /* 水平移到 物体后方 2cm */
+  PICK_ST_DESCEND_SRC,     /* 下降到 与物体同高 */
+  PICK_ST_REACH_IN,        /* 向前 2cm 到物体上 */
   PICK_ST_CLOSE_TOOL,
+  PICK_ST_SQUEEZE_TOOL,
   PICK_ST_DWELL_CLOSE,
-  PICK_ST_LIFT,
-  PICK_ST_TRAVERSE,
-  PICK_ST_DESCEND_DST,
+  PICK_ST_LIFT_SRC,        /* 抬回 物体高度+5cm */
+  PICK_ST_TRAVERSE,        /* 水平移到 目标点正上方 */
+  PICK_ST_DESCEND_DST,     /* 下降 5cm 到目标高度 */
   PICK_ST_OPEN_TOOL,
   PICK_ST_DWELL_OPEN,
-  PICK_ST_RETREAT
+  PICK_ST_RETREAT,         /* 抬回飞行高度 */
+  PICK_ST_GO_HOME          /* 回到开机初始位姿 */
 };
 
 static const char *const PICK_STAGE_NAME[] = {
-  "idle", "to-src-approach", "descend-src", "close-tool", "dwell-close",
-  "lift", "traverse", "descend-dst", "open-tool", "dwell-open",
-  "retreat"
+  "idle", "rise-src", "to-behind", "descend-src", "reach-in",
+  "close-tool", "squeeze-tool", "dwell-close", "lift-src", "traverse",
+  "descend-dst", "open-tool", "dwell-open", "retreat", "go-home"
 };
 
-/* 阶段类型：直线插值移动 / 夹爪角度渐变 / 原地停顿 */
-enum { PICK_KIND_MOVE = 0, PICK_KIND_TOOL, PICK_KIND_DWELL };
+/* 阶段类型：直线插值移动 / 夹爪角度渐变 / 原地停顿 / 关节空间插值（回初始位姿） */
+enum { PICK_KIND_MOVE = 0, PICK_KIND_TOOL, PICK_KIND_DWELL, PICK_KIND_HOME };
 
-/* The scalars below only ever hold -1..2 / 0..10 / 0..2, and the stage duration
+/* The scalars below only ever hold -1..2 / 0..14 / 0..3, and the stage duration
  * is clamped to PICK_MAX_SEG_MS (4000), so narrow types are enough and save
  * 5 bytes of RAM.  All of them keep their previous values and comparisons. */
 static signed char s_obj = -1;                  /* current object index, -1 = idle */
@@ -3017,9 +3245,14 @@ static unsigned short s_stageMs = 0;            /* planned duration of this stag
 
 static double s_fromX = 0.0, s_fromY = 0.0, s_fromZ = 0.0;   /* 移动段起点 */
 static double s_toX = 0.0, s_toY = 0.0, s_toZ = 0.0;         /* 移动段终点 */
-/* The tool stage reuses s_fromX / s_toX for its start and end angle: s_kind
- * selects which pair is meaningful, and a move stage never overlaps a tool
- * stage, so a separate pair of doubles would only waste RAM. */
+/* The tool stage reuses s_fromX / s_toX for its start and end angle, and the
+ * home stage reuses all six for the three joint angles; s_kind selects which
+ * meaning applies, and two stages never overlap, so extra doubles would only
+ * waste RAM. */
+
+/* 规划出来的飞行高度（水平移动时保持的 z）。只在一次序列期间有效，
+ * 由 pickPlaceStart() 写入；见 planTravelZ()。 */
+static double s_travelZ = 0.0;
 
 /* ==================== 小工具 ==================== */
 
@@ -3043,6 +3276,24 @@ static void loadPickPoint(const struct pickPoint *tab, double *out) {
   out[2] = PICK_COORD(tab, z);
 }
 
+/* 物体"后方 2cm"的那个点：从物体沿水平半径方向朝基座退 PICK_BACK_DZ。
+ * 夹爪沿基座的半径方向伸出去，所以"后方 / 向前"都该取半径方向；物体 y 分量
+ * 大时若固定退 -x，退让方向会和夹爪的开合方向差出几十度。
+ * z 沿用物体自身的高度（调用方需要别的 z 时自己覆盖 out[2]）。 */
+static void pickBehindPoint(const double *p, double *out) {
+  double rho = sqrt(p[0] * p[0] + p[1] * p[1]);
+  if (rho < 1e-6) {            /* 物体正好在基座正上方：没有半径方向可言 */
+    out[0] = p[0];
+    out[1] = p[1];
+    out[2] = p[2];
+    return;
+  }
+  double k = PICK_BACK_DZ / rho;
+  out[0] = p[0] - p[0] * k;
+  out[1] = p[1] - p[1] * k;
+  out[2] = p[2];
+}
+
 /* 反解 / 点校验 / 直线段校验三件套搬到了 path_core.h，与 draw_control 共用同一份
  * 实现（原来两个模块各存了一份逐字相同的代码）。采样步长与分支跳变门限这些
  * 常量仍由本文件提供（PICK_PATH_SAMPLE_STEP / PICK_PATH_SAMPLE_MAX /
@@ -3060,7 +3311,10 @@ static double pickRateDps(void) {
  * Called from both beginMove and beginTool; the body (one divide, two clamps
  * and a rounding) is far bigger than the call convention, so keep a single
  * out-of-line copy and let both callers share it.  noclone stops the compiler
- * from cloning a specialised copy for the constant PICK_TOOL_RATE_DPS. */
+ * from cloning a specialised copy per call site: the rate is always a
+ * compile-time constant (pickRateDps() for moves, PICK_TOOL_RATE_DPS or
+ * PICK_TOOL_SQUEEZE_RATE_DPS for the gripper), so without it the compiler
+ * would emit one inlined copy for each distinct constant. */
 static unsigned long __attribute__((noinline, noclone))
 durationMs(double degrees, double rateDps) {
   double ms = 0.0;
@@ -3074,13 +3328,50 @@ durationMs(double degrees, double rateDps) {
 
 /* 三个轴一次写完，只做一次正解刷新（与串口角度指令同一约定）——实现见 path_core.h */
 
+/* ==================== 飞行高度规划 ==================== */
+
+/* 找一个能让整条路径都成立的"飞行高度"（水平平移时保持的 z）。
+ *
+ * 理想值 = 最高物体 + PICK_LIFT_DZ(5cm)。但两节各 20 单位，末端到肩的距离
+ * sqrt(rho² + z²) ≤ 40，物体越高可达的水平半径越小：+10cm（z=+25）的物体，
+ * 5cm 的飞行高度要求 rho ≤ 13.9 单位，绝大多数取放点都做不到。这时按
+ * PICK_TRAVEL_STEP 逐档降低飞行高度，直到下面七个关键点全部可解：
+ *     起点正上方 / 物体后方(飞行高度) / 物体正上方(飞行高度) /
+ *     目标点正上方 / 物体后方(物体同高) / 物体同高 / 目标同高
+ * 因为每一段只在一个 z 上（或一根竖直线上）走，而判据对 rho、|z| 单调，
+ * 端点可解就等价于整段可解，所以先只查端点，确认后再由调用方做整段采样校验。
+ *
+ * 最低不低于"最高物体 + PICK_CLEAR_DZ(1cm)"——再低就会蹭到物体。
+ * 找到返回 true 并写 *outZ；整个区间都不可达时返回 false（调用方拒绝启动）。 */
+static bool planTravelZ(const double *src, const double *dst, const double *behind,
+                        double fromX, double fromY, double *outZ) {
+  const double top = (src[2] > dst[2]) ? src[2] : dst[2];
+  const double zMin = top + PICK_CLEAR_DZ;
+  const int maxSteps = (int)((PICK_LIFT_DZ - PICK_CLEAR_DZ) / PICK_TRAVEL_STEP);
+
+  for (int i = 0; i <= maxSteps; i++) {
+    const double z = top + PICK_LIFT_DZ - (double)i * PICK_TRAVEL_STEP;
+    if (z < zMin - 1e-9) break;
+    double b = 0.0, r = 0.0, c = 0.0;
+    if (!pathCorePointOk(fromX, fromY, z, &b, &r, &c)) continue;
+    if (!pathCorePointOk(behind[0], behind[1], z, &b, &r, &c)) continue;
+    if (!pathCorePointOk(src[0], src[1], z, &b, &r, &c)) continue;
+    if (!pathCorePointOk(dst[0], dst[1], z, &b, &r, &c)) continue;
+    if (!pathCorePointOk(behind[0], behind[1], src[2], &b, &r, &c)) continue;
+    if (!pathCorePointOk(src[0], src[1], src[2], &b, &r, &c)) continue;
+    if (!pathCorePointOk(dst[0], dst[1], dst[2], &b, &r, &c)) continue;
+    *outZ = z;
+    return true;
+  }
+  return false;
+}
+
 /* ==================== 阶段切换 ==================== */
 
-/* The target arrives as a point array plus a rise flag: rise != 0 means the
- * target is that point's raised point (z plus PICK_APPROACH_DZ).  Each of the
- * six call sites therefore pushes one address and one flag instead of three
- * doubles; the array values are bit-identical to the old arguments. */
-static void beginMove(int stage, const double *p, int rise) {
+/* 目标点 p（三个 double）及其 z：beginMove 用 p 自己的 z（下降/平移段），
+ * beginMoveAt 用调用方给的 z（"回到飞行高度"这种抬高段）。
+ * 主体只留一份，两个薄壳靠 LTO 内联，避免每个调用点各存一份三 double 的装配代码。 */
+static void beginMoveAt(int stage, const double *p, double z) {
   s_stage = (signed char)stage;
   s_kind = PICK_KIND_MOVE;
   s_fromX = Pos.rec.x;
@@ -3088,11 +3379,15 @@ static void beginMove(int stage, const double *p, int rise) {
   s_fromZ = Pos.rec.z;
   s_toX = p[0];
   s_toY = p[1];
-  s_toZ = rise ? (p[2] + PICK_APPROACH_DZ) : p[2];
+  s_toZ = z;
   s_stageStartMs = millis();
 
-  /* 这段要走多久：按"变化最大的那个关节"算，保证任何关节都不超过设定角速度。
-   * 反解失败时给 0，落到耗时下限，具体在推进时还会再查一次。 */
+  /* 这段要走多久：按"变化最大的那个关节"算**名义**耗时（dMax / 当前档位的角速度），
+   * 让各轴同步到达。注意 durationMs() 还有 PICK_MAX_SEG_MS(4000ms) 上限，所以
+   * 大幅度运动时实际角速度会高于档位标称值：180° 按 25°/s 需要 7200ms，被夹到
+   * 4000ms 就变成 45°/s。这是"宁可快一点，也不要一段走 7 秒"的有意取舍，
+   * 不是"任何关节都不超过设定角速度"（旧注释就是这么写的，不成立）。
+   * 反解失败时 dMax 保持 0，落到耗时下限 PICK_MIN_SEG_MS；推进时还会再查一次。 */
   double dMax = 0.0;
   double b = 0.0, r = 0.0, c = 0.0;
   if (pathCoreSolveJoint(s_toX, s_toY, s_toZ, &b, &r, &c)) {
@@ -3104,27 +3399,64 @@ static void beginMove(int stage, const double *p, int rise) {
   s_stageMs = (unsigned short)durationMs(dMax, pickRateDps());
 }
 
+static void beginMove(int stage, const double *p) {
+  beginMoveAt(stage, p, p[2]);
+}
+
 /* English note: this body (four state stores, millis(), durationMs(), one
- * subtraction) is reached from two places in advanceStage().  Keeping a single
- * out-of-line copy costs less flash than the two inlined copies the compiler
+ * subtraction) is reached from three places in advanceStage().  Keeping a single
+ * out-of-line copy costs less flash than the three inlined copies the compiler
  * would otherwise emit; noclone stops it from rebuilding a specialised copy
- * for the two constant-rate call sites.  No behaviour change: the parameters
- * and the state written are identical. */
+ * for the call sites whose rate is a compile-time constant (all of them are,
+ * and they no longer share one value: the close/open steps use
+ * PICK_TOOL_RATE_DPS while the squeeze step uses the much slower
+ * PICK_TOOL_SQUEEZE_RATE_DPS).  No behaviour change beyond that rate. */
 static void __attribute__((noinline, noclone))
-beginTool(int stage, double targetAngle) {
+beginTool(int stage, double targetAngle, double rateDps) {
   s_stage = (signed char)stage;
   s_kind = PICK_KIND_TOOL;
   s_fromX = Pos.ser.angle4;
   s_toX = targetAngle;
   s_stageStartMs = millis();
-  s_stageMs = (unsigned short)durationMs(fabs(s_toX - s_fromX), PICK_TOOL_RATE_DPS);
+  s_stageMs = (unsigned short)durationMs(fabs(s_toX - s_fromX), rateDps);
 }
 
 static void beginDwell(int stage, unsigned long ms) {
   s_stage = (signed char)stage;
   s_kind = PICK_KIND_DWELL;
   s_stageStartMs = millis();
-  s_stageMs = (unsigned short)ms;
+  /* s_stageMs 是 unsigned short：先夹到 60000ms 再窄化，免得调用方传进超长停顿时
+   * 静默回绕成"立刻结束"。目前唯一调用点用的是 PICK_DWELL_MS(600)。 */
+  s_stageMs = (ms > 60000UL) ? (unsigned short)60000 : (unsigned short)ms;
+}
+
+/* 最后一段：关节空间平滑回到开机初始位姿 POS_HOME。
+ * 走关节插值而不是再反解一个笛卡尔点，是因为初始位姿本身就是一个关节姿态，
+ * 直接插值不经过反解、不会在收拢姿态附近碰上分支跳变；Pos.rec 由 recFromServo()
+ * 每帧刷新，坐标与关节角一样保持自洽。angle4 不动（此时已经张开）。 */
+static void beginHome(void) {
+  s_stage = PICK_ST_GO_HOME;
+  s_kind = PICK_KIND_HOME;
+  s_fromX = Pos.ser.angle1;
+  s_fromY = Pos.ser.angle2;
+  s_fromZ = Pos.ser.angle3;
+
+  SER home;
+  if (posGetHomeAngles(&home)) {
+    s_toX = home.angle1;
+    s_toY = home.angle2;
+    s_toZ = home.angle3;
+  } else {
+    s_toX = s_fromX;
+    s_toY = s_fromY;
+    s_toZ = s_fromZ;
+  }
+
+  s_stageStartMs = millis();
+  double dMax = fabs(s_toX - s_fromX);
+  double d = fabs(s_toY - s_fromY); if (d > dMax) dMax = d;
+  d = fabs(s_toZ - s_fromZ);        if (d > dMax) dMax = d;
+  s_stageMs = (unsigned short)durationMs(dMax, pickRateDps());
 }
 
 /* 序列结束（正常跑完） */
@@ -3132,7 +3464,7 @@ static void finishSequence(void) {
 #if WEARM_DEBUG_SERIAL
   Serial.print(F("[pick] "));
   Serial.print(PICK_LETTER[s_obj]);
-  Serial.print(F(" done, retreat pos = ("));
+  Serial.print(F(" done, final pos = ("));
   Serial.print(Pos.rec.x, 2);
   Serial.print(F(", "));
   Serial.print(Pos.rec.y, 2);
@@ -3174,55 +3506,75 @@ static void abortSequence(void) {
 #define PICK_ABORT(msg) abortSequence()
 #endif
 
-/* 【每一帧都夹紧】手里的东西从"合上夹爪"到"松开夹爪"之间必须一直夹着：
+/* 【每一帧都夹紧】手里的东西从"压紧"到"松开"之间必须一直夹着：
  * 判据 = 当前阶段是否处于"已经夹住、还没放开"的区间。
- *   DWELL_CLOSE   合爪结束后的稳定停顿（此时已经是夹紧角）
- *   LIFT/TRAVERSE/DESCEND_DST  抬升、平移、下降到目标上方（全程不能松）
- * 不含 TRAVERSE 之后的 DESCEND_SRC/CLOSE_TOOL（还在往夹紧角插值，s_kind==TOOL
- * 自己会处理），也不含 DWELL_OPEN/OPEN_TOOL/RETREAT（已经松开）。
- * 调用点用 s_kind != PICK_KIND_TOOL 把 TOOL 阶段排除掉，避免与插值打架。 */
+ *   DWELL_CLOSE   压紧结束后的稳定停顿（此时已经是夹紧角）
+ *   LIFT_SRC/TRAVERSE/DESCEND_DST  抬起、平移、下降到目标（全程不能松）
+ * 不含开始阶段的 DESCEND_SRC / REACH_IN / CLOSE_TOOL / SQUEEZE_TOOL（还在往合拢角、
+ * 夹紧角插值，s_kind==TOOL 自己会处理），也不含 DWELL_OPEN/OPEN_TOOL/RETREAT/GO_HOME
+ *（已经松开）。调用点用 s_kind != PICK_KIND_TOOL 把 TOOL 阶段排除掉，避免与插值打架。 */
 static bool pickHoldingStage(int st) {
-  return st == PICK_ST_DWELL_CLOSE || st == PICK_ST_LIFT ||
+  return st == PICK_ST_DWELL_CLOSE || st == PICK_ST_LIFT_SRC ||
          st == PICK_ST_TRAVERSE    || st == PICK_ST_DESCEND_DST;
 }
 
 /* 本阶段跑完，进入下一阶段 */
 static void advanceStage(void) {
-  double src[3], dst[3];
+  double src[3], dst[3], p[3];
   loadPickPoint(&PICK_SRC[s_obj], src);
   loadPickPoint(&PICK_DST[s_obj], dst);
+  pickBehindPoint(src, p);            /* p = 物体后方 2cm 的水平点 */
 
   switch (s_stage) {
-    case PICK_ST_TO_SRC_APPROACH:
-      beginMove(PICK_ST_DESCEND_SRC, src, 0);
+    case PICK_ST_RISE_SRC:
+      p[2] = s_travelZ;               /* 水平移到物体后方（还是在飞行高度上） */
+      beginMove(PICK_ST_TO_BEHIND, p);
+      break;
+
+    case PICK_ST_TO_BEHIND:
+      p[2] = src[2];                  /* 垂直下降到与物体同高 */
+      beginMove(PICK_ST_DESCEND_SRC, p);
       break;
 
     case PICK_ST_DESCEND_SRC:
-      beginTool(PICK_ST_CLOSE_TOOL, PICK_TOOL_CLOSE_ANGLE);
+      beginMove(PICK_ST_REACH_IN, src);   /* 向前 2cm，把物体送进两爪之间 */
+      break;
+
+    case PICK_ST_REACH_IN:
+      beginTool(PICK_ST_CLOSE_TOOL, PICK_TOOL_CLOSE_ANGLE, PICK_TOOL_RATE_DPS);
       break;
 
     case PICK_ST_CLOSE_TOOL:
+      /* 只合到"刚碰到物体"的名义角，此时还不使劲；
+       * 真正压紧交给下一段用很慢的速度做，免得把物体顶出去。 */
+      beginTool(PICK_ST_SQUEEZE_TOOL, PICK_TOOL_SQUEEZE_ANGLE,
+                PICK_TOOL_SQUEEZE_RATE_DPS);
+      break;
+
+    case PICK_ST_SQUEEZE_TOOL:
 #if WEARM_DEBUG_SERIAL
-      Serial.print(F("[pick] gripper closed at angle4 = "));
+      Serial.print(F("[pick] gripper squeezed at angle4 = "));
       Serial.println(Pos.ser.angle4);
 #endif
       beginDwell(PICK_ST_DWELL_CLOSE, PICK_DWELL_MS);
       break;
 
     case PICK_ST_DWELL_CLOSE:
-      beginMove(PICK_ST_LIFT, src, 1);
+      p[0] = src[0]; p[1] = src[1]; p[2] = s_travelZ;
+      beginMove(PICK_ST_LIFT_SRC, p);     /* 抬回物体高度 + 5cm */
       break;
 
-    case PICK_ST_LIFT:
-      beginMove(PICK_ST_TRAVERSE, dst, 1);
+    case PICK_ST_LIFT_SRC:
+      p[0] = dst[0]; p[1] = dst[1]; p[2] = s_travelZ;
+      beginMove(PICK_ST_TRAVERSE, p);     /* 水平移到目标点正上方 */
       break;
 
     case PICK_ST_TRAVERSE:
-      beginMove(PICK_ST_DESCEND_DST, dst, 0);
+      beginMove(PICK_ST_DESCEND_DST, dst);   /* 下降到目标高度（名义 5cm） */
       break;
 
     case PICK_ST_DESCEND_DST:
-      beginTool(PICK_ST_OPEN_TOOL, PICK_TOOL_OPEN_ANGLE);
+      beginTool(PICK_ST_OPEN_TOOL, PICK_TOOL_OPEN_ANGLE, PICK_TOOL_RATE_DPS);
       break;
 
     case PICK_ST_OPEN_TOOL:
@@ -3234,10 +3586,15 @@ static void advanceStage(void) {
       break;
 
     case PICK_ST_DWELL_OPEN:
-      beginMove(PICK_ST_RETREAT, dst, 1);
+      p[0] = dst[0]; p[1] = dst[1]; p[2] = s_travelZ;
+      beginMove(PICK_ST_RETREAT, p);      /* 垂直撤离回飞行高度 */
       break;
 
     case PICK_ST_RETREAT:
+      beginHome();                        /* 回到初始化的点 */
+      break;
+
+    case PICK_ST_GO_HOME:
       finishSequence();
       break;
 
@@ -3261,11 +3618,19 @@ int pickPlaceStart(int object) {
     return -2;
   }
 
-  double srcP[3], dstP[3], srcRiseP[3], dstRiseP[3];
-  loadPickPoint(&PICK_SRC[object], srcP);
-  loadPickPoint(&PICK_DST[object], dstP);
-  srcRiseP[0] = srcP[0]; srcRiseP[1] = srcP[1]; srcRiseP[2] = srcP[2] + PICK_APPROACH_DZ;
-  dstRiseP[0] = dstP[0]; dstRiseP[1] = dstP[1]; dstRiseP[2] = dstP[2] + PICK_APPROACH_DZ;
+  double src[3], dst[3], behind[3];
+  loadPickPoint(&PICK_SRC[object], src);
+  loadPickPoint(&PICK_DST[object], dst);
+  pickBehindPoint(src, behind);
+
+  /* 0) 物体高度必须落在 -10cm ~ +10cm 里 */
+  if (src[2] < PICK_HEIGHT_MIN || src[2] > PICK_HEIGHT_MAX ||
+      dst[2] < PICK_HEIGHT_MIN || dst[2] > PICK_HEIGHT_MAX) {
+#if WEARM_DEBUG_SERIAL
+    Serial.println(F("[pick] rejected: object height outside -10cm..+10cm"));
+#endif
+    return -4;
+  }
 
   /* 1) 当前位姿可用，而且手里的关节角与它的反解是同一个分支 */
   double b = 0.0, r = 0.0, c = 0.0;
@@ -3280,56 +3645,80 @@ int pickPlaceStart(int object) {
     return -3;
   }
 
-  /* 2) Sample-check the whole path (4 straight segments); one bad segment rejects
-   * the whole sequence.  segmentOk is direction blind: it samples steps+1 points
-   * English note: segmentOk is direction blind.  It samples steps+1 points
-   * along the segment and every per-point predicate (limits, reachability, the
-   * IK branch-jump test) depends on that point alone, so validating a segment
-   * one way already covers the other way.  The old code additionally ran the
-   * reversed pairs srcP->srcRiseP and dstP->dstRiseP; they only duplicated the
-   * two forward calls above (same point set, same 0.5 mm step count) and each
-   * call site costs the full 3-double argument setup, so they are dropped.
-   * Both dropped segments are pure functions of the object index (they do not
-   * read the current pose) and both were already true for every object this
-   * function can be called with, so the accept/reject split is unchanged. */
-  double curP[3];
-  curP[0] = Pos.rec.x; curP[1] = Pos.rec.y; curP[2] = Pos.rec.z;
-  if (!pathCoreSegmentOk(curP, srcRiseP, PICK_PATH_SAMPLE_STEP,
-                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
-      !pathCoreSegmentOk(srcRiseP, srcP, PICK_PATH_SAMPLE_STEP,
-                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
-      !pathCoreSegmentOk(srcRiseP, dstRiseP, PICK_PATH_SAMPLE_STEP,
-                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG) ||
-      !pathCoreSegmentOk(dstRiseP, dstP, PICK_PATH_SAMPLE_STEP,
-                         PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG)) {
+  /* 2) 规划飞行高度（物体很高时会自动降低，见 planTravelZ） */
+  double travelZ = 0.0;
+  if (!planTravelZ(src, dst, behind, Pos.rec.x, Pos.rec.y, &travelZ)) {
 #if WEARM_DEBUG_SERIAL
-    Serial.print(F("[pick] rejected: path check failed for "));
+    Serial.print(F("[pick] rejected: no reachable travel height for "));
     Serial.println(PICK_LETTER[object]);
 #endif
-    return -3;
+    return -4;
+  }
+
+  /* 3) 整条路径采样校验（7 段直线）：从当前位姿一路到目标高度。
+   *    拐点顺序就是执行顺序，逐段调 pathCoreSegmentOk()：
+   *      起点 -> 起点正上方(飞行高度) -> 物体后方(飞行高度) -> 物体后方(物体同高)
+   *      -> 物体同高 -> 物体正上方(飞行高度) -> 目标正上方(飞行高度) -> 目标同高
+   *    返回 HOME 那一段走关节插值，不需要也不该做笛卡尔校验。 */
+  double path[8][3];
+  path[0][0] = Pos.rec.x; path[0][1] = Pos.rec.y; path[0][2] = Pos.rec.z;
+  path[1][0] = Pos.rec.x; path[1][1] = Pos.rec.y; path[1][2] = travelZ;
+  path[2][0] = behind[0]; path[2][1] = behind[1]; path[2][2] = travelZ;
+  path[3][0] = behind[0]; path[3][1] = behind[1]; path[3][2] = src[2];
+  path[4][0] = src[0];    path[4][1] = src[1];    path[4][2] = src[2];
+  path[5][0] = src[0];    path[5][1] = src[1];    path[5][2] = travelZ;
+  path[6][0] = dst[0];    path[6][1] = dst[1];    path[6][2] = travelZ;
+  path[7][0] = dst[0];    path[7][1] = dst[1];    path[7][2] = dst[2];
+
+  for (int i = 0; i + 1 < 8; i++) {
+    if (!pathCoreSegmentOk(path[i], path[i + 1], PICK_PATH_SAMPLE_STEP,
+                           PICK_PATH_SAMPLE_MAX, PICK_BRANCH_JUMP_DEG)) {
+#if WEARM_DEBUG_SERIAL
+      Serial.print(F("[pick] rejected: path check failed for "));
+      Serial.print(PICK_LETTER[object]);
+      Serial.print(F(" at segment "));
+      Serial.println(i);
+#endif
+      return -3;
+    }
   }
 
   s_obj = (signed char)object;
+  s_travelZ = travelZ;
 #if WEARM_DEBUG_SERIAL
   Serial.print(F("[pick] start "));
   Serial.print(PICK_LETTER[object]);
   Serial.print(F(": src=("));
-  Serial.print(srcP[0], 2);
+  Serial.print(src[0], 2);
   Serial.print(F(", "));
-  Serial.print(srcP[1], 2);
+  Serial.print(src[1], 2);
   Serial.print(F(", "));
-  Serial.print(srcP[2], 2);
+  Serial.print(src[2], 2);
   Serial.print(F(") dst=("));
-  Serial.print(dstP[0], 2);
+  Serial.print(dst[0], 2);
   Serial.print(F(", "));
-  Serial.print(dstP[1], 2);
+  Serial.print(dst[1], 2);
   Serial.print(F(", "));
-  Serial.print(dstP[2], 2);
-  Serial.print(F(") speed="));
+  Serial.print(dst[2], 2);
+  Serial.print(F(") travelZ="));
+  Serial.print(travelZ, 2);
+  Serial.print(F(" speed="));
   Serial.println(speedLevelName(speedGetLevel()));
 #endif
 
-  beginMove(PICK_ST_TO_SRC_APPROACH, srcP, 1);
+  /* 【开始前先张开夹爪】上一次序列若在中途被中止（或操作者用 'S' 手动合过爪），
+   * angle4 会停在合拢角 60 甚至夹紧角 45；那样下降段会"闭着爪子"压到物体上，
+   * 紧接着合爪反而是把它张开（45→60），物体被推开或夹空。
+   * 这里先归位到张开角，保证整个接近过程爪口都是开的；真正合爪在 REACH_IN
+   * 之后（向前 2cm 把物体送进两爪之间）才开始。 */
+  (void) posSetAngle4(PICK_TOOL_OPEN_ANGLE);
+
+  /* 第一段：垂直上移到飞行高度（x/y 不动），也就是"先上移到物体高度+5cm" */
+  double up[3];
+  up[0] = Pos.rec.x;
+  up[1] = Pos.rec.y;
+  up[2] = travelZ;
+  beginMove(PICK_ST_RISE_SRC, up);
   return 0;
 }
 
@@ -3355,15 +3744,22 @@ void pickPlaceLoop(void) {
     pathCoreSetJoints(b, r, c);
   } else if (s_kind == PICK_KIND_TOOL) {
     (void) posSetAngle4(s_fromX + (s_toX - s_fromX) * t);
+  } else if (s_kind == PICK_KIND_HOME) {
+    Pos.ser.angle1 = s_fromX + (s_toX - s_fromX) * t;
+    Pos.ser.angle2 = s_fromY + (s_toY - s_fromY) * t;
+    Pos.ser.angle3 = s_fromZ + (s_toZ - s_fromZ) * t;
+    (void) recFromServo(&Pos.rec, &Pos.ser);
   } else {
     /* 停顿：什么都不动，等物体被夹稳 / 放稳 */
   }
 
   /* 【每一帧都夹紧】合爪之后、松开之前的每一帧都重申一次夹紧角（见 pickHoldingStage）。
    * posSetAngle4() 在值没变时返回 false 且不写状态，所以这里只是保证目标角始终是
-   * 夹紧角（TOOL_ANGLE_TIGHT），不会和 CLOSE_TOOL / OPEN_TOOL 的插值打架。 */
+   * 夹紧角（TOOL_ANGLE_TIGHT），不会和 CLOSE_TOOL / SQUEEZE_TOOL / OPEN_TOOL 的
+   * 插值打架。注意这里必须是**夹紧角**而不是名义合拢角：否则一进入 LIFT_SRC 就会
+   * 悄悄把夹爪松回 60，正是"搬起来就掉"的老毛病。 */
   if (s_kind != PICK_KIND_TOOL && pickHoldingStage(s_stage)) {
-    (void) posSetAngle4(PICK_TOOL_CLOSE_ANGLE);
+    (void) posSetAngle4(PICK_TOOL_SQUEEZE_ANGLE);
   }
 
   if (stageDone) advanceStage();
@@ -3378,7 +3774,14 @@ int pickPlaceCurrentObject(void) {
 }
 
 const char *pickPlaceStageName(void) {
-  return PICK_STAGE_NAME[s_stage];
+  /* s_stage 目前恒为 0..14，但这是给探针用的对外接口：以后往枚举里插新阶段却忘了
+   * 同步 PICK_STAGE_NAME[] 时，宁可返回 "?" 也不要越界读。（负值转 unsigned 会变成
+   * 极大的数，同样被这一条判据拦住。） */
+  const unsigned idx = (unsigned)s_stage;
+  if (idx >= (unsigned)(sizeof(PICK_STAGE_NAME) / sizeof(PICK_STAGE_NAME[0]))) {
+    return "?";
+  }
+  return PICK_STAGE_NAME[idx];
 }
 
 bool pickPlaceGetSource(int object, double *x, double *y, double *z) {
@@ -3398,7 +3801,23 @@ bool pickPlaceGetTarget(int object, double *x, double *y, double *z) {
 }
 
 double pickPlaceApproachDz(void) {
-  return PICK_APPROACH_DZ;
+  return PICK_LIFT_DZ;
+}
+
+double pickPlaceBackDz(void) {
+  return PICK_BACK_DZ;
+}
+
+bool pickPlacePlanZ(int object, double *z) {
+  if (object < 0 || object >= PICK_OBJECT_COUNT) return false;
+  double src[3], dst[3], behind[3];
+  loadPickPoint(&PICK_SRC[object], src);
+  loadPickPoint(&PICK_DST[object], dst);
+  pickBehindPoint(src, behind);
+  double travelZ = 0.0;
+  if (!planTravelZ(src, dst, behind, Pos.rec.x, Pos.rec.y, &travelZ)) return false;
+  if (z) *z = travelZ;
+  return true;
 }
 #endif
 
@@ -3460,8 +3879,12 @@ double pickPlaceApproachDz(void) {
 /* ==================== 可自定义的参数 ==================== */
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
-#define DRAW_PEN_Z_DEFAULT    -12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
-#define DRAW_CENTER_X_DEFAULT 20.0   /* 内置图形的中心 x */
+/* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z。
+ * 待机位末端是 (20,0,-10)（折叠回缩姿态），纸面在肩轴**下方**
+ * （z < 0）才可能被笔尖碰到。默认取 -20（肩轴下方 20 单位 ≈ 80 mm 的台面）。
+ * 上机可用 p<z> 随时重标（注意新模型下 x 越小、可达的竖向深度越浅，纸面别离肩轴太近）。 */
+#define DRAW_PEN_Z_DEFAULT    -20.0
+#define DRAW_CENTER_X_DEFAULT 27.0   /* 内置图形的中心 x */
 #define DRAW_CENTER_Y_DEFAULT  0.0   /* 内置图形的中心 y */
 #define DRAW_HALF_DEFAULT      6.0   /* 内置图形的半宽（顶点落在 ±半宽 的正方形里） */
 /* 【本版本删除】原来这里还有纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
@@ -3532,24 +3955,29 @@ struct drawVertex {
 
 /* The tables live in flash (PROGMEM): they are read-only lookups, so keeping a
  * RAM copy would waste data space for nothing. Read them with pgm_read_float. */
+/* 【轴向约定】u -> 工作区 x（纸面"上下"，+x 远离操作者/纸面上方），
+ *              v -> 工作区 y（纸面"左右"，+y 向右，见 README 手柄映射）。
+ * 表里的字面量一律按"屏幕上看到的图形"写：第一个数是 x（上下），
+ * 第二个数是 y（左右）。纸是水平铺在桌面上的，所以"上下"其实是
+ * 远离/靠近底座的方向 —— 曾经写反过，导致全部图形在纸上转了 90°。 */
 static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
-  { -1.0,  0.0 }, {  1.0,  0.0 }
+  {  0.0, -1.0 }, {  0.0,  1.0 }
 };
 /* 字母 N：左下 -> 左上 -> 右下 -> 右上（两个竖 + 一道斜） */
 static const struct drawVertex SHAPE_N[4] PROGMEM = {
-  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
+  { -1.0, -1.0 }, {  1.0, -1.0 }, { -1.0,  1.0 }, {  1.0,  1.0 }
 };
 /* 三角形：左下 -> 右下 -> 顶点 -> 回到左下（最后一点与第一点重合，闭合） */
 static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
-  { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
+  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0,  0.0 }, { -1.0, -1.0 }
 };
 /* 字母 Z：左上 -> 右上 -> 左下 -> 右下（上横 + 斜 + 下横） */
 static const struct drawVertex SHAPE_Z[4] PROGMEM = {
-  { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
+  {  1.0, -1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, { -1.0,  1.0 }
 };
 /* 字母 V：左上 -> 底尖 -> 右上 */
 static const struct drawVertex SHAPE_V[3] PROGMEM = {
-  { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
+  {  1.0, -1.0 }, { -1.0,  0.0 }, {  1.0,  1.0 }
 };
 
 /* 任务名（下标即 DRAW_TASK_*）。
@@ -3856,52 +4284,91 @@ static bool validatePath(void)
   /* 1) 待机位（POS_HOME 的位置）-> 起点正上方 */
   SER home;
   home = Pos.ser;
-  if (!posGetHomeAngles(&home)) return false;
+  if (!posGetHomeAngles(&home)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: posGetHomeAngles failed"));
+#endif
+    return false;
+  }
   REC hrec;
-  if (!recFromServo(&hrec, &home)) return false;
+  if (!recFromServo(&hrec, &home)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: recFromServo(home) failed"));
+#endif
+    return false;
+  }
 
   double lz = liftZFor(s_pts[0]);
   double hp[3];                       /* 待机位 */
   hp[0] = hrec.x; hp[1] = hrec.y; hp[2] = hrec.z;
   double ap[3];                       /* 起点正上方 */
   ap[0] = s_pts[0][0]; ap[1] = s_pts[0][1]; ap[2] = lz;
+#ifdef WEARM_DRAW_TRACE
+  Serial.print(F("[draw] vp1 hp=")); Serial.print(hp[0], 3);
+  Serial.print(F(",")); Serial.print(hp[1], 3); Serial.print(F(",")); Serial.print(hp[2], 3);
+  Serial.print(F(" ap=")); Serial.print(ap[0], 3);
+  Serial.print(F(",")); Serial.print(ap[1], 3); Serial.print(F(",")); Serial.print(ap[2], 3);
+  Serial.print(F(" pts=")); Serial.println(s_ptCount);
+#endif
   if (!pathCoreSegmentOk(hp, ap, DRAW_PATH_SAMPLE_STEP,
-                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) return false;
+                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: home->lift segment rejected"));
+#endif
+    return false;
+  }
 
   /* 2) 垂直落笔 */
   if (!pathCoreSegmentOk(ap, s_pts[0], DRAW_PATH_SAMPLE_STEP,
                          DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.print(F("[draw] vp2: drop segment rejected, pt0="));
+    Serial.print(s_pts[0][0], 3); Serial.print(F(","));
+    Serial.print(s_pts[0][1], 3); Serial.print(F(","));
+    Serial.println(s_pts[0][2], 3);
+#endif
     return false;
   }
 
   /* 3) 轨迹本体 */
   if (s_curved) {
-    /* 曲线：按参数密集采样，逐对检查可达性与反解分支 */
-    const int SAMPLE_PER_SPAN = 24;
-    double prevB = 0.0, prevR = 0.0, prevC = 0.0;
-    bool first = true;
+    /* 曲线：把每段曲线再切成 SUB_PER_SPAN 小段，交给共用的 pathCoreSegmentOk()
+     * 逐点校验（盒内 + isReachable + 反解成功 + 相邻采样不跳分支）。
+     * 【冗余清理】这里原先自己又写了一遍采样循环（每段 24 个点各做一次 pointOk
+     *   和一次三分支跳变比较），和 path_core.h 里的段校验完全重复，只是采样密度
+     *   不同；直接复用共用实现，曲线校验的采样点反而更多（每 0.5mm 一个点），
+     *   代码少一大截。 */
+    const int SUB_PER_SPAN = 6;
+    double prev[3];
+    curvePoint(0, 0.0, prev);
     for (int span = 0; span < s_ptCount - 1; span++) {
-      for (int k = 0; k <= SAMPLE_PER_SPAN; k++) {
-        double u = (double)k / (double)SAMPLE_PER_SPAN;
-        double p[3];
-        curvePoint(span, u, p);
-        double b = 0.0, r = 0.0, c = 0.0;
-        if (!pointOk(p[0], p[1], p[2], &b, &r, &c)) return false;
-        if (!first) {
-          if (fabs(b - prevB) > DRAW_BRANCH_JUMP_DEG ||
-              fabs(r - prevR) > DRAW_BRANCH_JUMP_DEG ||
-              fabs(c - prevC) > DRAW_BRANCH_JUMP_DEG) {
-            return false;
-          }
+      for (int k = 1; k <= SUB_PER_SPAN; k++) {
+        double cur[3];
+        curvePoint(span, (double)k / (double)SUB_PER_SPAN, cur);
+        if (!pathCoreSegmentOk(prev, cur, DRAW_PATH_SAMPLE_STEP,
+                               DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+          Serial.print(F("[draw] vp3: curve sub-segment rejected span="));
+          Serial.print(span); Serial.print(F(" k=")); Serial.println(k);
+#endif
+          return false;
         }
-        prevB = b; prevR = r; prevC = c;
-        first = false;
+        prev[0] = cur[0]; prev[1] = cur[1]; prev[2] = cur[2];
       }
     }
   } else {
     for (int i = 0; i < s_ptCount - 1; i++) {
       if (!pathCoreSegmentOk(s_pts[i], s_pts[i + 1], DRAW_PATH_SAMPLE_STEP,
                              DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+        Serial.print(F("[draw] vp3: polyline seg rejected i=")); Serial.print(i);
+        Serial.print(F(" from=")); Serial.print(s_pts[i][0], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i][1], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i][2], 3);
+        Serial.print(F(" to=")); Serial.print(s_pts[i + 1][0], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i + 1][1], 3);
+        Serial.print(F(",")); Serial.println(s_pts[i + 1][2], 3);
+#endif
         return false;
       }
     }
@@ -3914,6 +4381,12 @@ static bool validatePath(void)
   ep[0] = last[0]; ep[1] = last[1]; ep[2] = ez;
   if (!pathCoreSegmentOk(last, ep, DRAW_PATH_SAMPLE_STEP,
                          DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.print(F("[draw] vp4: end-lift rejected last="));
+    Serial.print(last[0], 3); Serial.print(F(","));
+    Serial.print(last[1], 3); Serial.print(F(","));
+    Serial.print(last[2], 3); Serial.print(F(" ez=")); Serial.println(ez, 3);
+#endif
     return false;
   }
   return true;
@@ -4043,7 +4516,12 @@ static void beginSequence(void)
   s_span    = 0;
   s_u       = 0.0;
   s_hitCount = 0;
-  s_hitTotal = s_isTeach ? s_ptCount : 0;
+  /* 分母就用顶点数：内置图形走 buildShapePath() 也会把 s_ptCount 设成顶点数
+   * （2/3/4），而下面 pathTick() 的"过点统计"对内置图形一样在量（s_ptArc 是同一个
+   * 规划器填的），所以这里再按 s_isTeach 三元一次会让内置图形报出"命中 4 / 共 0"
+   * 这种自相矛盾的一对数。两份数据同源，分母直接取 s_ptCount。
+   * 绘制完成的打印本来就只在示教任务里给出这对数，所以这次改动不动任何输出。 */
+  s_hitTotal = s_ptCount;
   s_ptHit = 0;
 
   /* 先回待机；回完由 drawLoop 转入"抬笔去起点上方" */
@@ -4691,6 +5169,11 @@ void drawLoop(void)
 
   if (s_phase == DRAW_PHASE_IDLE) return;
 
+  /* 绘图任务只要处于非空闲阶段，工具就必须持续夹紧：这条约束要放在
+   * 示教、暂停、回待机和自动轨迹的所有早退分支之前，否则上一帧的点动
+   * 或串口角度会让笔重新张开。 */
+  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
+
   /* 示教：摇杆点动（暂停概念在示教里没有意义，按键1/2 是记录/撤销） */
   if (s_phase == DRAW_PHASE_TEACH) {
     teachJogTick();
@@ -4708,14 +5191,6 @@ void drawLoop(void)
   }
 
   if (s_paused) return;                    /* 暂停：保持任务状态，什么都不推进 */
-
-  /* 【每一帧都夹紧】绘图运动中把末端持续压在"夹紧角"上（与取放序列同一个约定，
-   * 见 constant_and_positions.h 的 TOOL_ANGLE_TIGHT）。60~150 的夹爪范围限制
-   * 已删除，所以这个角可以比名义合拢角 60 更小，笔才真正被夹住。
-   * posSetAngle4() 在"值没变"时返回 false 且不写状态，所以这里等价于每帧重申
-   * 一次目标角：不产生额外抖动，只是保证夹爪始终保持在夹紧位置。
-   * 示教阶段（DRAW_PHASE_TEACH）与暂停时不会走到这里，示教点动仍可单独调末端。 */
-  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
 
   switch (s_phase) {
     case DRAW_PHASE_HOME: {
@@ -5613,6 +6088,12 @@ const char *buttonStateName(void) {
 */
 
 
+/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mS/mE 查询切换）。
+ * 定义在本 TU（而不是 meArm.ino）：自检探针都链接本 TU、但不 #include meArm.ino，
+ * 放在 .ino 里会导致探针链接失败（undefined reference）。 */
+bool g_mirrorShoulder = (WEARM_MIRROR_SHOULDER != 0);
+bool g_mirrorElbow    = (WEARM_MIRROR_ELBOW    != 0);
+
 /* ---------- 行缓冲与状态 ---------- */
 static char s_line[PROTO_LINE_BUF_SIZE];
 static int  s_len = 0;
@@ -5776,33 +6257,22 @@ static void protoSerialBegin(void)
 /* ========== 响应层（WEARM_SERIAL_RESPONSES） ========== */
 #if WEARM_SERIAL_RESPONSES
 
-/* 夹爪回显：angle4 被夹在 60..150，所以普通的三位十进制打印机就够用。 */
-static void protoWriteInt(int v)
-{
-  if (v >= 100) {
-    protoPut((char)('0' + v / 100));
-  }
-  if (v >= 10) {
-    protoPut((char)('0' + (v / 10) % 10));
-  }
-  protoPut((char)('0' + v % 10));
-}
-
-/* 从 flash 里逐字节走出 <text> 并发送；每条回复以换行结尾，
- * 而 '#' 会被替换成夹爪角度的十进制值。刻意 out-of-line：
- * 在 -flto 下 gcc 会把这个循环克隆到每个回复点，而每个点的参数准备
- * 比一次调用还要贵。 */
+/* 从 flash 里逐字节走出 <text> 并发送；每条回复以换行结尾。
+ * 刻意 out-of-line：在 -flto 下 gcc 会把这个循环克隆到每个回复点，
+ * 而每个点的参数准备比一次调用还要贵。
+ *
+ * 【已删除】原先还有一个 '#' 占位符，会在回复里插入 angle4 的十进制值，
+ * 只有 'O'/'S' 两条命令用（回 "OK 150" / "OK 60"）。那两个值是编译期常量
+ * （TOOL_ANGLE_OPEN / TOOL_ANGLE_CLOSE），主机能从回复码
+ * PROTO_RES_GRIPPER_OPEN/CLOSE 分辨，纯串口主机也拿不到额外信息；
+ * 连带 protoWriteInt() 的十进制拆分（三位除法取模）一起删掉，省 flash。 */
 __attribute__((noinline, noclone))
 static void protoReply(const char *text)
 {
   char c;
 
   while ((c = (char)pgm_read_byte(text++)) != '\0') {
-    if (c == '#') {
-      protoWriteInt((int)Pos.ser.angle4);
-    } else {
-      protoPut(c);
-    }
+    protoPut(c);
   }
   protoPut('\n');
 }
@@ -5812,7 +6282,6 @@ static void protoReply(const char *text)
 static const char s_rOk[] PROGMEM = "OK";
 static const char s_rErr[] PROGMEM = "ERR";
 static const char s_rRej[] PROGMEM = "REJECTED";
-static const char s_rOkN[] PROGMEM = "OK #";
 /* 三种"看懂了但没执行"的回复，按键族以前都合并成 REJECTED。
  * 把它们区分开是让纯串口主机能做出反应的关键：BUSY = 机械臂在动，
  * DISCARD = 录制被丢弃（位移不够 / 没有动作 / 缓冲满），
@@ -5823,7 +6292,7 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
+static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -5843,35 +6312,69 @@ static void protoReplyTaskTag(const char *tag)
   protoPut('\n');
 }
 
+/* 'm'（查询/切换上臂与下臂换向）的回复："S=0 E=1" 形式，与 protoReplyFeature 同一风格。 */
+static void protoReplyMirror(void)
+{
+  protoPut('S');
+  protoPut('=');
+  protoPut(g_mirrorShoulder ? '1' : '0');
+  protoPut(' ');
+  protoPut('E');
+  protoPut('=');
+  protoPut(g_mirrorElbow ? '1' : '0');
+  protoPut('\n');
+}
+
+/* '!'（查询/切换三个模块的运行时开关）的回复："P=1 B=1 D=1" 形式。
+ * 与 protoReplyMirror 同样是 out-of-line 的：原先是一个宏，在 '!' 与 '!P/!B/!D'
+ * 两个调用点各展开一份约二十个 protoPut，纯属重复代码。 */
+static void protoReplyFeature(void)
+{
+  protoPut('P');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0');
+  protoPut(' ');
+  protoPut('B');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0');
+  protoPut(' ');
+  protoPut('D');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0');
+  protoPut('\n');
+}
+
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
 #define R_REJ()  protoReply(s_rRej)
-#define R_OKN()  protoReply(s_rOkN)
 #define R_BUSY() protoReply(s_rBusy)
 #define R_DISCARD() protoReply(s_rDiscard)
 #define R_EMPTY() protoReply(s_rEmpty)
 #define R_OFF()  protoReply(s_rOff)
 #define R_BOOT() protoReply(s_rBoot)
-#define R_FEATURE() do { protoPut('P'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0'); protoPut(' '); protoPut('B'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0'); protoPut(' '); protoPut('D'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0'); protoPut(10); } while (0)
 #else
 #define R_OK()   do { } while (0)
 #define R_ERR()  do { } while (0)
 #define R_REJ()  do { } while (0)
-#define R_OKN()  do { } while (0)
 #define R_BUSY() do { } while (0)
 #define R_DISCARD() do { } while (0)
 #define R_EMPTY() do { } while (0)
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
-#define R_FEATURE() do { } while (0)
 #define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
+#define protoReplyMirror() do { } while (0)
+#define protoReplyFeature() do { } while (0)
 #endif
 
 /* ========== 命令分类位图 ========== */
 /* 下标 i = cmd - '0' 覆盖 '0'(0x30) .. 'p'(0x70)，包括所有命令字符；
  * 其它字符会越出表尾并被拒绝。
  * s_liveBits：模块忙时该命令仍然被接受。
- * s_fastBits：命令只要单字符一到就立即执行，不必等行尾。 */
+ * s_fastBits：命令只要单字符一到就立即执行，不必等行尾。
+ * 注意两张表第 0 字节的低 4 位覆盖 '0'..'3'：'0' 是回中别名（有效），
+ * '1'/'2'/'3' 是早已删掉的档位直达键。这三个位**有意保留** —— 这几个字符因此
+ * 照常进入派发流程、收到一个干净的 ERR；清掉只会让忙时回复从 ERR 变成 BUSY，
+ * 没有别的好处，探针也没有断言这三个字符的行为。 */
 static const uint8_t s_liveBits[9] PROGMEM = { 0x0F, 0x00, 0xF0, 0x71, 0xA7, 0x00, 0x00, 0xC0, 0x01 };
 static const uint8_t s_fastBits[9] PROGMEM = { 0x0E, 0x00, 0x0E, 0x99, 0x08, 0x00, 0x00, 0x08, 0x00 };
 
@@ -5949,8 +6452,14 @@ void serialProtocolLoop(void)
       continue;  /* 丢弃到行尾之前的字符 */
     }
 
-    /* 行缓冲溢出 */
+    /* 行缓冲溢出：整行丢弃，并且**回一行 ERR**。
+     * 协议约定"每条命令恰好回一行短回复"，静默丢弃会让在等回复的主机卡住，
+     * 还会把下一条命令的回复张冠李戴（probe_protocol 第三节就是拿合法前缀
+     * 填满缓冲来验证"整行被丢掉"的）。
+     * 这一行只会在刚溢出的那一刻触发一次：之后进入 s_dropUntilEol 状态，
+     * 字符被直接扔掉，直到行尾（或超时）才复位。 */
     if (s_len >= PROTO_LINE_BUF_SIZE - 1) {
+      R_ERR();
       s_dropUntilEol = true;
       s_len = 0;
       s_pending = false;
@@ -6074,12 +6583,34 @@ int protoHandleLine(const char *line)
     }
     if (!protoRuntimeEnabled(feature)) s_runtimeFeatures |= feature;
     else s_runtimeFeatures &= (uint8_t)~feature;
-    R_FEATURE();
+    protoReplyFeature();
     return PROTO_RES_FEATURE;
   }
   if (cmd == '!' && single) {
-    R_FEATURE();
+    protoReplyFeature();
     return PROTO_RES_NONE;
+  }
+
+  /* m / mS / mE：查询/切换上臂(r)与下臂(c)的物理换向（运行时方向标定）。
+   * 只改 writeServo() 送给舵机的数，逻辑角与反解一律不变；掉电不保存。
+   * 放在功能门控与忙判定之前：换向不移动机械臂，任何时刻都允许。 */
+  if (cmd == 'm') {
+    if (single) {
+      protoReplyMirror();
+      return PROTO_RES_MIRROR;
+    }
+    const char *q = tail;
+    if (q[1] != '\0' || (q[0] != 'S' && q[0] != 'E')) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+    if (q[0] == 'S') {
+      g_mirrorShoulder = !g_mirrorShoulder;
+    } else {
+      g_mirrorElbow = !g_mirrorElbow;
+    }
+    protoReplyMirror();
+    return PROTO_RES_MIRROR;
   }
 
   if (!single && (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
@@ -6142,13 +6673,13 @@ int protoHandleLine(const char *line)
      * switch 会生成一张 64 项的跳转表，而 if 链只为自己用到的比较买单。
      * 真实 AVR 构建实测：整个派发器省 78 字节。 */
     if (cmd == PROTO_CMD_GRIPPER_OPEN) {
-      posSetAngle4(150.0);  // 硬编码：夹爪张开（与 f 行程上限一致）
-      R_OKN();
+      posSetAngle4(TOOL_ANGLE_OPEN);   // 夹爪张开到位（宏定义在 constant_and_positions.h）
+      R_OK();
       return PROTO_RES_GRIPPER_OPEN;
 
     } else if (cmd == PROTO_CMD_GRIPPER_CLOSE) {
-      posSetAngle4(60.0);   // 硬编码：夹爪合拢（与 f 行程下限一致）
-      R_OKN();
+      posSetAngle4(TOOL_ANGLE_CLOSE);  // 名义合拢角；"夹紧"是取放序列自己的事
+      R_OK();
       return PROTO_RES_GRIPPER_CLOSE;
 
     } else if (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN) {
@@ -6205,7 +6736,7 @@ int protoHandleLine(const char *line)
     /* 未知单字符命令：落到下面的角度解析 */
   }
 
-  /* 纸面标定 p/n/o：多字符（p12.5 / n6 / o20,0）。
+  /* 纸面标定 p/n/o：多字符（p-20 / n6 / o27,0）。
    * 放在角度解析之前处理，因为 'o' 行里带逗号，
    * 否则会被当成"语法错误的角度命令"。 */
   if ((cmd == PROTO_CMD_DRAW_PAPER_Z ||
@@ -6392,7 +6923,9 @@ static int protoHandleDrawCalib(const char *line, char cmd)
 
   PROTO_SKIP_BLANKS(p);
   if (!protoParseNumber(&p, &v1)) {
-    R_ERR();
+    /* 只返回结果码，**不在这里回复** —— 回复由调用方按契约统一发出。
+     * 这条曾经既在这里 R_ERR() 又在调用方 R_REJ()，于是被拒的 p/n/o
+     * 会连着吐 "ERR" 和 "REJECTED" 两行，主机按"一命令一回复"读就会错位。 */
     return PROTO_RES_DRAW_REJECTED;
   }
   PROTO_SKIP_BLANKS(p);
@@ -6415,7 +6948,8 @@ static int protoHandleDrawCalib(const char *line, char cmd)
     return PROTO_RES_DRAW_CALIBRATED;
   }
 
-  R_ERR();
+  /* 同上：值非法也只返回码，由调用方回 REJECTED（PROTO_RES_DRAW_REJECTED 的
+   * 文档已经把"标定值非法"和"轨迹校验不过/示教点不够"都算作 REJECTED）。 */
   return PROTO_RES_DRAW_REJECTED;
 }
 
@@ -6470,7 +7004,7 @@ void serialProtocolBegin(void)
 //
 // 结构:
 //   setup() —— 复位到安全初始角度、初始化串口协议、自标定摇杆中位与状态灯、
-//              初始化按键/绘图模块、启动 Timer1 舵机驱动并把 4 路 attach 到引脚
+//              初始化按键/绘图模块、启动舵机驱动并把 4 路 attach 到引脚
 //              （顺序有讲究，见 setup() 里的编号注释）
 //   loop()  —— 每轮:
 //     1. serialProtocolLoop() 处理串口指令（唯一读者，放在最前面保证及时响应）
@@ -6480,7 +7014,7 @@ void serialProtocolBegin(void)
 //                          每个采样点最终都交给 move.h 的 moveToPoint() 落地）
 //     5. joystickLoop()    读手柄（MeArm 套件手柄：两根双轴摇杆，共占 A0~A3），
 //                          按全局速度参数直接改变 4 个关节角
-//     6. writeServo()      把当前 4 个关节角写入物理舵机（servo_drive，Timer1 硬件 PWM）
+//     6. writeServo()      把当前 4 个关节角写入物理舵机（servo_drive → Arduino Servo 库）
 //   （取放/按键/绘图三者互斥：各自的 IsBusy()/Locked() 会让另外两个与摇杆整段让位）
 //
 // 【控制方式：关节角是唯一被控量】
@@ -6500,8 +7034,8 @@ void serialProtocolBegin(void)
 //
 // 手柄操作（详见 joystick_control.h）:
 //   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 +y 侧转
-//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂继续抬高
-//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂往前收
+//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 90°−r 变小）
+//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c−90° 变大）
 //   右手柄 左右推 (A2) -> f = angle4 末端夹具   角度增大 = 张开
 //   ★ 摇杆中位在 setup() 里自标定（各轴取平均、扣掉静态偏差，见 joystick_control.cpp
 //     的 JOY_CAL_*）：真实手柄的中位很少正好是 ADC 512，偏差超过死区就会让机械臂
@@ -6550,9 +7084,9 @@ void serialProtocolBegin(void)
 //     发 D             开始绘制（内置图形直接画；五点折线/五点曲线先进入五点示教）
 //     发 G / E         示教中记录 / 撤销一个示教点（等价于示教时按按键1 / 按键2）
 //     发 Q / U / W     暂停 / 继续 / 取消（等价于绘制时按按键1 / 按键2 / 按键3）
-//     发 p12.5         标定纸面高度（铅笔尖刚好落在纸上时的 z）
+//     发 p-20          标定纸面高度（铅笔尖刚好落在纸上时的 z；在待机 -10 下方）
 //     发 n6            标定内置图形的半宽（顶点落在 ±半宽 的正方形里）
-//     发 o20,0         标定内置图形的中心 (x,y)
+//     发 o27,0         标定内置图形的中心 (x,y)
 //   绘图时的按键语义（与空闲时的 循环取放/录制/播放/回中 同一套"按键编号"，只是换了解释）:
 //     示教中  "按键1"记录示教点（记满 5 个自动开始）  "按键2"撤销  "按键3"取消  "按键4"手动开始
 //     绘制中  "按键1"暂停（停在原地、任务状态保留）  "按键2"继续（从暂停处接续）  "按键3"取消（抬笔回待机）
@@ -6580,33 +7114,38 @@ void serialProtocolBegin(void)
 //
 // 安全边界:
 //   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
-//                              （原来的 f 60~150 夹爪软限位已按需求删除），唯一的软件边界。
+//                              （原来的 f 60~150 夹爪软限位已按需求删除）。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
 //                              点，绘图/示教一律拒绝，串口 x/y/z（NOW 策略）允许吸附后到位。
-//   2. rangeLimit 位置边界   —— 由新角度正解出的末端坐标若跑出 limit 区间，
-//                              这一步整步回退，避免臂跑到没标定的区域。
+//   2. rangeLimit 位置边界   —— "工作空间盒子"（constant_and_positions.cpp 的 limit）：
+//                              x/y ±40、z -40~40。摇杆/按键/示教的关节步进由
+//                              move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
+//                              取放与绘图的轨迹采样点由 path_core.h 的
+//                              pathCorePointOk() 整条拒绝（取放启动报 BUSY、
+//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽，
+//                              见下面的"可达包络"一节 —— 它不改变可达性。
 //   3. 正运动学自洽          —— 每步都用 recFromServo() 重算坐标，
 //                              Pos.ser 与 Pos.rec 永远严格对应（坐标入口也一样，
 //                              见 move.cpp 的 moveToPoint()）。
 //
 // 坐标模型（用于显示与工作空间校验，与 constant_and_positions.cpp 一致）:
 //   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机中立位 90° 的实测含义:
+//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
 //     b (angle1) 90° -> 基座朝 +x，b 偏离 90° 就转向 ±y；
-//     r (angle2) 90° -> 上臂竖直向上；
-//     c (angle3) 90° -> 下臂水平朝前（与上臂成 90°）。
-//   初始位姿 (b,r,c,f) = (90,90,90,f 中位) 对应末端 (20, 0, 20)，
-//   也就是 constant_and_positions.cpp 里的 POS_HOME。
-//   关节限位内的实测可达包络（probe_axes 扫 5929741 个组合）:
-//     x[-40.00, 40.00] y[-40.00, 40.00] z[-20.00, 40.00]
-//   limit 按包络"向外取整到 0.5"取 x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
-//   （这次包络端值恰好落在 0.5 的整数倍上，所以余量是 0），
-//   理由是角度模式下坐标只是派生量，limit 不该比真实包络更早挡住摇杆
-//   （详见 constant_and_positions.cpp 里 limit 上方的注释）。
-//   ★ 代价: limit 现在是"软护栏"，基座可摆到 x<0 后方、末端最低到 z≈-20.0，
-//     上机请先在慢速档、空载、抬离台面的情况下单步试。
+//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下；
+//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上。
+//   alpha = 90 - r、beta = c - 90（肩轴反转、肘轴正转，见 RC-robot-hand 标定）。
+//   初始位姿 POS_HOME = (20, 0, -10)，即 (b,r,c,f) ≈ (90, 60.55, 7.43, f 中位)
+//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   关节限位内的实测可达包络（probe_axes 扫组合，余量由探针打印）:
+//     x[0.00, 40.00] y[-40.00, 40.00] z[-40.00, 40.00]
+//   limit 本版取 x/y ±40、z -40~40（与可达包络一致，两杆各 20、关节 0~180°）。
+//   ★ 末端能到哪仍由几何决定（L1 = L2 = 20）：水平半径越大竖向行程越小，
+//     最大竖向行程在 ρ≈0 处（z ∈ [-40, 40]）。
+//   ★ 上机提示: 基座可摆到 x<0 的后方、末端最低到 z≈-40.0，请先在慢速档、
+//     空载、抬离台面的情况下单步试。
 //
 // 调速:
 //   调用 adjustSpeed(level) 切换速度档位:
@@ -6618,7 +7157,7 @@ void serialProtocolBegin(void)
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
 
-/* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
+/* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，内部就是 Arduino Servo 库）。
  * 字母记号（与 constant_and_positions.h 的 TOOL_ANGLE_* 一致）:
  *   通道0 = b 水平回转   通道1 = r 上臂俯仰
  *   通道2 = c 下臂俯仰   通道3 = f 末端 */
@@ -6641,8 +7180,8 @@ void writeServo(void){
     servoDriveWrite(0, Pos.ser.angle1);
 #endif
 
-    servoDriveWrite(1, Pos.ser.angle2);
-    servoDriveWrite(2, Pos.ser.angle3);
+    servoDriveWrite(1, g_mirrorShoulder ? (180.0 - Pos.ser.angle2) : Pos.ser.angle2);
+    servoDriveWrite(2, g_mirrorElbow    ? (180.0 - Pos.ser.angle3) : Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
     // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）
@@ -6672,12 +7211,13 @@ void setup() {
   drawSetup();
 
   /* 5. 启动舵机驱动并把 4 路 attach 到对应引脚。
-   *    servoDriveBegin() 必须在 attach 之前：它初始化 Timer1 与各通道默认脉宽。
-   *    引脚号请按实际硬件修改 (示例: 9, 7, 8, 6) */
+   *    servoDriveBegin() 必须在 attach 之前（官方 Servo 库其实没有 begin；
+   *    本工程里它是空钩子，保留调用是为了将来换驱动时不用改这里）。
+   *    引脚号请按实际硬件修改 (示例: 9, 8, 7, 6) */
   servoDriveBegin();
   servoDriveAttach(0, 9);   /* 水平回转 */
-  servoDriveAttach(1, 8);   /* 上臂俯仰 */
-  servoDriveAttach(2, 7);   /* 下臂俯仰 */
+  servoDriveAttach(1, 8);   /* 上臂俯仰：实机上臂舵机接 D8 */
+  servoDriveAttach(2, 7);   /* 下臂俯仰：实机下臂舵机接 D7 */
   servoDriveAttach(3, 6);   /* 末端 */
 
   /* 6. 上电后先让机械臂到位，再开始接收手柄输入 */

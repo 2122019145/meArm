@@ -149,11 +149,12 @@ static bool runUntilPhase(int phase, unsigned long cap) {
   return drawGetPhase() == phase;
 }
 
-/* 推进到"绘制中"并且笔尖 x 已经越过 xMin（内置直线/横线类轨迹 x 单调） */
-static bool runUntilPathX(double xMin, unsigned long cap) {
+/* 推进到"绘制中"并且笔尖 y 已经离开起始位置（内置直线现在是沿 y 的横线，x 恒等于中心 x） */
+static bool runUntilPathY(double yMin, unsigned long cap) {
   unsigned long target = g_mockMillis + cap;
   while (g_mockMillis < target) {
-    if (drawGetPhase() == DRAW_PHASE_PATH && Pos.rec.x >= xMin) { note(); return true; }
+    if (drawGetPhase() == DRAW_PHASE_PATH &&
+        fabs(Pos.rec.y - drawGetCenterY()) >= yMin) { note(); return true; }
     step();
   }
   return false;
@@ -321,13 +322,14 @@ static bool teachFive(const double tgt[5][3], double out[5][3]) {
 /* ==================== 用例 ==================== */
 
 /* 内置图形的期望顶点（中心 + 归一化 u,v × 半宽，z = 纸面高度）
- * 题目要求从 字母N / 三角形 / 字母Z / 字母V 里选一种，本工程四种都保留（同组不得完全相同）。 */
+ * 【轴向约定】表格第一列是 x（纸面上下，+x 远离操作者），第二列是 y（纸面左右，+y 向右）。
+ * 必须与 draw_control.cpp 的 SHAPE_* 表逐字一致 —— 纸是水平铺的，"屏幕上的上下"= x、左右 = y。 */
 static void shapeVerts(int task, double half, double z, double out[5][3], int *n) {
-  static const double LINE[2][2]     = { { -1.0, 0.0 },  { 1.0, 0.0 } };
-  static const double NN[4][2]       = { { -1.0, -1.0 }, { -1.0, 1.0 }, { 1.0, -1.0 }, { 1.0, 1.0 } };
-  static const double TRIANGLE[4][2] = { { -1.0, -1.0 }, { 1.0, -1.0 }, { 0.0, 1.0 }, { -1.0, -1.0 } };
-  static const double ZZ[4][2]       = { { -1.0, 1.0 },  { 1.0, 1.0 },  { -1.0, -1.0 }, { 1.0, -1.0 } };
-  static const double VV[3][2]       = { { -1.0, 1.0 },  { 0.0, -1.0 }, { 1.0, 1.0 } };
+  static const double LINE[2][2]     = { { 0.0, -1.0 },  { 0.0, 1.0 } };
+  static const double NN[4][2]       = { { -1.0, -1.0 }, { 1.0, -1.0 }, { -1.0, 1.0 }, { 1.0, 1.0 } };
+  static const double TRIANGLE[4][2] = { { -1.0, -1.0 }, { -1.0, 1.0 }, { 1.0, 0.0 }, { -1.0, -1.0 } };
+  static const double ZZ[4][2]       = { { 1.0, -1.0 },  { 1.0, 1.0 },  { -1.0, -1.0 }, { -1.0, 1.0 } };
+  static const double VV[3][2]       = { { 1.0, -1.0 },  { -1.0, 0.0 }, { 1.0, 1.0 } };
 
   const double (*src)[2] = LINE;
   int cnt = 2;
@@ -360,10 +362,10 @@ int main(void) {
   snprintf(d, sizeof d, "纸面 z=%.2f 半宽=%.2f 中心=(%.2f,%.2f)",
            drawGetPaperZ(), drawGetHalfSize(), drawGetCenterX(), drawGetCenterY());
   /* DRAW_PEN_Z_DEFAULT 是 draw_control.cpp 的私有宏，探针看不到，只能硬编码；
-   * -12.0 是"笔尖刚好落在纸上"的出厂标定值。 */
-  check("默认纸面 z=-12 / 半宽 6 / 中心 (20,0)",
-        fabs(drawGetPaperZ() - (-12.0)) < 1e-9 && fabs(drawGetHalfSize() - 6.0) < 1e-9 &&
-        fabs(drawGetCenterX() - 20.0) < 1e-9 && fabs(drawGetCenterY()) < 1e-9, d);
+   * -20.0 是"笔尖刚好落在纸上"的出厂标定值。 */
+  check("默认纸面 z=-20 / 半宽 6 / 中心 (27,0)",
+        fabs(drawGetPaperZ() - (-20.0)) < 1e-9 && fabs(drawGetHalfSize() - 6.0) < 1e-9 &&
+        fabs(drawGetCenterX() - 27.0) < 1e-9 && fabs(drawGetCenterY()) < 1e-9, d);
   check("空闲时 drawControlBusy()/Locked() 都是 false",
         !drawControlBusy() && !drawControlLocked(), drawStateName());
   check("空闲时阶段名 = 空闲", drawGetPhase() == DRAW_PHASE_IDLE && strcmp(drawPhaseName(), "空闲") == 0,
@@ -409,9 +411,9 @@ int main(void) {
         !drawSetPaperZ(NAN) && fabs(drawGetPaperZ() - 999.0) < 1e-9, "pNaN 被拒");
   check("标定半宽 n：超范围拒绝", !drawSetHalfSize(1.0) && !drawSetHalfSize(13.0), "1.0 / 13.0 被拒");
   check("标定中心 o：超上限拒绝且不改动",
-        !drawSetCenter(100.0, 0.0) && fabs(drawGetCenterX() - 20.0) < 1e-9, "o100,0 被拒");
-  check("标定恢复默认（p12/n6/o20,0）",
-        drawSetPaperZ(12.0) && drawSetHalfSize(6.0) && drawSetCenter(20.0, 0.0), "已恢复");
+        !drawSetCenter(100.0, 0.0) && fabs(drawGetCenterX() - 27.0) < 1e-9, "o100,0 被拒");
+  check("标定恢复默认（p-20/n6/o27,0）",
+        drawSetPaperZ(-20.0) && drawSetHalfSize(6.0) && drawSetCenter(27.0, 0.0), "已恢复");
   check("空闲时暂停/继续/取消都回 BUSY",
         drawPause() == PROTO_RES_BUSY && drawResume() == PROTO_RES_BUSY &&
         drawCancel() == PROTO_RES_BUSY, "空闲没有可暂停/取消的任务");
@@ -442,41 +444,44 @@ int main(void) {
     statsFor(DRAW_PHASE_PATH, &pa);
     statsFor(DRAW_PHASE_LIFT, &lf);
 
-    snprintf(d, sizeof d, "抬笔段 z 最低 %.2f（纸面 12）", mv.zmin);
-    check("抬笔平移全程都在纸面之上", mv.n > 5 && mv.zmin > 12.5, d);
+    snprintf(d, sizeof d, "抬笔段 z 最低 %.2f（纸面 %.2f）", mv.zmin, drawGetPaperZ());
+    check("抬笔平移全程都在纸面之上", mv.n > 5 && mv.zmin > drawGetPaperZ() + 0.5, d);
 
     snprintf(d, sizeof d, "落笔段 x/y 漂移 %.3f，z 到 %.2f", pl.maxXYStep, pl.zmin);
     check("落笔是垂直下降（x/y 不动，z 落到纸面）",
-          pl.n > 5 && pl.maxXYStep < 0.05 && fabs(pl.zmin - 12.0) < 0.02, d);
+          pl.n > 5 && pl.maxXYStep < 0.05 && fabs(pl.zmin - (-20.0)) < 0.02, d);
 
     snprintf(d, sizeof d, "线段 z %.4f~%.4f，x %.2f~%.2f，y %.3f~%.3f，相邻步最大 %.3f",
              pa.zmin, pa.zmax, pa.xmin, pa.xmax, pa.ymin, pa.ymax, pa.maxStep);
     check("绘制中 z 恒定 = 纸面高度（不会深一段浅一段）",
-          pa.n > 20 && fabs(pa.zmax - pa.zmin) < 0.01 && fabs(pa.zmin - 12.0) < 0.02, d);
-    check("绘制中沿 y=0 走，x 从 14 到 26",
-          fabs(pa.ymin) < 0.02 && fabs(pa.ymax) < 0.02 &&
-          fabs(pa.xmin - 14.0) < 0.05 && fabs(pa.xmax - 26.0) < 0.05, d);
+          pa.n > 20 && fabs(pa.zmax - pa.zmin) < 0.01 && fabs(pa.zmin - (-20.0)) < 0.02, d);
+    check("绘制中沿 x=27 走，y 从 -6 到 6（纸面横线 = 左右方向）",
+          fabs(pa.xmin - 27.0) < 0.05 && fabs(pa.xmax - 27.0) < 0.05 &&
+          fabs(pa.ymin - (-6.0)) < 0.05 && fabs(pa.ymax - 6.0) < 0.05, d);
     check("直线真直（每步位移 ≤ 0.02 单位 —— 本分支的精细化插值）",
           pa.maxStep > 0.0 && pa.maxStep <= 0.025, d);
 
     {
-      const double seg[2][3] = { { 14.0, 0.0, 12.0 }, { 26.0, 0.0, 12.0 } };
+      const double seg[2][3] = { { 27.0, -6.0, -20.0 }, { 27.0, 6.0, -20.0 } };
       double worst = maxDistToPolyline(seg, 2);
       snprintf(d, sizeof d, "离理想直线最远 %.4f 单位", worst);
       check("整条线都贴合理想直线（<= 0.02）", worst <= 0.02, d);
     }
 
     snprintf(d, sizeof d, "抬笔段 z 最高 %.2f，x/y 漂移 %.3f", lf.zmax, lf.maxXYStep);
-    check("画完垂直抬笔（先离纸再走）", lf.n > 5 && lf.zmax > 12.0 + 3.5 && lf.maxXYStep < 0.05, d);
+    check("画完垂直抬笔（先离纸再走）", lf.n > 5 && lf.zmax > -20.0 + 3.5 && lf.maxXYStep < 0.05, d);
 
     snprintf(d, sizeof d, "用时 %lu ms（弧长 12 单位，笔尖 3 单位/秒）", drawLastRunMs());
     check("绘制用时合理（12 单位 / 3 单位每秒，加上抬笔落笔与回待机）",
           drawLastRunMs() > 1000UL && drawLastRunMs() < 20000UL, d);
 
+    SER homeSer = Pos.ser;
+    bool hok = posGetHomeAngles(&homeSer);
     snprintf(d, sizeof d, "b=%.2f r=%.2f c=%.2f", Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
-    check("结束后回到待机位（b/r/c 都是 90 度附近）",
-          fabs(Pos.ser.angle1 - 90.0) < 0.5 && fabs(Pos.ser.angle2 - 90.0) < 0.5 &&
-          fabs(Pos.ser.angle3 - 90.0) < 0.5, d);
+    check("结束后回到待机位（与 POS_HOME 反解一致）",
+          hok && fabs(Pos.ser.angle1 - homeSer.angle1) < 0.5 &&
+          fabs(Pos.ser.angle2 - homeSer.angle2) < 0.5 &&
+          fabs(Pos.ser.angle3 - homeSer.angle3) < 0.5, d);
   }
 
   /* ================= 3) 内置图形几何（题目四种图形全测；直线在 [2] 段已覆盖） ================= */
@@ -487,7 +492,7 @@ int main(void) {
       int task = letterTasks[li];
       double want[5][3];
       int n = 0;
-      shapeVerts(task, 6.0, 12.0, want, &n);
+      shapeVerts(task, 6.0, -20.0, want, &n);
 
       (void) drawSelectTask(task);
       traceReset();
@@ -522,7 +527,7 @@ int main(void) {
     seqReset();
     traceReset();
     (void) drawStartTask();
-    bool inPath = runUntilPathX(17.0, 30000);
+    bool inPath = runUntilPathY(1.0, 30000);
     double px = Pos.rec.x, py = Pos.rec.y, pz = Pos.rec.z;
     const SER serAtPause = Pos.ser;
 
@@ -533,7 +538,7 @@ int main(void) {
     check("已暂停时 drawPause 幂等（仍回 PAUSED）", drawPause() == PROTO_RES_DRAW_PAUSED, "重复暂停无害");
 
     advance(800);
-    snprintf(d, sizeof d, "暂停 800ms 后 x=%.3f（暂停时 %.3f）", Pos.rec.x, px);
+    snprintf(d, sizeof d, "暂停 800ms 后 y=%.3f（暂停时 %.3f）", Pos.rec.y, py);
     check("暂停期间笔尖一动不动（四个关节角都不变）",
           Pos.rec.x == px && Pos.rec.y == py && Pos.rec.z == pz &&
           Pos.ser.angle1 == serAtPause.angle1 && Pos.ser.angle2 == serAtPause.angle2 &&
@@ -549,9 +554,9 @@ int main(void) {
     bool done = runToIdleTrace(30000);
     struct PhaseStats pa;
     statsFor(DRAW_PHASE_PATH, &pa);
-    snprintf(d, sizeof d, "继续后 x 最小 %.3f（暂停点 %.3f），终点 %.3f", pa.xmin, px, pa.xmax);
-    check("从暂停位置接续（x 不倒退、不从头重画）", done && pa.xmin >= px - 0.05, d);
-    check("继续后仍然画到终点 x≈26", fabs(pa.xmax - 26.0) < 0.05, d);
+    snprintf(d, sizeof d, "继续后 y 最小 %.3f（暂停点 %.3f），终点 %.3f", pa.ymin, py, pa.ymax);
+    check("从暂停位置接续（y 不倒退、不从头重画）", done && pa.ymin >= py - 0.05, d);
+    check("继续后仍然画到终点 y≈6", fabs(pa.ymax - 6.0) < 0.05, d);
   }
 
   /* ================= 5) 取消 ================= */
@@ -559,7 +564,7 @@ int main(void) {
   {
     (void) drawSelectTask(DRAW_TASK_LINE);
     (void) drawStartTask();
-    bool inPath = runUntilPathX(18.0, 30000);
+    bool inPath = runUntilPathY(1.0, 30000);
     double cx = Pos.rec.x, cz = Pos.rec.z;
 
     traceReset();
@@ -576,13 +581,16 @@ int main(void) {
              lf.maxXYStep, lf.zmin, lf.zmax, cz);
     check("抬笔是垂直的（x/y 不动，z 升到纸面之上）",
           lf.n > 3 && lf.maxXYStep < 0.05 && lf.zmax > cz + 3.5, d);
-    check("取消后整段不再碰纸面（z 不低于纸面）", lf.zmin >= 12.0 - 0.05, d);
+    check("取消后整段不再碰纸面（z 不低于纸面）", lf.zmin >= -20.0 - 0.05, d);
+    SER homeSer2 = Pos.ser;
+    bool hok2 = posGetHomeAngles(&homeSer2);
     snprintf(d, sizeof d, "取消点 x=%.2f，最终 b=%.2f r=%.2f c=%.2f", cx,
              Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3);
     check("取消后回到待机位并空闲",
           done && drawGetPhase() == DRAW_PHASE_IDLE && !drawControlBusy() &&
-          fabs(Pos.ser.angle1 - 90.0) < 0.5 && fabs(Pos.ser.angle2 - 90.0) < 0.5 &&
-          fabs(Pos.ser.angle3 - 90.0) < 0.5, d);
+          hok2 && fabs(Pos.ser.angle1 - homeSer2.angle1) < 0.5 &&
+          fabs(Pos.ser.angle2 - homeSer2.angle2) < 0.5 &&
+          fabs(Pos.ser.angle3 - homeSer2.angle3) < 0.5, d);
     check("取消后能重新启动新任务", drawSelectTask(DRAW_TASK_LINE) == DRAW_TASK_LINE, "任务选择恢复可用");
   }
 
@@ -590,8 +598,8 @@ int main(void) {
   printf("\n[6] 五点示教 + 折线轨迹（按键记录、自动开始、绘制中暂停/继续）\n");
   {
     static double tgt[5][3] = {
-      { 15.0, -5.0, 12.0 }, { 25.0, -5.0, 12.0 }, { 15.0, 5.0, 12.0 },
-      { 25.0,  5.0, 12.0 }, { 20.0,  0.0, 12.0 }
+      { 22.0, -5.0, -20.0 }, { 32.0, -5.0, -20.0 }, { 22.0, 5.0, -20.0 },
+      { 32.0,  5.0, -20.0 }, { 27.0,  0.0, -20.0 }
     };
     static double got[5][3];
 
@@ -739,10 +747,10 @@ int main(void) {
     {
       double first[3];
       bool has = firstSampleOf(DRAW_PHASE_TRAVEL, first);
-      snprintf(d, sizeof d, "抬笔起点 (%.2f,%.2f,%.2f)（待机位 20,0,20）",
+      snprintf(d, sizeof d, "抬笔起点 (%.2f,%.2f,%.2f)（待机位 20,0,-10）",
                has ? first[0] : 0.0, has ? first[1] : 0.0, has ? first[2] : 0.0);
       check("先回待机位再走向第一个目标点",
-            has && fabs(first[0] - 20.0) < 1.0 && fabs(first[1]) < 1.0 && fabs(first[2] - 20.0) < 1.0, d);
+            has && fabs(first[0] - 20.0) < 1.0 && fabs(first[1]) < 1.0 && fabs(first[2] + 10.0) < 1.0, d);
     }
     check("画完并回到待机", done && drawGetPhase() == DRAW_PHASE_IDLE, drawStateName());
 
@@ -768,7 +776,7 @@ int main(void) {
       statsFor(DRAW_PHASE_PATH, &pa);
       snprintf(d, sizeof d, "绘制中 z %.3f~%.3f（示教点 z=%.3f），相邻步最大 %.3f",
                pa.zmin, pa.zmax, got[0][2], pa.maxStep);
-      /* 高度要恒定，并且就是示教时记下的那个高度（点动收在 ±0.3 里，所以不比 12.0 死） */
+      /* 高度要恒定，并且就是示教时记下的那个高度（点动收在 ±0.3 里，所以不比 -20.0 死） */
       check("折线全程贴着纸面画（高度恒定 = 示教高度）",
             fabs(pa.zmax - pa.zmin) < 0.01 && fabs(pa.zmin - got[0][2]) < 0.05, d);
     }
@@ -778,8 +786,8 @@ int main(void) {
   printf("\n[7] 五点示教 + 平滑曲线轨迹\n");
   {
     static double tgt[5][3] = {
-      { 15.0, -5.0, 12.0 }, { 22.0, -5.5, 12.0 }, { 25.0, 0.0, 12.0 },
-      { 22.0,  5.5, 12.0 }, { 15.0,  5.0, 12.0 }
+      { 22.0, -5.0, -20.0 }, { 29.0, -5.5, -20.0 }, { 32.0, 0.0, -20.0 },
+      { 29.0,  5.5, -20.0 }, { 22.0,  5.0, -20.0 }
     };
     static double got[5][3];
 
@@ -863,19 +871,19 @@ int main(void) {
     check("串口 pabc 非数字被拒", protoHandleLine("pabc") == PROTO_RES_DRAW_REJECTED, "REJECTED");
     check("串口 n7 标定半宽",
           protoHandleLine("n7") == PROTO_RES_DRAW_CALIBRATED && fabs(drawGetHalfSize() - 7.0) < 1e-9, "CALIBRATED");
-    check("串口 o20,0 标定中心",
-          protoHandleLine("o20,0") == PROTO_RES_DRAW_CALIBRATED &&
-          fabs(drawGetCenterX() - 20.0) < 1e-9 && fabs(drawGetCenterY()) < 1e-9, "CALIBRATED");
+    check("串口 o27,0 标定中心",
+          protoHandleLine("o27,0") == PROTO_RES_DRAW_CALIBRATED &&
+          fabs(drawGetCenterX() - 27.0) < 1e-9 && fabs(drawGetCenterY()) < 1e-9, "CALIBRATED");
     check("串口 o100,0 超上限被拒", protoHandleLine("o100,0") == PROTO_RES_DRAW_REJECTED, "REJECTED");
-    check("标定恢复默认 p12 / n6",
-          protoHandleLine("p12") == PROTO_RES_DRAW_CALIBRATED &&
+    check("标定恢复默认 p-20 / n6",
+          protoHandleLine("p-20") == PROTO_RES_DRAW_CALIBRATED &&
           protoHandleLine("n6") == PROTO_RES_DRAW_CALIBRATED, "已恢复");
 
     check("选回直线任务", drawSelectTask(DRAW_TASK_LINE) == DRAW_TASK_LINE, drawTaskName(drawGetTask()));
     traceReset();
     seqReset();
     check("串口 D 启动绘制", protoHandleLine("D") == PROTO_RES_DRAW_STARTED, "STARTED");
-    bool inPath = runUntilPathX(16.0, 30000);
+    bool inPath = runUntilPathY(1.0, 30000);
     check("D 之后确实在绘制中", inPath && drawGetPhase() == DRAW_PHASE_PATH, drawPhaseName());
     check("绘制中发角度指令被忙守卫拒绝", protoHandleLine("x10") == PROTO_RES_BUSY, "x10 -> BUSY");
     check("绘制中发 Q 暂停（绘图命令豁免忙守卫）",

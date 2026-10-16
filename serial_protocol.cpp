@@ -17,6 +17,12 @@
 #include "draw_control.h"
 #include "weArm_config.h"
 
+/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mS/mE 查询切换）。
+ * 定义在本 TU（而不是 meArm.ino）：自检探针都链接本 TU、但不 #include meArm.ino，
+ * 放在 .ino 里会导致探针链接失败（undefined reference）。 */
+bool g_mirrorShoulder = (WEARM_MIRROR_SHOULDER != 0);
+bool g_mirrorElbow    = (WEARM_MIRROR_ELBOW    != 0);
+
 /* ---------- 行缓冲与状态 ---------- */
 static char s_line[PROTO_LINE_BUF_SIZE];
 static int  s_len = 0;
@@ -180,33 +186,22 @@ static void protoSerialBegin(void)
 /* ========== 响应层（WEARM_SERIAL_RESPONSES） ========== */
 #if WEARM_SERIAL_RESPONSES
 
-/* 夹爪回显：angle4 被夹在 60..150，所以普通的三位十进制打印机就够用。 */
-static void protoWriteInt(int v)
-{
-  if (v >= 100) {
-    protoPut((char)('0' + v / 100));
-  }
-  if (v >= 10) {
-    protoPut((char)('0' + (v / 10) % 10));
-  }
-  protoPut((char)('0' + v % 10));
-}
-
-/* 从 flash 里逐字节走出 <text> 并发送；每条回复以换行结尾，
- * 而 '#' 会被替换成夹爪角度的十进制值。刻意 out-of-line：
- * 在 -flto 下 gcc 会把这个循环克隆到每个回复点，而每个点的参数准备
- * 比一次调用还要贵。 */
+/* 从 flash 里逐字节走出 <text> 并发送；每条回复以换行结尾。
+ * 刻意 out-of-line：在 -flto 下 gcc 会把这个循环克隆到每个回复点，
+ * 而每个点的参数准备比一次调用还要贵。
+ *
+ * 【已删除】原先还有一个 '#' 占位符，会在回复里插入 angle4 的十进制值，
+ * 只有 'O'/'S' 两条命令用（回 "OK 150" / "OK 60"）。那两个值是编译期常量
+ * （TOOL_ANGLE_OPEN / TOOL_ANGLE_CLOSE），主机能从回复码
+ * PROTO_RES_GRIPPER_OPEN/CLOSE 分辨，纯串口主机也拿不到额外信息；
+ * 连带 protoWriteInt() 的十进制拆分（三位除法取模）一起删掉，省 flash。 */
 __attribute__((noinline, noclone))
 static void protoReply(const char *text)
 {
   char c;
 
   while ((c = (char)pgm_read_byte(text++)) != '\0') {
-    if (c == '#') {
-      protoWriteInt((int)Pos.ser.angle4);
-    } else {
-      protoPut(c);
-    }
+    protoPut(c);
   }
   protoPut('\n');
 }
@@ -216,7 +211,6 @@ static void protoReply(const char *text)
 static const char s_rOk[] PROGMEM = "OK";
 static const char s_rErr[] PROGMEM = "ERR";
 static const char s_rRej[] PROGMEM = "REJECTED";
-static const char s_rOkN[] PROGMEM = "OK #";
 /* 三种"看懂了但没执行"的回复，按键族以前都合并成 REJECTED。
  * 把它们区分开是让纯串口主机能做出反应的关键：BUSY = 机械臂在动，
  * DISCARD = 录制被丢弃（位移不够 / 没有动作 / 缓冲满），
@@ -227,7 +221,7 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL 123 kK ABC NRPM0 FDGEQUW pno ANG x,y,z ! !P !B !D";
+static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -247,35 +241,69 @@ static void protoReplyTaskTag(const char *tag)
   protoPut('\n');
 }
 
+/* 'm'（查询/切换上臂与下臂换向）的回复："S=0 E=1" 形式，与 protoReplyFeature 同一风格。 */
+static void protoReplyMirror(void)
+{
+  protoPut('S');
+  protoPut('=');
+  protoPut(g_mirrorShoulder ? '1' : '0');
+  protoPut(' ');
+  protoPut('E');
+  protoPut('=');
+  protoPut(g_mirrorElbow ? '1' : '0');
+  protoPut('\n');
+}
+
+/* '!'（查询/切换三个模块的运行时开关）的回复："P=1 B=1 D=1" 形式。
+ * 与 protoReplyMirror 同样是 out-of-line 的：原先是一个宏，在 '!' 与 '!P/!B/!D'
+ * 两个调用点各展开一份约二十个 protoPut，纯属重复代码。 */
+static void protoReplyFeature(void)
+{
+  protoPut('P');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0');
+  protoPut(' ');
+  protoPut('B');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0');
+  protoPut(' ');
+  protoPut('D');
+  protoPut('=');
+  protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0');
+  protoPut('\n');
+}
+
 #define R_OK()   protoReply(s_rOk)
 #define R_ERR()  protoReply(s_rErr)
 #define R_REJ()  protoReply(s_rRej)
-#define R_OKN()  protoReply(s_rOkN)
 #define R_BUSY() protoReply(s_rBusy)
 #define R_DISCARD() protoReply(s_rDiscard)
 #define R_EMPTY() protoReply(s_rEmpty)
 #define R_OFF()  protoReply(s_rOff)
 #define R_BOOT() protoReply(s_rBoot)
-#define R_FEATURE() do { protoPut('P'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_PICK) ? '1' : '0'); protoPut(' '); protoPut('B'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_BUTTON) ? '1' : '0'); protoPut(' '); protoPut('D'); protoPut('='); protoPut((s_runtimeFeatures & PROTO_FEATURE_DRAW) ? '1' : '0'); protoPut(10); } while (0)
 #else
 #define R_OK()   do { } while (0)
 #define R_ERR()  do { } while (0)
 #define R_REJ()  do { } while (0)
-#define R_OKN()  do { } while (0)
 #define R_BUSY() do { } while (0)
 #define R_DISCARD() do { } while (0)
 #define R_EMPTY() do { } while (0)
 #define R_OFF()  do { } while (0)
 #define R_BOOT() do { } while (0)
-#define R_FEATURE() do { } while (0)
 #define protoReplyTaskTag(tag) do { (void)(tag); } while (0)
+#define protoReplyMirror() do { } while (0)
+#define protoReplyFeature() do { } while (0)
 #endif
 
 /* ========== 命令分类位图 ========== */
 /* 下标 i = cmd - '0' 覆盖 '0'(0x30) .. 'p'(0x70)，包括所有命令字符；
  * 其它字符会越出表尾并被拒绝。
  * s_liveBits：模块忙时该命令仍然被接受。
- * s_fastBits：命令只要单字符一到就立即执行，不必等行尾。 */
+ * s_fastBits：命令只要单字符一到就立即执行，不必等行尾。
+ * 注意两张表第 0 字节的低 4 位覆盖 '0'..'3'：'0' 是回中别名（有效），
+ * '1'/'2'/'3' 是早已删掉的档位直达键。这三个位**有意保留** —— 这几个字符因此
+ * 照常进入派发流程、收到一个干净的 ERR；清掉只会让忙时回复从 ERR 变成 BUSY，
+ * 没有别的好处，探针也没有断言这三个字符的行为。 */
 static const uint8_t s_liveBits[9] PROGMEM = { 0x0F, 0x00, 0xF0, 0x71, 0xA7, 0x00, 0x00, 0xC0, 0x01 };
 static const uint8_t s_fastBits[9] PROGMEM = { 0x0E, 0x00, 0x0E, 0x99, 0x08, 0x00, 0x00, 0x08, 0x00 };
 
@@ -353,8 +381,14 @@ void serialProtocolLoop(void)
       continue;  /* 丢弃到行尾之前的字符 */
     }
 
-    /* 行缓冲溢出 */
+    /* 行缓冲溢出：整行丢弃，并且**回一行 ERR**。
+     * 协议约定"每条命令恰好回一行短回复"，静默丢弃会让在等回复的主机卡住，
+     * 还会把下一条命令的回复张冠李戴（probe_protocol 第三节就是拿合法前缀
+     * 填满缓冲来验证"整行被丢掉"的）。
+     * 这一行只会在刚溢出的那一刻触发一次：之后进入 s_dropUntilEol 状态，
+     * 字符被直接扔掉，直到行尾（或超时）才复位。 */
     if (s_len >= PROTO_LINE_BUF_SIZE - 1) {
+      R_ERR();
       s_dropUntilEol = true;
       s_len = 0;
       s_pending = false;
@@ -478,12 +512,34 @@ int protoHandleLine(const char *line)
     }
     if (!protoRuntimeEnabled(feature)) s_runtimeFeatures |= feature;
     else s_runtimeFeatures &= (uint8_t)~feature;
-    R_FEATURE();
+    protoReplyFeature();
     return PROTO_RES_FEATURE;
   }
   if (cmd == '!' && single) {
-    R_FEATURE();
+    protoReplyFeature();
     return PROTO_RES_NONE;
+  }
+
+  /* m / mS / mE：查询/切换上臂(r)与下臂(c)的物理换向（运行时方向标定）。
+   * 只改 writeServo() 送给舵机的数，逻辑角与反解一律不变；掉电不保存。
+   * 放在功能门控与忙判定之前：换向不移动机械臂，任何时刻都允许。 */
+  if (cmd == 'm') {
+    if (single) {
+      protoReplyMirror();
+      return PROTO_RES_MIRROR;
+    }
+    const char *q = tail;
+    if (q[1] != '\0' || (q[0] != 'S' && q[0] != 'E')) {
+      R_REJ();
+      return PROTO_RES_UNKNOWN;
+    }
+    if (q[0] == 'S') {
+      g_mirrorShoulder = !g_mirrorShoulder;
+    } else {
+      g_mirrorElbow = !g_mirrorElbow;
+    }
+    protoReplyMirror();
+    return PROTO_RES_MIRROR;
   }
 
   if (!single && (cmd == PROTO_CMD_BTN_CYCLE || cmd == PROTO_CMD_BTN_RECORD ||
@@ -546,13 +602,13 @@ int protoHandleLine(const char *line)
      * switch 会生成一张 64 项的跳转表，而 if 链只为自己用到的比较买单。
      * 真实 AVR 构建实测：整个派发器省 78 字节。 */
     if (cmd == PROTO_CMD_GRIPPER_OPEN) {
-      posSetAngle4(150.0);  // 硬编码：夹爪张开（与 f 行程上限一致）
-      R_OKN();
+      posSetAngle4(TOOL_ANGLE_OPEN);   // 夹爪张开到位（宏定义在 constant_and_positions.h）
+      R_OK();
       return PROTO_RES_GRIPPER_OPEN;
 
     } else if (cmd == PROTO_CMD_GRIPPER_CLOSE) {
-      posSetAngle4(60.0);   // 硬编码：夹爪合拢（与 f 行程下限一致）
-      R_OKN();
+      posSetAngle4(TOOL_ANGLE_CLOSE);  // 名义合拢角；"夹紧"是取放序列自己的事
+      R_OK();
       return PROTO_RES_GRIPPER_CLOSE;
 
     } else if (cmd == PROTO_CMD_SPEED_UP || cmd == PROTO_CMD_SPEED_DOWN) {
@@ -609,7 +665,7 @@ int protoHandleLine(const char *line)
     /* 未知单字符命令：落到下面的角度解析 */
   }
 
-  /* 纸面标定 p/n/o：多字符（p12.5 / n6 / o20,0）。
+  /* 纸面标定 p/n/o：多字符（p-20 / n6 / o27,0）。
    * 放在角度解析之前处理，因为 'o' 行里带逗号，
    * 否则会被当成"语法错误的角度命令"。 */
   if ((cmd == PROTO_CMD_DRAW_PAPER_Z ||
@@ -796,7 +852,9 @@ static int protoHandleDrawCalib(const char *line, char cmd)
 
   PROTO_SKIP_BLANKS(p);
   if (!protoParseNumber(&p, &v1)) {
-    R_ERR();
+    /* 只返回结果码，**不在这里回复** —— 回复由调用方按契约统一发出。
+     * 这条曾经既在这里 R_ERR() 又在调用方 R_REJ()，于是被拒的 p/n/o
+     * 会连着吐 "ERR" 和 "REJECTED" 两行，主机按"一命令一回复"读就会错位。 */
     return PROTO_RES_DRAW_REJECTED;
   }
   PROTO_SKIP_BLANKS(p);
@@ -819,7 +877,8 @@ static int protoHandleDrawCalib(const char *line, char cmd)
     return PROTO_RES_DRAW_CALIBRATED;
   }
 
-  R_ERR();
+  /* 同上：值非法也只返回码，由调用方回 REJECTED（PROTO_RES_DRAW_REJECTED 的
+   * 文档已经把"标定值非法"和"轨迹校验不过/示教点不够"都算作 REJECTED）。 */
   return PROTO_RES_DRAW_REJECTED;
 }
 

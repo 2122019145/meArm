@@ -1,13 +1,23 @@
 /*
  * pick_place.h -- 物体 A / B / C 的自动取放序列
  *
- * 上位机在串口里发单个字母 A / B / C，本模块用一条非阻塞状态机自动完成整套动作：
- *     移动到物体上方 -> 垂直下降 -> 合爪 -> 停顿 -> 垂直抬起
- *     -> 平移到放置点上方 -> 垂直下降 -> 松爪 -> 停顿 -> 垂直撤离
+ * 上位机在串口里发单个字母 A / B / C，本模块用一条非阻塞状态机自动完成整套动作。
+ * 路径按用户口径：以物体高度为基准（1 工作区单位 = 4 mm，5cm = 12.5、2cm = 5.0）
+ *     先上移到「物体高度 + 5cm」-> 沿水平方向移到「物体后方 2cm」
+ *     -> 下降到与物体同高 -> 沿水平方向「向前 2cm」把物体送进两爪之间
+ *     -> 合爪（快合到名义合拢角，再慢压到夹紧角）-> 停顿
+ *     -> 抬回「物体高度 + 5cm」-> 沿水平方向移到「目标点正上方」
+ *     -> 下降到目标高度（名义上正好 5cm）-> 张爪 -> 停顿
+ *     -> 抬回飞行高度 -> 回到开机初始位姿 POS_HOME
+ *
+ * 合爪之后到张爪之前的每一帧都重申夹紧角，搬运途中不会松开（见 pickHoldingStage）。
+ * 「后方 / 向前」取的是基座的水平半径方向，不是固定 ±x（见 pickBehindPoint）。
  *
  * 位置表（每个物体的初始位置与放置位置）写在 pick_place.cpp 顶部，可直接改。
- * 三个物体的初始位置互不相同，三个放置位置也互不相同；而且对每个物体来说，
- * 放置位置相对它的初始位置在 x 与 y 两个方向上都有明显位移（表里逐条标了 Δx/Δy）。
+ * 物体与目标的放置高度允许 -10cm ~ +10cm（±25 单位）；物体越高可达的水平半径越小，
+ * 所以「+5cm 的飞行高度」在物体很高时会整个落在可达包络之外，这时
+ * planTravelZ() 会逐档降低飞行高度，最低不低于「最高物体 + 1cm」。
+ * 飞行高度是否被降过可以用 pickPlacePlanZ() 查（探针用它断言取值区间）。
  *
  * 【与摇杆、串口的关系】
  *  - 序列执行期间由本模块独占 b/r/c 三个关节角，摇杆步进被让位
@@ -18,8 +28,9 @@
  *    期间串口接收与指示灯照常工作。
  *
  * 【为什么序列要用反解走直线】
- * 每个阶段都是在 x/y/z 上线性插值（所以下降/抬起是垂直的），插值点用固件自己的
- * getAngleEx() 反解成关节角，写进 Pos.ser 后只刷新一次 Pos.rec。
+ * 每个移动阶段都是在 x/y/z 上线性插值（所以下降/抬起是垂直的），插值点用固件自己的
+ * getAngleEx() 反解成关节角，写进 Pos.ser 后只刷新一次 Pos.rec。最后回初始位姿
+ * 那一段走的是关节空间插值（POS_HOME 本身就是关节姿态，不必再反解）。
  * 启动前会把整条路径采样验证一遍（在 limit 内、isReachable()、关节角没被吸附、
  * 相邻采样点的反解分支不跳变），有一条不满足就拒绝启动、一个字节都不改。
  */
@@ -41,8 +52,9 @@
  *    0  已开始（pickPlaceIsBusy() 变为 true）
  *   -1  物体编号非法
  *   -2  已经有一个序列在执行（本次忽略）
- *   -3  路径校验失败（当前位姿到物体、或物体到放置点的路径上有不可达/越界点），
- *       拒绝启动，Pos 一个字节都不改                                 */
+ *   -3  路径校验失败（当前位姿不可用 / 不在自己的反解分支上，或路径上有不可达、
+ *       越界、分支跳变的点），拒绝启动，Pos 一个字节都不改
+ *   -4  位置表高度超出 -10cm~+10cm，或整段区间都找不到可达的飞行高度       */
 int pickPlaceStart(int object);
 
 /* 每轮 loop() 调用一次，推动序列前进（非阻塞，空闲时立即返回）。 */
@@ -63,9 +75,17 @@ const char *pickPlaceStageName(void);
 bool pickPlaceGetSource(int object, double *x, double *y, double *z);
 bool pickPlaceGetTarget(int object, double *x, double *y, double *z);
 
-/* 接近 / 撤离高度（相对取放点的 z 抬升量，也是平移时的飞行高度）。
- * 单值真值在 pick_place.cpp 的 PICK_APPROACH_DZ，探针与上位机靠这个取，不要各自写死。 */
+/* 理想的接近 / 撤离高度（相对取放点的 z 抬升量，即「物体高度 + 5cm」）。
+ * 单值真值在 pick_place.cpp 的 PICK_LIFT_DZ，探针与上位机靠这个取，不要各自写死。
+ * 物体很高时实际用的飞行高度会比它低（被 planTravelZ 降过），要用 pickPlacePlanZ()。 */
 double pickPlaceApproachDz(void);
+
+/* 「物体后方 2cm」的水平退让距离（单值真值 PICK_BACK_DZ）。 */
+double pickPlaceBackDz(void);
+
+/* 按当前位置与物体 object 的位置表，算出这次序列实际会用的飞行高度（工作区 z）。
+ * 只做规划、不改变任何状态；找不到可达的飞行高度时返回 false。 */
+bool pickPlacePlanZ(int object, double *z);
 #else
 /* 取放功能已关闭，这里是空实现 */
 static inline int  pickPlaceStart(int object)   { (void)object; return -1; }
@@ -78,6 +98,9 @@ static inline bool pickPlaceGetSource(int object, double *x, double *y, double *
 static inline bool pickPlaceGetTarget(int object, double *x, double *y, double *z)
     { (void)object; (void)x; (void)y; (void)z; return false; }
 static inline double pickPlaceApproachDz(void)  { return 0.0; }
+static inline double pickPlaceBackDz(void)      { return 0.0; }
+static inline bool pickPlacePlanZ(int object, double *z)
+    { (void)object; (void)z; return false; }
 #endif
 
 #endif

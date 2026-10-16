@@ -8,16 +8,18 @@
 //   上位机的命令文档要改时，只改这一个文件即可。
 //
 // 【不重复定义真值】
-//   1. 每个关节的机械行程（例如爪子的 60/150）唯一真值是
-//      constant_and_positions.cpp 里的 servoLimit，本文件不写死，
-//      只通过 protoAxisGetLimit() 转发，避免出现两处真值。
+//   1. 三个关节 b/r/c 的行程就是舵机的电气行程 0~180，真值写在落地那一层：
+//      serial_protocol.cpp 的 protoApplyAngles()（夹取）与 constant_and_positions.cpp
+//      的 getAngleEx()（行程判据），舵机驱动层再兜一次。（旧的 servoLimit 配置表已删除。）
+//      注意 constant_and_positions.h 的 TOOL_ANGLE_MIN/MAX 是**夹爪**(angle4/f) 的
+//      0~180，不是这三个关节的 —— 数值碰巧一样，别当成同一个真值引用。
 //   2. 速度档位的具体参数（0.5/20/80 等）唯一真值在 adjustSpeed()，
 //      本文件只引用档位号。
 //
-// 【角度上下限只在 servoLimit 里定义】
+// 【角度上下限不在这里定义】
 //   本文件不定义角度上下限（没有 PROTO_ANGLE_MIN/MAX 这类名义区间）。解析
 //   阶段不会因为角度超出某个区间而拒绝指令（那样 "x200" 就变成废指令了），
-//   而是在落地前按该关节真实的 servoLimit 行程夹取，例如 x200 最终写 180。
+//   而是在落地前把角度硬夹到 0~180，例如 x200 最终写 180。
 //
 */
 
@@ -38,7 +40,9 @@
 #define PROTO_CMD_PICK_C    'C'
 
 /* 四个物理按键的串口等价命令（效果与按下按键完全一样）。
- * 用字母而不是数字：数字键留给将来扩展，且与绘图任务的弹点时序无关。 */
+ * 用字母而不是数字：原先占用数字位的 '1'/'2'/'3' 档位直达键已删（与题目命令集
+ * 无关，同时给 Uno 腾 flash），数字位留空；字母也不会和 x/X/y/Y/z/Z 三个角度轴
+ * 字母冲突。 */
 #define PROTO_CMD_BTN_CYCLE    'N'   /* 按键1 循环执行：下一次按顺序夹 A/B/C */
 #define PROTO_CMD_BTN_RECORD   'R'   /* 按键2 录制：第一次开始，第二次结束并保存 */
 #define PROTO_CMD_BTN_PLAY     'P'   /* 按键3 播放上一次录制的动作 */
@@ -56,7 +60,7 @@
 #define PROTO_CMD_DRAW_RESUME  'U'   /* 继续（等价于绘制中按按键2） */
 #define PROTO_CMD_DRAW_CANCEL  'W'   /* 取消（等价于绘制中按按键3） */
 
-/* 纸面标定命令（多字符，形如 p12.5 / n6 / o20,0），用于上机时把"纸面"告诉固件 */
+/* 纸面标定命令（多字符，形如 p-20 / n6 / o27,0），用于上机时把"纸面"告诉固件 */
 #define PROTO_CMD_DRAW_PAPER_Z 'p'   /* p<纸面高度>：铅笔尖落在纸上时的 z */
 #define PROTO_CMD_DRAW_HALF    'n'   /* n<半宽>：内置图形的半宽 */
 #define PROTO_CMD_DRAW_CENTER  'o'   /* o<中心x>,<中心y>：内置图形的中心 */
@@ -65,9 +69,6 @@
 #define PROTO_AXIS_COUNT 3
 /* 轴的字符（大小写都接受，见 protoAxisIndexFromChar） */
 extern const char protoAxisChar[PROTO_AXIS_COUNT];
-/* 轴对应的关节字母：b = 基座(angle1) r = 上臂(angle2) c = 下臂(angle3)，
- * 只用于串口提示；写入本身按"轴 a 写 angle(a+1)"进行。 */
-extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 
 /* ---------- 3) 解析与缓冲区 ---------- */
 #define PROTO_LINE_BUF_SIZE 40
@@ -84,8 +85,7 @@ extern const char protoAxisJoint[PROTO_AXIS_COUNT];
 /* 把 x/X/y/Y/z/Z 转成轴下标 0..2，其它字符返回 -1 */
 int protoAxisIndexFromChar(int c);
 
-/* 取第 axis 个轴（0..2）的关节行程上下限，直接转发 servoLimit。
- * axis 越界或指针为空时返回 false。 */
-bool protoAxisGetLimit(int axis, double *minAngle, double *maxAngle);
+/* 三个关节 b/r/c 的行程真值（0~180）在 protoApplyAngles() 与 getAngleEx()：
+ * 数值上正好等于 TOOL_ANGLE_MIN/MAX，但后者是夹爪(angle4)的，别混用。 */
 
 #endif

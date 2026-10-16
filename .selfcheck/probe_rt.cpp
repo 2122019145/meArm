@@ -1,10 +1,12 @@
 /* probe_rt.cpp —— 正解/反解往返验证（去配置化版本）
  *
- * 固件约定（已用两处实测标定核对，误差 0.00）：
- *   平面: alpha = r, beta = r - c
+ * 固件约定（v1.6.7 修正后的绝对角模型）：
+ *   平面: alpha = 90 - r    beta = c - 90
  *         x_planar = L1 cos(alpha) + L2 cos(beta)
  *         z        = L1 sin(alpha) + L2 sin(beta)      (armheight = 0)
  *   基座: theta = 90 - b   (b=90 朝 +x, b<90 转向 +y)
+ *   反解: delta = +acos(...) 优先、-acos(...) 兜底（见 constant_and_positions.cpp）
+ *   可达域: rho∈[0,40], z∈[-40,40]（x 恒 ≥ 0，仅朝前半空间）
  *
  * 【本版本】servoLimit / rangeLimit 已从固件删除：
  *   关节行程硬编码 0~180，坐标范围不设限制。
@@ -34,10 +36,10 @@ static const int CMIN = 0, CMAX = 180;
 int main(void) {
   printf("=== 0) 标定点核对（固件模型正解）===\n");
   struct { double b, r, c, ex, ez; } anchors[] = {
-    { 90,  90,  90, 20.00, 20.00 },
-    { 90,  90, 105, 19.32, 14.82 },
-    { 90,  45,   0, 28.28, 28.28 },
-    {  0,  90,  90,  0.00, 20.00 },
+    { 90,  90,  90, 40.00,   0.00 },
+    { 90,  90, 105, 39.32,   5.18 },
+    { 90,  45,   0, 14.14,  -5.86 },
+    {  0,  90,  90,  0.00,   0.00 },
   };
   for (unsigned i = 0; i < sizeof(anchors)/sizeof(anchors[0]); i++) {
     double x, y, z;
@@ -50,11 +52,11 @@ int main(void) {
   printf("\n=== 1) 反解: 给笛卡尔点，检查 getAngle 是否给出预期关节角 ===\n");
   {
     struct { double x, y, z, eb, er, ec; } cases[] = {
-      { 20.0,   0.0, 20.0, 90,  90,  90 },
-      { 19.32,  0.0, 14.82, 90, 90, 105 },
-      { 28.28,  0.0,  0.00, 90, 46.00,  1.99 },
-      { 28.28,  0.0, 28.28, 90, 45.01, 90.02 },
-      {  0.0,  20.0, 20.0,  0, 90,  90 },
+      { 20.0,   0.0, 20.0,  90,  0.00,  90.00 },
+      { 19.32,  0.0, 14.82, 90,  0.01,  74.99 },
+      { 28.28,  0.0,  0.00, 90, 44.99,  44.99 },
+      { 40.00,  0.0,  0.00, 90, 90.00,  90.00 },
+      { 20.0,   0.0,-20.0, 90, 90.00,   0.00 },
     };
     for (unsigned i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
       pos p;
@@ -69,6 +71,26 @@ int main(void) {
                p.ser.angle1, p.ser.angle2, p.ser.angle3, err);
       bool good = ok && err < 0.05;
       check("ik", good, buf);
+    }
+  }
+
+  printf("\n=== 1.5) 端点回归（臂折到极限的位姿）===\n");
+  {
+    struct { double x, y, z, er, ec; } eps2[] = {
+      {  20.0, 0.0,  20.0,   0.0,  90.0 },   /* 上臂竖直向上、小臂水平朝前 */
+      {  20.0, 0.0, -20.0,  90.0,   0.0 },   /* 上臂水平朝前、小臂竖直朝下 */
+      {   0.0, 0.0, -40.0, 180.0,   0.0 },   /* 两臂都竖直朝下（r=180 端点） */
+    };
+    for (unsigned i = 0; i < sizeof(eps2)/sizeof(eps2[0]); i++) {
+      pos p;
+      p.rec.x = eps2[i].x; p.rec.y = eps2[i].y; p.rec.z = eps2[i].z;
+      p.ser.angle1 = p.ser.angle2 = p.ser.angle3 = 0; p.ser.angle4 = 105.0;
+      bool ok = getAngle(&p);
+      char buf[200];
+      snprintf(buf, sizeof(buf), "-> b=%.2f r=%.2f c=%.2f (期望 r=%.2f c=%.2f)",
+               p.ser.angle1, p.ser.angle2, p.ser.angle3, eps2[i].er, eps2[i].ec);
+      check("endpoint-ik", ok && fabs(p.ser.angle2 - eps2[i].er) < 0.05 &&
+                           fabs(p.ser.angle3 - eps2[i].ec) < 0.05, buf);
     }
   }
 

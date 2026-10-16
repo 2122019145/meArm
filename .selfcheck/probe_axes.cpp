@@ -1,7 +1,8 @@
-/* probe_axes.cpp —— 扫描真实可达空间（去配置化版本）
+/* probe_axes.cpp —— 扫描真实可达空间 + 核对工作空间盒子 limit
  *
- * 【本版本】servoLimit / rangeLimit 已从固件删除，b/r/c 硬编码 0~180。
- * 本探针只扫描这个固定行程并报告包络。
+ * 【本版】b/r/c 硬编码 0~180（servoLimit 仍是删除状态）；rangeLimit 已恢复：
+ * x/y ±40、z -40~40（见 constant_and_positions.h 的 struct rangeLimit）。
+ * 本探针扫出真实包络，再验证"盒子必须覆盖包络"。
  * 直接 #include 固件，用 recFromServo() 算坐标，绝不重写公式。
  */
 #include <cmath>
@@ -49,7 +50,43 @@ int main(void) {
   printf("\n=== 1) 全域实测包络（%ld 个采样点）===\n", total);
   printf("  x[%.2f, %.2f]  y[%.2f, %.2f]  z[%.2f, %.2f]\n",
          xmin, xmax, ymin, ymax, zmin, zmax);
-  printf("  (预期: x[-40,40] y[-40,40] z[-20,40])\n");
+  printf("  (预期: x[0,40] y[-40,40] z[-40,40])\n");
+
+  /* 1.5) 工作空间盒子 limit：配置值 + "盒子必须覆盖包络"这条安全不变量 */
+  printf("\n=== 1.5) 工作空间盒子 limit ===\n");
+  {
+    /* 余量 = 包络离盒子边界还有多远。两边都必须 >= 0：
+     *   lowX  = xmin - limit.minX  （盒子下界比包络最低还低多少）
+     *   highX = limit.maxX - xmax  （盒子上界比包络最高还高多少）
+     * 注意别写反成 limit.minX - xmin —— 那样"盒子覆盖包络"会被算成负数。 */
+    double lowX = xmin - limit.minX, highX = limit.maxX - xmax;
+    double lowY = ymin - limit.minY, highY = limit.maxY - ymax;
+    double lowZ = zmin - limit.minZ, highZ = limit.maxZ - zmax;
+    int ok = 1;
+
+    printf("  limit = x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]\n",
+           limit.minX, limit.maxX, limit.minY, limit.maxY, limit.minZ, limit.maxZ);
+    printf("  盒子相对包络的余量: x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
+           lowX, highX, lowY, highY, lowZ, highZ);
+
+    /* 配置值必须与"末端笛卡尔 z 范围 -40~40"的需求一致（x/y 仍 ±40） */
+    if (!(limit.minX == -40.0 && limit.maxX == 40.0)) {
+      printf("  MISMATCH: x 应为 ±40\n"); ok = 0;
+    }
+    if (!(limit.minY == -40.0 && limit.maxY == 40.0)) {
+      printf("  MISMATCH: y 应为 ±40\n"); ok = 0;
+    }
+    if (!(limit.minZ == -40.0 && limit.maxZ == 40.0)) {
+      printf("  MISMATCH: z 应为 -40~40\n"); ok = 0;
+    }
+    if (lowX < 0 || highX < 0 || lowY < 0 || highY < 0 || lowZ < 0 || highZ < 0) {
+      printf("  FAIL: 盒子比实测包络窄，可达姿态会被提前挡住\n"); ok = 0;
+    }
+    if (ok) {
+      printf("  OK：配置正确，且盒子覆盖包络（x 余量 40/0、y 余量 0/0、z 余量 0/0）\n");
+    }
+    if (!ok) fails++;
+  }
 
   /* 2) 逐高度 z 的 x/y 可达区间 */
   printf("\n=== 2) 逐高度可达区间（每 2 单位一层）===\n");
@@ -102,11 +139,11 @@ int main(void) {
   /* 4) 标定点核对（需要 armheight=0） */
   printf("\n=== 4) 标定点核对（固件 recFromServo，需要 armheight=0）===\n");
   struct { double b, r, c; double ex, ey, ez; } pts[5] = {
-    { 90, 90,  90, 20.00, 0.00, 20.00 },
-    { 90, 90, 105, 19.32, 0.00, 14.82 },
-    { 90, 45,  90, 28.28, 0.00,  0.00 },
-    { 90, 105,  0,-10.35, 0.00, 38.64 },
-    { 90, 45, 105, 24.14, 0.00, -3.18 }
+    { 90, 90,  90, 40.00, 0.00,  0.00 },
+    { 90, 90, 105, 39.32, 0.00,  5.18 },
+    { 90, 45,  90, 34.14, 0.00, 14.14 },
+    { 90, 105,  0, 19.32, 0.00,-25.18 },
+    { 90, 45, 105, 33.46, 0.00, 19.32 }
   };
   for (int i = 0; i < 5; i++) {
     double x, y, z;

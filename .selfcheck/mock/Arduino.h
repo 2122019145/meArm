@@ -120,8 +120,12 @@ extern int g_mockPinMode[20];
 /* digitalWrite() 的仿真记录（v1.3.0）：g_mockPinLevel 是每个引脚的当前电平；
  * g_mockWriteLogPin/Level 按调用顺序记录最近 MOCK_WRITE_LOG_MAX 次写引脚事件，
  * g_mockWriteLogCount 是已记录条数（封顶于容量，用于下标遍历），
- * g_mockWriteTotal 是累计调用次数（日志满了也继续涨，便于判断"还有脉冲没记下"）。
- * probe_servo_drive 用它验证舵机脉冲的引脚顺序与极性。 */
+ * g_mockWriteTotal 是累计调用次数（日志满了也继续涨，便于判断"还有事件没记下"）。
+ *
+ * 【v1.6.6】舵机换成官方 Servo 库之后，脉冲波形不再由固件产生，原先靠这份
+ * 日志断言"引脚顺序/极性/脉宽"的两个探针（probe_servo_drive、wearm_ino_test）
+ * 改成读 mock/Servo.h 的绑定记录。日志本身留着：它是通用的"哪根脚何时被写成
+ * 什么电平"基础设施。 */
 #define MOCK_WRITE_LOG_MAX 256
 extern int g_mockPinLevel[20];
 extern int g_mockWriteLogPin[MOCK_WRITE_LOG_MAX];

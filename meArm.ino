@@ -4,7 +4,7 @@
 //
 // 结构:
 //   setup() —— 复位到安全初始角度、初始化串口协议、自标定摇杆中位与状态灯、
-//              初始化按键/绘图模块、启动 Timer1 舵机驱动并把 4 路 attach 到引脚
+//              初始化按键/绘图模块、启动舵机驱动并把 4 路 attach 到引脚
 //              （顺序有讲究，见 setup() 里的编号注释）
 //   loop()  —— 每轮:
 //     1. serialProtocolLoop() 处理串口指令（唯一读者，放在最前面保证及时响应）
@@ -14,7 +14,7 @@
 //                          每个采样点最终都交给 move.h 的 moveToPoint() 落地）
 //     5. joystickLoop()    读手柄（MeArm 套件手柄：两根双轴摇杆，共占 A0~A3），
 //                          按全局速度参数直接改变 4 个关节角
-//     6. writeServo()      把当前 4 个关节角写入物理舵机（servo_drive，Timer1 硬件 PWM）
+//     6. writeServo()      把当前 4 个关节角写入物理舵机（servo_drive → Arduino Servo 库）
 //   （取放/按键/绘图三者互斥：各自的 IsBusy()/Locked() 会让另外两个与摇杆整段让位）
 //
 // 【控制方式：关节角是唯一被控量】
@@ -34,8 +34,8 @@
 //
 // 手柄操作（详见 joystick_control.h）:
 //   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 +y 侧转
-//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂继续抬高
-//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂往前收
+//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 90°−r 变小）
+//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c−90° 变大）
 //   右手柄 左右推 (A2) -> f = angle4 末端夹具   角度增大 = 张开
 //   ★ 摇杆中位在 setup() 里自标定（各轴取平均、扣掉静态偏差，见 joystick_control.cpp
 //     的 JOY_CAL_*）：真实手柄的中位很少正好是 ADC 512，偏差超过死区就会让机械臂
@@ -84,9 +84,9 @@
 //     发 D             开始绘制（内置图形直接画；五点折线/五点曲线先进入五点示教）
 //     发 G / E         示教中记录 / 撤销一个示教点（等价于示教时按按键1 / 按键2）
 //     发 Q / U / W     暂停 / 继续 / 取消（等价于绘制时按按键1 / 按键2 / 按键3）
-//     发 p12.5         标定纸面高度（铅笔尖刚好落在纸上时的 z）
+//     发 p-20          标定纸面高度（铅笔尖刚好落在纸上时的 z；在待机 -10 下方）
 //     发 n6            标定内置图形的半宽（顶点落在 ±半宽 的正方形里）
-//     发 o20,0         标定内置图形的中心 (x,y)
+//     发 o27,0         标定内置图形的中心 (x,y)
 //   绘图时的按键语义（与空闲时的 循环取放/录制/播放/回中 同一套"按键编号"，只是换了解释）:
 //     示教中  "按键1"记录示教点（记满 5 个自动开始）  "按键2"撤销  "按键3"取消  "按键4"手动开始
 //     绘制中  "按键1"暂停（停在原地、任务状态保留）  "按键2"继续（从暂停处接续）  "按键3"取消（抬笔回待机）
@@ -114,33 +114,38 @@
 //
 // 安全边界:
 //   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
-//                              （原来的 f 60~150 夹爪软限位已按需求删除），唯一的软件边界。
+//                              （原来的 f 60~150 夹爪软限位已按需求删除）。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
 //                              点，绘图/示教一律拒绝，串口 x/y/z（NOW 策略）允许吸附后到位。
-//   2. rangeLimit 位置边界   —— 由新角度正解出的末端坐标若跑出 limit 区间，
-//                              这一步整步回退，避免臂跑到没标定的区域。
+//   2. rangeLimit 位置边界   —— "工作空间盒子"（constant_and_positions.cpp 的 limit）：
+//                              x/y ±40、z -40~40。摇杆/按键/示教的关节步进由
+//                              move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
+//                              取放与绘图的轨迹采样点由 path_core.h 的
+//                              pathCorePointOk() 整条拒绝（取放启动报 BUSY、
+//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽，
+//                              见下面的"可达包络"一节 —— 它不改变可达性。
 //   3. 正运动学自洽          —— 每步都用 recFromServo() 重算坐标，
 //                              Pos.ser 与 Pos.rec 永远严格对应（坐标入口也一样，
 //                              见 move.cpp 的 moveToPoint()）。
 //
 // 坐标模型（用于显示与工作空间校验，与 constant_and_positions.cpp 一致）:
 //   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机中立位 90° 的实测含义:
+//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
 //     b (angle1) 90° -> 基座朝 +x，b 偏离 90° 就转向 ±y；
-//     r (angle2) 90° -> 上臂竖直向上；
-//     c (angle3) 90° -> 下臂水平朝前（与上臂成 90°）。
-//   初始位姿 (b,r,c,f) = (90,90,90,f 中位) 对应末端 (20, 0, 20)，
-//   也就是 constant_and_positions.cpp 里的 POS_HOME。
-//   关节限位内的实测可达包络（probe_axes 扫 5929741 个组合）:
-//     x[-40.00, 40.00] y[-40.00, 40.00] z[-20.00, 40.00]
-//   limit 按包络"向外取整到 0.5"取 x[-40.0,40.0] y[-40.0,40.0] z[-20.0,40.0]
-//   （这次包络端值恰好落在 0.5 的整数倍上，所以余量是 0），
-//   理由是角度模式下坐标只是派生量，limit 不该比真实包络更早挡住摇杆
-//   （详见 constant_and_positions.cpp 里 limit 上方的注释）。
-//   ★ 代价: limit 现在是"软护栏"，基座可摆到 x<0 后方、末端最低到 z≈-20.0，
-//     上机请先在慢速档、空载、抬离台面的情况下单步试。
+//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下；
+//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上。
+//   alpha = 90 - r、beta = c - 90（肩轴反转、肘轴正转，见 RC-robot-hand 标定）。
+//   初始位姿 POS_HOME = (20, 0, -10)，即 (b,r,c,f) ≈ (90, 60.55, 7.43, f 中位)
+//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   关节限位内的实测可达包络（probe_axes 扫组合，余量由探针打印）:
+//     x[0.00, 40.00] y[-40.00, 40.00] z[-40.00, 40.00]
+//   limit 本版取 x/y ±40、z -40~40（与可达包络一致，两杆各 20、关节 0~180°）。
+//   ★ 末端能到哪仍由几何决定（L1 = L2 = 20）：水平半径越大竖向行程越小，
+//     最大竖向行程在 ρ≈0 处（z ∈ [-40, 40]）。
+//   ★ 上机提示: 基座可摆到 x<0 的后方、末端最低到 z≈-40.0，请先在慢速档、
+//     空载、抬离台面的情况下单步试。
 //
 // 调速:
 //   调用 adjustSpeed(level) 切换速度档位:
@@ -151,7 +156,7 @@
 //   stepDelayMs 是每个档位的固定间隔）。
 //   调速即时生效，下一轮 loop 的摇杆转动就会使用新参数。
 //
-#include "servo_drive.h"             /* 4 路舵机（Timer1 硬件 PWM，取代 Servo 库） */
+#include "servo_drive.h"             /* 4 路舵机（封装 Arduino 原生 Servo 库） */
 #include "constant_and_positions.h"  /* Pos（唯一被控量）与末端夹爪角 TOOL_ANGLE_* */
 #include "joystick_control.h"        /* 摇杆读取、板载 LED、全局调速 */
 #include "serial_protocol.h"         /* 串口命令解析（x/y/z 直接写三个关节角，不逆解） */
@@ -159,7 +164,7 @@
 #include "button_control.h"          /* 按键 / 录制 / 播放 / 回中 */
 #include "draw_control.h"            /* 绘图任务（采样点交给 move.h 的 moveToPoint()） */
 
-/* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，替代 Arduino Servo 库）。
+/* 4 个舵机: 通道 0~3 对应各关节（见 servo_drive.h，内部就是 Arduino Servo 库）。
  * 字母记号（与 constant_and_positions.h 的 TOOL_ANGLE_* 一致）:
  *   通道0 = b 水平回转   通道1 = r 上臂俯仰
  *   通道2 = c 下臂俯仰   通道3 = f 末端 */
@@ -182,8 +187,8 @@ void writeServo(void){
     servoDriveWrite(0, Pos.ser.angle1);
 #endif
 
-    servoDriveWrite(1, Pos.ser.angle2);
-    servoDriveWrite(2, Pos.ser.angle3);
+    servoDriveWrite(1, g_mirrorShoulder ? (180.0 - Pos.ser.angle2) : Pos.ser.angle2);
+    servoDriveWrite(2, g_mirrorElbow    ? (180.0 - Pos.ser.angle3) : Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
     // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）
@@ -213,12 +218,13 @@ void setup() {
   drawSetup();
 
   /* 5. 启动舵机驱动并把 4 路 attach 到对应引脚。
-   *    servoDriveBegin() 必须在 attach 之前：它初始化 Timer1 与各通道默认脉宽。
-   *    引脚号请按实际硬件修改 (示例: 9, 7, 8, 6) */
+   *    servoDriveBegin() 必须在 attach 之前（官方 Servo 库其实没有 begin；
+   *    本工程里它是空钩子，保留调用是为了将来换驱动时不用改这里）。
+   *    引脚号请按实际硬件修改 (示例: 9, 8, 7, 6) */
   servoDriveBegin();
   servoDriveAttach(0, 9);   /* 水平回转 */
-  servoDriveAttach(1, 8);   /* 上臂俯仰 */
-  servoDriveAttach(2, 7);   /* 下臂俯仰 */
+  servoDriveAttach(1, 8);   /* 上臂俯仰：实机上臂舵机接 D8 */
+  servoDriveAttach(2, 7);   /* 下臂俯仰：实机下臂舵机接 D7 */
   servoDriveAttach(3, 6);   /* 末端 */
 
   /* 6. 上电后先让机械臂到位，再开始接收手柄输入 */

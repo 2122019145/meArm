@@ -1,5 +1,6 @@
-/* probe_move.cpp —— 关节角步进 / 行程限位 / 整步回退 / 调速档位 回归验证
- * 【去配置化版本】servoLimit / rangeLimit 已从固件删除，b/r/c 硬编码 0~180。
+/* probe_move.cpp —— 关节角步进 / 行程限位 / 整步回退 / 工作空间盒子 / 调速档位 回归验证
+ * 【本版】servoLimit 仍是删除状态（b/r/c 硬编码 0~180）；rangeLimit 已恢复：
+ * x/y ±40、z -40~40（见 constant_and_positions.h 的 struct rangeLimit）。
  * 直接链接固件，不重写任何公式。
  */
 #include <cmath>
@@ -7,6 +8,7 @@
 #include <cstring>
 #include "constant_and_positions.h"
 #include "move.h"
+#include "path_core.h"      /* pathCorePointOk(): 盒内 + 可达 + 反解不被吸附 */
 
 static int failures = 0;
 
@@ -61,12 +63,12 @@ int main(void) {
 
   printf("=== 0) 起点核对 ===\n");
   {
-    double d = dist(&Pos.rec, 20.0, 0.0, 20.0);
+    double d = dist(&Pos.rec, 20.0, 0.0, -10.0);
     snprintf(buf, sizeof(buf), "Pos=(%.2f,%.2f,%.2f) b=%.2f r=%.2f c=%.2f f=%.2f 自洽=%d",
              Pos.rec.x, Pos.rec.y, Pos.rec.z,
              Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3, Pos.ser.angle4,
              selfConsistent() ? 1 : 0);
-    check("home=(20,0,20)、在 limit 内、坐标与角度自洽",
+    check("home=(20,0,-10)、在 limit 内、坐标与角度自洽",
           d < 1e-6 && selfConsistent() &&
           Pos.ser.angle4 >= TOOL_ANGLE_MIN && Pos.ser.angle4 <= TOOL_ANGLE_MAX, buf);
   }
@@ -160,6 +162,43 @@ int main(void) {
     above.x = 0; above.y = 0; above.z = 100;
     check("竖向不再单独设卡：z=100 也判可达", isReachable(&above),
           "z=100 以前被竖向限位拒掉，现在只判水平半径");
+
+    /* 【本版本恢复】工作空间盒子 limit：先验配置值，再验"盒子外一定被拒"。
+     * 盒子由 path_core.h 的 pathCorePointOk()（取放/绘图轨迹）与 move.cpp 的
+     * posOutOfRange()（关节步进整步回退）消费。 */
+    snprintf(buf, sizeof(buf), "x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]",
+             limit.minX, limit.maxX, limit.minY, limit.maxY, limit.minZ, limit.maxZ);
+    check("limit 配置 = x/y ±40、z -40~40",
+          limit.minX == -40.0 && limit.maxX == 40.0 &&
+          limit.minY == -40.0 && limit.maxY == 40.0 &&
+          limit.minZ == -40.0 && limit.maxZ == 40.0, buf);
+
+    /* 配置自检：故意把 z 写反，rangeLimitConfig() 必须交换回来并报告 1 个轴 */
+    {
+      double saveMinZ = limit.minZ, saveMaxZ = limit.maxZ;
+      limit.minZ = saveMaxZ; limit.maxZ = saveMinZ;
+      int fixed = rangeLimitConfig();
+      snprintf(buf, sizeof(buf), "fixed=%d z=[%.1f,%.1f]", fixed, limit.minZ, limit.maxZ);
+      check("rangeLimitConfig() 纠正写反的 z 轴",
+            fixed == 1 && limit.minZ == saveMinZ && limit.maxZ == saveMaxZ, buf);
+
+      limit.minZ = saveMinZ; limit.maxZ = saveMaxZ;
+      check("复原后再自检 -> 0 个轴被改", rangeLimitConfig() == 0, "同一个盒子查两次必须幂等");
+    }
+
+    /* 越界判据：三条轴各测一次。注意 z=41 越界、z=100 不可达，两者都要被拒
+     * （前者由盒子挡、后者由几何挡），而 home 必须通过。 */
+    {
+      double bb = 0, rr = 0, cc = 0;
+      check("z=41（超出 maxZ=40）被点校验拒绝",
+            !pathCorePointOk(20.0, 0.0, 41.0, &bb, &rr, &cc),
+            "越界点在采样阶段就被 limit 挡掉");
+      check("x=41（超出 maxX=40）被点校验拒绝",
+            !pathCorePointOk(41.0, 0.0, 20.0, &bb, &rr, &cc), "x 越界同样拒");
+      check("盒内的 home(20,0,-10) 被接受",
+            pathCorePointOk(20.0, 0.0, -10.0, &bb, &rr, &cc),
+            "在盒子内 + 可达 + 反解不被吸附");
+    }
   }
 
   printf("=== 5) 调速档位 ===\n");

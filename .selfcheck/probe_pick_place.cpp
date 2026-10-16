@@ -147,17 +147,39 @@ int main(void) {
   snprintf(d, sizeof(d), "最紧的一对是 %.2f（要求 >=5）", worstClear);
   check("放置点不会蹭到别的物体（离别人的初始点 >=5）", worstClear >= 5.0, d);
 
-  /* ---------------- 2) 取放点与接近点 ---------------- */
-  printf("\n[2] 取放点与接近点可达性\n");
+  /* ---------------- 2) 取放点与飞行高度 ---------------- */
+  /* 【为什么不能直接测 z+rise】物体越高，末端到肩的距离 sqrt(rho²+z²) ≤ 40 限制得
+   * 越紧：物体摆在 +10cm（z=+25 单位）时，"物体高度 + 5cm" 的飞行高度要求水平半径
+   * 只有 13.9 单位，绝大多数取放点都做不到。固件的 planTravelZ() 会逐档降低飞行
+   * 高度直到整条路径都成立（下限是"最高物体 + 1cm"），所以这里断言的是**实际规划
+   * 出来的**高度落在 [最高+1cm, 最高+5cm] 内，而不是死等 z+5cm。 */
+  printf("\n[2] 取放点与飞行高度可达性\n");
+  const double back = pickPlaceBackDz();
+  const double lift = pickPlaceApproachDz();
+  const double clearDz = lift / 5.0;          /* 5cm 的 1/5 = 1cm：规划高度下限 */
   for (int i = 0; i < PICK_OBJECT_COUNT; i++) {
-    double rise = pickPlaceApproachDz();
+    double z = 0.0;
+    bool planned = pickPlacePlanZ(i, &z);
+    double top = (src[i].z > dst[i].z) ? src[i].z : dst[i].z;
+    /* 物体"后方 2cm"的水平点：与固件同一算法（沿半径方向退回） */
+    double rho = sqrt(src[i].x * src[i].x + src[i].y * src[i].y);
+    double k = (rho > 1e-6) ? back / rho : 0.0;
+    double bx = src[i].x - src[i].x * k;
+    double by = src[i].y - src[i].y * k;
+
     bool ok = pointUsable(src[i].x, src[i].y, src[i].z) &&
               pointUsable(dst[i].x, dst[i].y, dst[i].z) &&
-              pointUsable(src[i].x, src[i].y, src[i].z + rise) &&
-              pointUsable(dst[i].x, dst[i].y, dst[i].z + rise);
-    snprintf(d, sizeof(d), "%c 与抬升 %.1f 的接近点：在 limit 内 + isReachable + 反解未被吸附",
-             'A' + i, rise);
-    check("取放点可用", ok, d);
+              pointUsable(bx, by, src[i].z) &&
+              planned &&
+              z >= top + clearDz - 1e-9 &&
+              z <= top + lift + 1e-9 &&
+              pointUsable(bx, by, z) &&
+              pointUsable(src[i].x, src[i].y, z) &&
+              pointUsable(dst[i].x, dst[i].y, z);
+    snprintf(d, sizeof(d),
+             "%c 取放/后方点可用，飞行高度 %.2f ∈ [最高%+.1f + %.1f, + %.1f]",
+             'A' + i, z, top, clearDz, lift);
+    check("取放点与整条飞行路径可用", ok, d);
   }
 
   /* ---------------- 3) 启动语义 ---------------- */
@@ -201,6 +223,8 @@ int main(void) {
 
     long iter = 0;
     const long cap = 300000;
+    const char *firstStage = "";
+    bool sawReachIn = false, sawTraverse = false, sawGoHome = false;
     while (pickPlaceIsBusy() && iter < cap) {
       pickPlaceLoop();
       g_mockMillis += 20;
@@ -219,6 +243,10 @@ int main(void) {
       }
 
       const char *nm = pickPlaceStageName();
+      if (firstStage[0] == '\0') firstStage = nm;
+      if (strcmp(nm, "reach-in") == 0)     sawReachIn = true;
+      if (strcmp(nm, "traverse") == 0)     sawTraverse = true;
+      if (strcmp(nm, "go-home") == 0)      sawGoHome = true;
       if (strcmp(nm, lastName) != 0) {
         if (traceN < 64) trace[traceN++] = nm;
         lastName = nm;
@@ -234,15 +262,31 @@ int main(void) {
     snprintf(d, sizeof(d), "angle4=%.3f 期望 TOOL_ANGLE_OPEN=%.3f", Pos.ser.angle4, TOOL_ANGLE_OPEN);
     check("末端张开到位（与串口 O 同角度）", fabs(Pos.ser.angle4 - TOOL_ANGLE_OPEN) < 1e-9, d);
 
-    snprintf(d, sizeof(d), "final=(%.4f,%.4f,%.4f) 期望=(%.4f,%.4f,%.4f)",
+    /* 【本条改了】序列现在最后一段是"回到初始化的点"，所以结束时停在 POS_HOME 的
+     * 关节姿态上。POS_HOME 是 constant_and_positions.cpp 里的 file-static，探针取不到，
+     * 只能拿公开的 posGetHomeAngles() 当真值。 */
+    SER home;
+    bool homeOk = posGetHomeAngles(&home);
+    snprintf(d, sizeof(d),
+             "final=(%.4f,%.4f,%.4f) ser=(%.3f,%.3f,%.3f) home=(%.3f,%.3f,%.3f)",
              Pos.rec.x, Pos.rec.y, Pos.rec.z,
-             dst[obj].x, dst[obj].y, dst[obj].z + pickPlaceApproachDz());
-    check("最终停在放置点正上方（撤离高度）",
-          fabs(Pos.rec.x - dst[obj].x) < 1e-6 &&
-          fabs(Pos.rec.y - dst[obj].y) < 1e-6 &&
-          fabs(Pos.rec.z - (dst[obj].z + pickPlaceApproachDz())) < 1e-6, d);
+             Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3,
+             home.angle1, home.angle2, home.angle3);
+    check("最终回到初始化位姿 POS_HOME",
+          homeOk &&
+          fabs(Pos.ser.angle1 - home.angle1) < 1e-9 &&
+          fabs(Pos.ser.angle2 - home.angle2) < 1e-9 &&
+          fabs(Pos.ser.angle3 - home.angle3) < 1e-9, d);
 
     check("结束时坐标与关节角自洽", selfConsistent(), "recFromServo(Pos.ser) == Pos.rec");
+
+    /* 阶段顺序 = 用户口径的路径：第一站必须是"上移"，中途有"向前 2cm"和"水平平移"，
+     * 最后一段是"回初始位姿"。顺序错了这条会立刻红。 */
+    snprintf(d, sizeof(d), "首阶段=%s reach-in=%d traverse=%d go-home=%d",
+             firstStage, (int)sawReachIn, (int)sawTraverse, (int)sawGoHome);
+    check("阶段顺序符合新路径（上移-后方-向前-平移-回初始位姿）",
+          strcmp(firstStage, "rise-src") == 0 &&
+          sawReachIn && sawTraverse && sawGoHome, d);
   }
 
   snprintf(d, sizeof(d), "violations=%d%s%s", violations,

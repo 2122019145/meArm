@@ -13,19 +13,22 @@
 // 坐标轴约定（全工程统一）:
 //   x: 左右 (右为正)   y: 前后 (前为正)   z: 上下 (上为正)
 //
-// 【本版本删去的范围限制】
-//   - 笛卡尔坐标范围：struct rangeLimit / limit、rangeClampConfig()、
-//     clampToRange() 全部移除。末端 x/y/z 只是角度正解出来的派生量。
+// 【范围限制现状】
+//   - 笛卡尔坐标范围（"工作空间盒子"）：struct rangeLimit / limit 已恢复
+//     （定义在 constant_and_positions.cpp）：x/y/z 都是 ±40。
+//     越界点由 path_core.h 的点校验与 move.cpp 的关节步进拒绝，详见 meArm.ino
+//     的"安全边界"一节。注意盒子比真实可达包络（x[0,40]、y[-40,40]、z[-40,40]）
+//     更宽（x<0 半边够不到），拦不住任何可达姿态 —— 它是一份声明式的配置，
+//     不是当前的有效边界；真正的可达性由反解残差与路径校验把关。
 //   - 可配置的关节硬限位：struct servoLimitCfg / servoLimit、servoSelfCheck()、
-//     isServoInRange()、clampServoAngles() 全部移除。
-//   - 【本版本新增删除】夹爪 f 的 60~150 硬限位：getAngleEx() 里的越限吸附、
-//     posSetAngle4() 的夹取、button_control 录制/回放里的夹取全部删掉，
-//     f 现在只受舵机电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，
-//     于是"夹紧"（压到 60 以下）才可能做到。
-//   - 【本版本新增删除】纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
-//   - 【本版本新增删除】isReachable() 的竖向边界 |z - armheight| <= L1+L2：
+//     isServoInRange()、clampServoAngles() 仍然是删除状态；b/r/c 三轴的物理
+//     行程 0~180 硬编码在 moveJointStep() 内。
+//   - 夹爪 f 的 60~150 硬限位：已删除（见下面的 TOOL_ANGLE_*）。f 只受舵机
+//     电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，于是"夹紧"
+//     （压到 60 以下）才可能做到。
+//   - 纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)：已删除。
+//   - isReachable() 的竖向边界 |z - armheight| <= L1+L2：已删除，
 //     可达性只看水平半径，竖向交给反解残差与路径校验把关。
-//   - b/r/c 三轴的物理行程 0~180 在 moveJointStep() 内硬编码。
 //
 #ifndef WEARM_CONSTANT_AND_POSITIONS_H
 #define WEARM_CONSTANT_AND_POSITIONS_H
@@ -33,12 +36,17 @@
 #include <math.h>
 #include <stdbool.h>
 
-#define RADtoDEG (180 / 3.1415926535)
+/* 【v1.6.6 修正】原来写的是 180/3.1415926535（π 只截了 10 位），相对误差
+ * ~3.5e-11，换算到 90° 是 ~3.2e-9 度的偏差。当时行程容差是 1e-9，偏差比容差还大
+ * —— r/c 恰好落在 180/0 的端点解会被 0~180 的行程判据误杀（probe_rt 里
+ * (0,0,-40) => r=180,c=0 这一条就是这么被拒的）。π 改成完整精度（常量、编译期
+ * 折叠，不占 flash）；行程容差也统一成下面的 ANGLE_EPS(1e-6)，两头都不再留隐患。 */
+#define RADtoDEG (180.0 / 3.14159265358979323846)
 /* 避免与 Arduino 核心的 PI 宏冲突 */
 #ifndef PI
 #define PI 3.1415926535
 #endif
-/* 关节角容差（度）：小于它的微小负角按 0 处理 */
+/* 关节角容差（度）：反解的回代残差判据与 r/c 行程边界判据共用这一个口径 */
 #define ANGLE_EPS 1e-6
 
 /* 机械臂几何参数：上臂长、下臂长、臂高（单位与坐标一致） */
@@ -77,18 +85,62 @@ typedef struct position {
 extern pos Pos;
 extern struct arm arm1;
 
+/* ---------- 末端笛卡尔坐标范围（"工作空间盒子"）----------
+ * 末端坐标 x/y/z 的上下限，每个轴都必须 min <= max（写反由 rangeLimitConfig()
+ * 在开机时自动交换回来）。数值在 constant_and_positions.cpp 里，
+ * 【本版】x/y/z 都是 ±40（修正小臂模型 beta=c-90 后包络变成 x[0,40] 半空间）。
+ *
+ * 越界怎么处理（两条"整步/整条回退"路径）:
+ *   - 取放与绘图：轨迹采样点越界 -> 整条轨迹校验不过，取放启动被拒（BUSY）、
+ *     绘图启动/绘制中被拒（见 path_core.h 的 pathCorePointOk()）；
+ *   - 摇杆 / 按键 / 示教的关节步进：走完一步后正解出的末端越界 -> 这一步整步
+ *     回退（返回 MOVE_AT_LIMIT，摇杆表现为"推到头了"，见 move.cpp）。
+ *
+ * 【为什么盒子拦不住任何可达姿态】关节 0~180 真正能走到的末端包围盒是
+ * x[0,40] y[-40,40] z[-40,40]（probe_axes 扫 5929741 个组合实测，x<0 半边
+ * 因为基座只能朝前半空间扫而够不到），盒子比它宽，所以没有任何可达姿态落在
+ * 盒子外 —— 这份配置改的是"允许声明的工作空间"，不是可达性；想让末端真的到
+ * x<0 或更大范围必须加长两臂（arm1）。 */
+struct rangeLimit {
+  double minX, maxX;
+  double minY, maxY;
+  double minZ, maxZ;
+};
+extern struct rangeLimit limit;
+
+/* 校验并修正 limit 配置：把每个轴写反的 (min,max) 交换回来，返回被修正的轴数。
+ * 在 posInit() 里开机调用一次（配置自检，与调速/行程的自检同一风格）：
+ * 盒子写反会让每个点都被判越界，必须当场纠正。 */
+int rangeLimitConfig(void);
+
 /* ---------- 末端夹爪（f）关节角：逻辑角，单位度 ----------
  * 【本版本已删除 60~150 的"夹爪范围限制"】现在只剩舵机自身的电气行程
  * 0~180（与 b/r/c 同一套边界），夹爪可以一直往里压到 0 也不会被软件拦下。
- * TOOL_ANGLE_TIGHT 是"夹紧"角：比名义合拢角再往里压几度，靠舵机的保持力矩
- * 把物体/笔夹住——取放序列与绘图循环每一帧都会重申这个角（见 pick_place.cpp
- * 的 pickHoldingStage() 与 draw_control.cpp 的 drawLoop()）。
- * 注意：压得越深堵转电流越大，舵机最好单独供电；夹不住再一点点调小。 */
+ *
+ * 三个角的分工（能不能夹住东西，全靠最后这一个差值）：
+ *   TOOL_ANGLE_OPEN   150   完全张开
+ *   TOOL_ANGLE_CLOSE   60   名义合拢角（= 串口 'S'）：夹爪“刚碰到物体”时大致的位置
+ *   TOOL_ANGLE_TIGHT   45   夹紧角：在名义合拢角的基础上**再往里压 15 度**
+ *
+ * 舵机是位置伺服：它只会一直朝目标角使劲，直到堵转。所以"夹得紧不紧"在固件里
+ * 只有一个可调量 —— 目标角比接触点再往里压多少度：
+ *   · 压得太少（v1.6.5 的 55 只有 5 度）：稍小一点的物体，夹爪还没碰到它，
+ *     舵机就已经"到位"了；此时看着是合上了，其实两爪之间是空的，一抬臂就掉。
+ *     这就是取物容易松开的直接原因。
+ *   · 压得够多（本版 15 度）：不管物体大小，夹爪都必然压到物体上并继续用力。
+ *     夹持力 = 舵机的堵转力矩，与压进去几度无关（多压只是多走一段行程，
+ *     保证"一定碰上"）。
+ *   · 压得太多（逼近 0）：两爪先自己顶死，物体反而可能被斜面挤出去，
+ *     而且堵转电流最大、发热最快。
+ * 调法：夹不住就按 5 度一档往下调本值；舵机发烫 / 供电掉压就往回调大。
+ * 取放序列也是按这个思路走的：先快速合到 TOOL_ANGLE_CLOSE，再用很慢的速度
+ * 蠕动到本角（见 pick_place.cpp 的 SQUEEZE_TOOL），免得一上来就用力把物体顶飞。
+ * 取放与绘图每一帧都会重申这个角（pickHoldingStage() / drawLoop()）。 */
 #define TOOL_ANGLE_MIN   0.0     /* f 逻辑角下限（舵机电气行程） */
 #define TOOL_ANGLE_MAX   180.0   /* f 逻辑角上限 */
 #define TOOL_ANGLE_OPEN  150.0   /* 张开到位，与串口 'O' 一致 */
 #define TOOL_ANGLE_CLOSE 60.0    /* 名义合拢，与串口 'S' 一致 */
-#define TOOL_ANGLE_TIGHT 55.0    /* 夹紧：再往里压 5 度 */
+#define TOOL_ANGLE_TIGHT 45.0    /* 夹紧：在名义合拢角 60 的基础上再往里压 15 度 */
 /* 夹爪的装配镜像：physical = TOOL_MIRROR_SUM - logical（与基座的 180- 同理）。
  * 210 是这台机器上舵机摆臂的装配角，与"行程"无关，换装配才需要改。 */
 #define TOOL_MIRROR_SUM  210.0

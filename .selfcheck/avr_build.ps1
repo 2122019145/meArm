@@ -1,4 +1,4 @@
-﻿#
+#
 # avr_build.ps1 -- build the meArm sketch exactly the way the Arduino IDE does,
 # with the locally installed AVR toolchain, and report flash/SRAM usage.
 #
@@ -6,9 +6,10 @@
 #   avr-gcc 7.3.0 : %LOCALAPPDATA%\Arduino15\packages\arduino\tools\avr-gcc\7.3.0-atmel3.6.1-arduino7\bin
 #   AVR core 1.8.8: %LOCALAPPDATA%\Arduino15\packages\arduino\hardware\avr\1.8.8
 #
-# v1.3.0: the sketch no longer uses the Arduino Servo library (it has its own
-# 4-channel Timer1 driver in servo_drive.cpp), so the Servo library is neither
-# compiled nor linked here.
+# v1.6.6: the sketch's servo layer (servo_drive.cpp) is a thin wrapper over the
+# official Arduino Servo library, so that library IS compiled and linked here.
+# (v1.3.0~v1.6.5 used a self-written Timer1 driver and deliberately skipped it --
+#  that is why the -I/-l for Servo disappeared back then.)
 #
 # Flags are copied from the core's platform.txt (LTO is enabled by that core!).
 #
@@ -19,6 +20,7 @@ param(
   [switch]$Full,       # also rebuild the core archive
   [switch]$Symbols,    # print the biggest symbols after linking
   [switch]$NoLto,      # disable LTO (per-object sizes become meaningful)
+  [switch]$Relax,      # enable AVR jump/call relaxation (-mrelax) to shrink flash
   [string[]]$ExtraDefs = @()   # extra -D... switches (used for size ablations)
 )
 
@@ -28,8 +30,11 @@ $ard      = Join-Path $env:LOCALAPPDATA 'Arduino15\packages\arduino'
 $gccbin   = Join-Path $ard 'tools\avr-gcc\7.3.0-atmel3.6.1-arduino7\bin'
 $coreDir  = Join-Path $ard 'hardware\avr\1.8.8\cores\arduino'
 $varDir   = Join-Path $ard 'hardware\avr\1.8.8\variants\standard'
-# 【v1.3.0】不再需要 Arduino Servo 库：固件改用自研 servo_drive.cpp（4 路 Timer1）。
-#   去掉 -I 指向 Servo 与 servo.a 的编译，既省构建时间，也让尺寸对比与真机一致。
+# 【v1.6.6】舵机层（servo_drive.cpp）封装官方 Servo 库，所以这里必须把
+#   Servo 库的 src/avr/Servo.cpp 编译并链接进来（v1.3.0~v1.6.5 用的是自研
+#   Timer1 驱动，当时刻意跳过了这个库；忘了把它加回来的话，构建立刻就是
+#   "fatal error: Servo.h: No such file or directory"）。
+$servoDir = Join-Path $env:LOCALAPPDATA 'Arduino15\libraries\Servo\src'
 
 $cc   = Join-Path $gccbin 'avr-gcc.exe'
 $cxx  = Join-Path $gccbin 'avr-g++.exe'
@@ -37,7 +42,7 @@ $ar   = Join-Path $gccbin 'avr-gcc-ar.exe'
 $size = Join-Path $gccbin 'avr-size.exe'
 $nm   = Join-Path $gccbin 'avr-nm.exe'
 
-foreach ($p in @($cc,$cxx,$ar,$size,$nm,$coreDir,$varDir)) {
+foreach ($p in @($cc,$cxx,$ar,$size,$nm,$coreDir,$varDir,$servoDir)) {
   if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
 }
 
@@ -50,8 +55,15 @@ $cF    = @('-c','-g','-Os','-std=gnu11','-ffunction-sections','-fdata-sections',
 $cppF  = @('-c','-g','-Os','-std=gnu++11','-fpermissive','-fno-exceptions',
            '-ffunction-sections','-fdata-sections','-fno-threadsafe-statics',
            '-Wno-error=narrowing','-MMD','-flto')
-$inc   = @(('-I' + $coreDir), ('-I' + $varDir))
+$inc   = @(('-I' + $coreDir), ('-I' + $varDir), ('-I' + $servoDir), ('-I' + (Join-Path $servoDir 'avr')))
 $defs   = $defs + $ExtraDefs
+if ($Relax) {
+  # -mrelax 让链接器把 CALL/JMP 放松成 RCALL/RJMP（调用点足够近时）。
+  # 不改变任何行为，纯粹是编码更短；32 KB 的程序里通常能省几百字节。
+  $cF  = $cF  + '-mrelax'
+  $cppF = $cppF + '-mrelax'
+  $defs = $defs + '-mrelax'
+}
 if ($NoLto) {
   $cF   = @($cF   | Where-Object { $_ -ne '-flto' -and $_ -ne '-fno-fat-lto-objects' })
   $cppF = @($cppF | Where-Object { $_ -ne '-flto' })
@@ -61,10 +73,12 @@ $coreObjDir = Join-Path $BuildRoot 'core'
 $sketchBld  = Join-Path $BuildRoot 'sketch'
 $sketchObj  = Join-Path $BuildRoot 'obj'
 $coreA      = Join-Path $BuildRoot 'core.a'
+$servoObjDir = Join-Path $BuildRoot 'servo'
+$servoA     = Join-Path $BuildRoot 'servo.a'
 $elf        = Join-Path $BuildRoot 'weArm.elf'
 
 if ($Full) { Remove-Item -LiteralPath $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue }
-foreach ($d in @($BuildRoot,$coreObjDir,$sketchBld,$sketchObj)) {
+foreach ($d in @($BuildRoot,$coreObjDir,$sketchBld,$sketchObj,$servoObjDir)) {
   if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
@@ -108,6 +122,26 @@ if ($Full -or -not (Test-Path -LiteralPath $coreA)) {
   Write-Host ('   core.a: {0} objects' -f $coreObjs.Count)
 }
 
+# ---- 1b) Servo library archive (cached unless -Full) ----
+# 只编译 AVR 架构那一个源文件（src/avr/Servo.cpp）——和 Arduino IDE 对
+# 「库的 src/ + src/<arch>/ 都要编」的规则一致；Servo.h 里按 ARDUINO_ARCH_AVR
+# 条件包含 avr/ServoTimers.h，所以 src 与 src/avr 都要在 -I 里。
+if ($Full -or -not (Test-Path -LiteralPath $servoA)) {
+  Write-Host '== compiling Servo library =='
+  $servoSrc = @(Get-ChildItem -LiteralPath (Join-Path $servoDir 'avr') -File -Filter *.cpp -ErrorAction SilentlyContinue)
+  if ($servoSrc.Count -eq 0) { throw "no Servo sources under $servoDir\avr" }
+  $servoObjs = @()
+  foreach ($s in $servoSrc) {
+    $obj = Join-Path $servoObjDir ($s.Name + '.o')
+    $a = $cppF + $defs + $inc + @($s.FullName, '-o', $obj)
+    Invoke-Tool -Exe $cxx -Arguments $a -What ("compile servo " + $s.Name) | Out-Null
+    $servoObjs += $obj
+  }
+  Remove-Item -LiteralPath $servoA -Force -ErrorAction SilentlyContinue
+  Invoke-Tool -Exe $ar -Arguments (@('rcs', $servoA) + $servoObjs) -What 'archive servo.a' | Out-Null
+  Write-Host ('   servo.a: {0} object(s)' -f $servoObjs.Count)
+}
+
 # ---- 2) sketch sources ----
 Write-Host '== compiling sketch =='
 Remove-Item -Path (Join-Path $sketchBld '*') -Recurse -Force -ErrorAction SilentlyContinue
@@ -133,7 +167,8 @@ foreach ($s in (Get-ChildItem -LiteralPath $sketchBld -File -Filter *.cpp)) {
 
 # ---- 3) link ----
 $link = @('-Os','-g','-flto','-fuse-linker-plugin','-Wl,--gc-sections',('-mmcu=' + $mcu),
-          "-Wl,-Map=$BuildRoot\weArm.map",'-o', $elf) + $sketchObjs + @($coreA, ('-L' + $BuildRoot), '-lm')
+          "-Wl,-Map=$BuildRoot\weArm.map",'-o', $elf) + $sketchObjs + @($servoA, $coreA, ('-L' + $BuildRoot), '-lm')
+if ($Relax) { $link = $link + @('-mrelax', '-Wl,--relax') }
 if ($NoLto) { $link = @($link | Where-Object { $_ -ne '-flto' -and $_ -ne '-fuse-linker-plugin' }) }
 Invoke-Tool -Exe $cxx -Arguments $link -What 'link' | Out-Null
 

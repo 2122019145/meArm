@@ -4,6 +4,7 @@
 //       默认静默，设 WEARM_MOCK_SERIAL=1 可打印固件日志。
 //
 #include "Arduino.h"
+#include "Servo.h"   /* mock 舵机状态 g_mockServo / mockServoReset() 定义在文件末尾 */
 
 MockSerial Serial;
 
@@ -22,8 +23,8 @@ int g_mockPinMode[20] = { INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT, INPUT
 
 /* digitalWrite() 的仿真记录（v1.3.0 起）：除了每个引脚的当前电平，
  * 还按调用顺序记录最近 MOCK_WRITE_LOG_MAX 次"写引脚"事件。
- * probe_servo_drive 靠这个日志验证 servo_drive.cpp 的脉冲顺序/极性；
- * 其它探针仍然只读 g_mockPinMode，不受影响。 */
+ * 【v1.6.6】舵机改用官方 Servo 库后，波形不再由固件产生，舵机那两个探针
+ * 改读 mock/Servo.h 的记录；这里保留为通用的"引脚写事件"日志。 */
 int g_mockPinLevel[20] = { LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW,
                            LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW };
 int g_mockWriteLogPin[MOCK_WRITE_LOG_MAX];
@@ -105,4 +106,23 @@ int MockSerial::available() { return inLen - inPos; }
 int MockSerial::read() {
   if (inPos >= inLen) return -1;
   return (unsigned char) inBuf[inPos++];
+}
+
+/* ---------- mock Servo（官方 Servo 库替身，声明见 mock/Servo.h） ----------
+ * v1.6.6 起 servo_drive.cpp 封装官方 Servo 库，PC 端需要有这个头才能编译。 */
+MockServoState g_mockServo;
+
+void mockServoReset(void) {
+  g_mockServo.attachCount = 0;
+  for (int i = 0; i < MOCK_SERVO_LOG_MAX; i++) {
+    g_mockServo.attachPin[i]  = -1;
+    g_mockServo.attachSlot[i] = -1;
+  }
+  for (int i = 0; i < MOCK_SERVO_SLOT_MAX; i++) {
+    g_mockServo.slotPin[i]    = -1;
+    g_mockServo.slotAngle[i]  = -1;
+    g_mockServo.slotWrites[i] = 0;
+  }
+  /* nextSlot 故意不复位：Servo 对象只构造一次，槽位在首次 attach 时固定下来，
+   * 复位成 0 会让新对象和已存在的对象撞到同一个槽位。 */
 }

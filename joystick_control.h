@@ -51,15 +51,20 @@
 //
 // 【坐标模型（用于显示与工作空间校验）】
 //   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机中立位 90° 的含义:
+//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
 //     b (angle1) 90° -> 基座朝 +x 方向；b 行程 0~180° 使可达空间只占 x >= 0 一侧
-//     r (angle2) 90° -> 上臂竖直向上
-//     c (angle3) 90° -> 下臂水平朝前（与上臂成 90°）
-//   初始位姿 (b,r,c,f) = (90,90,90,0) == 末端 (20, 0, 20)。
-//   正运动学: alpha = r, beta = r - c,
+//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下
+//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上
+//   初始位姿 POS_HOME = (20, 0, -10) -> (b,r,c,f) ≈ (90, 60.55, 7.43, 105)
+//   （上臂上抬 29°、小臂下垂 83° 的折叠回缩姿态，位于可达包络内部）。
+//   正运动学: alpha = 90 - r, beta = c - 90,
 //             x_planar = L1 cos alpha + L2 cos beta,
 //             z = L1 sin alpha + L2 sin beta + armheight,
 //             theta = 90 - b  ->  x = x_planar cos theta, y = x_planar sin theta。
+//   【修正】肩轴反转（alpha = 90 - r）、肘轴正转（beta = c - 90），依据
+//   RC-robot-hand 参考工程实测位姿：R↑=末端降、F↑=末端升。旧 beta = c - 180 把
+//   下臂多算 90°，导致取放时"该下反上"。详见 .selfcheck/README.md 的
+//   "运动学标定"一节。
 //
 // 【调速参数】存在全局 speedCfg (speed) 中，所有移动源共用：
 //     speed.stepSize    满偏（推到底）时每格的关节角（度）；实际每格 = stepSize × 偏转比例

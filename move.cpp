@@ -6,14 +6,19 @@
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
 //   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
+//   -> 坐标一越出 limit（"工作空间盒子"）=> 也算 MOVE_AT_LIMIT
+//      （角度模式下坐标是派生量，所以这不是"不可达"，而是"这个方向到头了"，
+//        摇杆表现为推到头了）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
 //
 // 所有失败路径都一个字节都不写 Pos —— 这正是原来"备份 + 整步回退"的等价效果，
 // 但省掉了备份变量和两处回退代码。
 //
-// 【本版本已删去】笛卡尔坐标范围检查（posOutOfRange）、可配置的关节限位
-// （clampServoAngles）。b/r/c 三轴的 0~180 物理行程改为在 moveJointStep()
-// 内部直接硬编码；angle4（f）由 posSetAngle4() 单独处理，不走本路径。
+// 【本版本恢复】笛卡尔坐标范围检查（posOutOfRange，只读 limit 盒子）。它只管
+// 关节步进这一条路；取放/绘图的坐标采样点由 path_core.h 的 pathCorePointOk()
+// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的 0~180
+// 物理行程在 moveJointStep() 内部直接硬编码；angle4（f）由 posSetAngle4()
+// 单独处理，不走本路径。
 //
 #include "move.h"
 #include "constant_and_positions.h"
@@ -60,7 +65,8 @@ static bool samePose(const SER *a, const SER *b) {
 /* b/r/c 三轴硬编码 0~180 的物理行程夹取。
  * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
  * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
- * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 60~150。 */
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 0~180 的
+ * 舵机电气行程。 */
 static void clampBCR(SER *s) {
   if (s->angle1 < 0.0)   s->angle1 = 0.0;
   if (s->angle1 > 180.0) s->angle1 = 180.0;
@@ -68,6 +74,26 @@ static void clampBCR(SER *s) {
   if (s->angle2 > 180.0) s->angle2 = 180.0;
   if (s->angle3 < 0.0)   s->angle3 = 0.0;
   if (s->angle3 > 180.0) s->angle3 = 180.0;
+}
+
+/* 坐标是否越出 limit（"工作空间盒子"，只读判断，不改动 Pos）。
+ * 三轴紧凑循环：limit 的内存布局是 {minX,maxX, minY,maxY, minZ,maxZ}，
+ * REC 是 {x,y,z}，两者都是连续的 double，所以每轴走 2 个 / 1 个 double 即可。
+ *
+ * 【实测记录，别再试】曾经想复用"原地夹取 Pos.rec 并返回是否夹到过"的
+ * clampToRange() 当越界判据：move.cpp 自身能从约 300 B 降到 206 B，
+ * 但 LTO 的连锁反应让 draw_control.cpp 从 13966 B 涨到 14178 B，
+ * 全程序净增 82 B，故回退成这个独立判据。
+ * （clampToRange() 本身随 servoLimit 一起删除了，本版也没有恢复它。） */
+static bool posOutOfRange(const REC *r) {
+  const double *c = &r->x;
+  const double *l = &limit.minX;
+  for (unsigned char i = 0; i < 3; i++) {
+    if (*c < l[0] || *c > l[1]) return true;
+    c++;
+    l += 2;
+  }
+  return false;
 }
 
 /* ---------- 单步关节移动 ---------- */
@@ -103,9 +129,16 @@ int moveJointStep(int dir, double stepSize) {
     return MOVE_UNREACHABLE;
   }
 
-  /* 4) 全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。
-   *    【本版本已删除】笛卡尔坐标范围检查（posOutOfRange）；坐标范围限制
-   *    按需求一并移除，末端坐标只是由角度正解出来的派生量，不再作为软护栏。 */
+  /* 4) 位置边界：这个角度把末端带出了 limit（工作空间盒子）就整步回退。
+   *    角度模式下坐标是派生量，所以这不算"不可达"，而是"这个方向到头了"
+   *    （摇杆收到 MOVE_AT_LIMIT 会照常记录/忽略，不会去重试）。
+   *    【本版】盒子比真实包络宽，这一步现在拦不住任何姿态，但它是配置的
+   *    唯一判据，盒子收窄（例如以后加长两臂后重定边界）就立刻生效。
+   *    全部通过，一次性提交：Pos.ser 与 Pos.rec 严格对应。 */
+  if (posOutOfRange(&nextRec)) {
+    return MOVE_AT_LIMIT;
+  }
+
   Pos.ser = next;
   Pos.rec = nextRec;
   return MOVE_OK;

@@ -64,8 +64,12 @@
 /* ==================== 可自定义的参数 ==================== */
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
-#define DRAW_PEN_Z_DEFAULT    -12.0   /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z */
-#define DRAW_CENTER_X_DEFAULT 20.0   /* 内置图形的中心 x */
+/* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z。
+ * 待机位末端是 (20,0,-10)（折叠回缩姿态），纸面在肩轴**下方**
+ * （z < 0）才可能被笔尖碰到。默认取 -20（肩轴下方 20 单位 ≈ 80 mm 的台面）。
+ * 上机可用 p<z> 随时重标（注意新模型下 x 越小、可达的竖向深度越浅，纸面别离肩轴太近）。 */
+#define DRAW_PEN_Z_DEFAULT    -20.0
+#define DRAW_CENTER_X_DEFAULT 27.0   /* 内置图形的中心 x */
 #define DRAW_CENTER_Y_DEFAULT  0.0   /* 内置图形的中心 y */
 #define DRAW_HALF_DEFAULT      6.0   /* 内置图形的半宽（顶点落在 ±半宽 的正方形里） */
 /* 【本版本删除】原来这里还有纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
@@ -136,24 +140,29 @@ struct drawVertex {
 
 /* The tables live in flash (PROGMEM): they are read-only lookups, so keeping a
  * RAM copy would waste data space for nothing. Read them with pgm_read_float. */
+/* 【轴向约定】u -> 工作区 x（纸面"上下"，+x 远离操作者/纸面上方），
+ *              v -> 工作区 y（纸面"左右"，+y 向右，见 README 手柄映射）。
+ * 表里的字面量一律按"屏幕上看到的图形"写：第一个数是 x（上下），
+ * 第二个数是 y（左右）。纸是水平铺在桌面上的，所以"上下"其实是
+ * 远离/靠近底座的方向 —— 曾经写反过，导致全部图形在纸上转了 90°。 */
 static const struct drawVertex SHAPE_LINE[2] PROGMEM = {
-  { -1.0,  0.0 }, {  1.0,  0.0 }
+  {  0.0, -1.0 }, {  0.0,  1.0 }
 };
 /* 字母 N：左下 -> 左上 -> 右下 -> 右上（两个竖 + 一道斜） */
 static const struct drawVertex SHAPE_N[4] PROGMEM = {
-  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0, -1.0 }, {  1.0,  1.0 }
+  { -1.0, -1.0 }, {  1.0, -1.0 }, { -1.0,  1.0 }, {  1.0,  1.0 }
 };
 /* 三角形：左下 -> 右下 -> 顶点 -> 回到左下（最后一点与第一点重合，闭合） */
 static const struct drawVertex SHAPE_TRIANGLE[4] PROGMEM = {
-  { -1.0, -1.0 }, {  1.0, -1.0 }, {  0.0,  1.0 }, { -1.0, -1.0 }
+  { -1.0, -1.0 }, { -1.0,  1.0 }, {  1.0,  0.0 }, { -1.0, -1.0 }
 };
 /* 字母 Z：左上 -> 右上 -> 左下 -> 右下（上横 + 斜 + 下横） */
 static const struct drawVertex SHAPE_Z[4] PROGMEM = {
-  { -1.0,  1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, {  1.0, -1.0 }
+  {  1.0, -1.0 }, {  1.0,  1.0 }, { -1.0, -1.0 }, { -1.0,  1.0 }
 };
 /* 字母 V：左上 -> 底尖 -> 右上 */
 static const struct drawVertex SHAPE_V[3] PROGMEM = {
-  { -1.0,  1.0 }, {  0.0, -1.0 }, {  1.0,  1.0 }
+  {  1.0, -1.0 }, { -1.0,  0.0 }, {  1.0,  1.0 }
 };
 
 /* 任务名（下标即 DRAW_TASK_*）。
@@ -460,52 +469,91 @@ static bool validatePath(void)
   /* 1) 待机位（POS_HOME 的位置）-> 起点正上方 */
   SER home;
   home = Pos.ser;
-  if (!posGetHomeAngles(&home)) return false;
+  if (!posGetHomeAngles(&home)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: posGetHomeAngles failed"));
+#endif
+    return false;
+  }
   REC hrec;
-  if (!recFromServo(&hrec, &home)) return false;
+  if (!recFromServo(&hrec, &home)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: recFromServo(home) failed"));
+#endif
+    return false;
+  }
 
   double lz = liftZFor(s_pts[0]);
   double hp[3];                       /* 待机位 */
   hp[0] = hrec.x; hp[1] = hrec.y; hp[2] = hrec.z;
   double ap[3];                       /* 起点正上方 */
   ap[0] = s_pts[0][0]; ap[1] = s_pts[0][1]; ap[2] = lz;
+#ifdef WEARM_DRAW_TRACE
+  Serial.print(F("[draw] vp1 hp=")); Serial.print(hp[0], 3);
+  Serial.print(F(",")); Serial.print(hp[1], 3); Serial.print(F(",")); Serial.print(hp[2], 3);
+  Serial.print(F(" ap=")); Serial.print(ap[0], 3);
+  Serial.print(F(",")); Serial.print(ap[1], 3); Serial.print(F(",")); Serial.print(ap[2], 3);
+  Serial.print(F(" pts=")); Serial.println(s_ptCount);
+#endif
   if (!pathCoreSegmentOk(hp, ap, DRAW_PATH_SAMPLE_STEP,
-                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) return false;
+                         DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.println(F("[draw] vp1: home->lift segment rejected"));
+#endif
+    return false;
+  }
 
   /* 2) 垂直落笔 */
   if (!pathCoreSegmentOk(ap, s_pts[0], DRAW_PATH_SAMPLE_STEP,
                          DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.print(F("[draw] vp2: drop segment rejected, pt0="));
+    Serial.print(s_pts[0][0], 3); Serial.print(F(","));
+    Serial.print(s_pts[0][1], 3); Serial.print(F(","));
+    Serial.println(s_pts[0][2], 3);
+#endif
     return false;
   }
 
   /* 3) 轨迹本体 */
   if (s_curved) {
-    /* 曲线：按参数密集采样，逐对检查可达性与反解分支 */
-    const int SAMPLE_PER_SPAN = 24;
-    double prevB = 0.0, prevR = 0.0, prevC = 0.0;
-    bool first = true;
+    /* 曲线：把每段曲线再切成 SUB_PER_SPAN 小段，交给共用的 pathCoreSegmentOk()
+     * 逐点校验（盒内 + isReachable + 反解成功 + 相邻采样不跳分支）。
+     * 【冗余清理】这里原先自己又写了一遍采样循环（每段 24 个点各做一次 pointOk
+     *   和一次三分支跳变比较），和 path_core.h 里的段校验完全重复，只是采样密度
+     *   不同；直接复用共用实现，曲线校验的采样点反而更多（每 0.5mm 一个点），
+     *   代码少一大截。 */
+    const int SUB_PER_SPAN = 6;
+    double prev[3];
+    curvePoint(0, 0.0, prev);
     for (int span = 0; span < s_ptCount - 1; span++) {
-      for (int k = 0; k <= SAMPLE_PER_SPAN; k++) {
-        double u = (double)k / (double)SAMPLE_PER_SPAN;
-        double p[3];
-        curvePoint(span, u, p);
-        double b = 0.0, r = 0.0, c = 0.0;
-        if (!pointOk(p[0], p[1], p[2], &b, &r, &c)) return false;
-        if (!first) {
-          if (fabs(b - prevB) > DRAW_BRANCH_JUMP_DEG ||
-              fabs(r - prevR) > DRAW_BRANCH_JUMP_DEG ||
-              fabs(c - prevC) > DRAW_BRANCH_JUMP_DEG) {
-            return false;
-          }
+      for (int k = 1; k <= SUB_PER_SPAN; k++) {
+        double cur[3];
+        curvePoint(span, (double)k / (double)SUB_PER_SPAN, cur);
+        if (!pathCoreSegmentOk(prev, cur, DRAW_PATH_SAMPLE_STEP,
+                               DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+          Serial.print(F("[draw] vp3: curve sub-segment rejected span="));
+          Serial.print(span); Serial.print(F(" k=")); Serial.println(k);
+#endif
+          return false;
         }
-        prevB = b; prevR = r; prevC = c;
-        first = false;
+        prev[0] = cur[0]; prev[1] = cur[1]; prev[2] = cur[2];
       }
     }
   } else {
     for (int i = 0; i < s_ptCount - 1; i++) {
       if (!pathCoreSegmentOk(s_pts[i], s_pts[i + 1], DRAW_PATH_SAMPLE_STEP,
                              DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+        Serial.print(F("[draw] vp3: polyline seg rejected i=")); Serial.print(i);
+        Serial.print(F(" from=")); Serial.print(s_pts[i][0], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i][1], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i][2], 3);
+        Serial.print(F(" to=")); Serial.print(s_pts[i + 1][0], 3);
+        Serial.print(F(",")); Serial.print(s_pts[i + 1][1], 3);
+        Serial.print(F(",")); Serial.println(s_pts[i + 1][2], 3);
+#endif
         return false;
       }
     }
@@ -518,6 +566,12 @@ static bool validatePath(void)
   ep[0] = last[0]; ep[1] = last[1]; ep[2] = ez;
   if (!pathCoreSegmentOk(last, ep, DRAW_PATH_SAMPLE_STEP,
                          DRAW_PATH_SAMPLE_MAX, DRAW_BRANCH_JUMP_DEG)) {
+#ifdef WEARM_DRAW_TRACE
+    Serial.print(F("[draw] vp4: end-lift rejected last="));
+    Serial.print(last[0], 3); Serial.print(F(","));
+    Serial.print(last[1], 3); Serial.print(F(","));
+    Serial.print(last[2], 3); Serial.print(F(" ez=")); Serial.println(ez, 3);
+#endif
     return false;
   }
   return true;
@@ -647,7 +701,12 @@ static void beginSequence(void)
   s_span    = 0;
   s_u       = 0.0;
   s_hitCount = 0;
-  s_hitTotal = s_isTeach ? s_ptCount : 0;
+  /* 分母就用顶点数：内置图形走 buildShapePath() 也会把 s_ptCount 设成顶点数
+   * （2/3/4），而下面 pathTick() 的"过点统计"对内置图形一样在量（s_ptArc 是同一个
+   * 规划器填的），所以这里再按 s_isTeach 三元一次会让内置图形报出"命中 4 / 共 0"
+   * 这种自相矛盾的一对数。两份数据同源，分母直接取 s_ptCount。
+   * 绘制完成的打印本来就只在示教任务里给出这对数，所以这次改动不动任何输出。 */
+  s_hitTotal = s_ptCount;
   s_ptHit = 0;
 
   /* 先回待机；回完由 drawLoop 转入"抬笔去起点上方" */
@@ -1295,6 +1354,11 @@ void drawLoop(void)
 
   if (s_phase == DRAW_PHASE_IDLE) return;
 
+  /* 绘图任务只要处于非空闲阶段，工具就必须持续夹紧：这条约束要放在
+   * 示教、暂停、回待机和自动轨迹的所有早退分支之前，否则上一帧的点动
+   * 或串口角度会让笔重新张开。 */
+  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
+
   /* 示教：摇杆点动（暂停概念在示教里没有意义，按键1/2 是记录/撤销） */
   if (s_phase == DRAW_PHASE_TEACH) {
     teachJogTick();
@@ -1312,14 +1376,6 @@ void drawLoop(void)
   }
 
   if (s_paused) return;                    /* 暂停：保持任务状态，什么都不推进 */
-
-  /* 【每一帧都夹紧】绘图运动中把末端持续压在"夹紧角"上（与取放序列同一个约定，
-   * 见 constant_and_positions.h 的 TOOL_ANGLE_TIGHT）。60~150 的夹爪范围限制
-   * 已删除，所以这个角可以比名义合拢角 60 更小，笔才真正被夹住。
-   * posSetAngle4() 在"值没变"时返回 false 且不写状态，所以这里等价于每帧重申
-   * 一次目标角：不产生额外抖动，只是保证夹爪始终保持在夹紧位置。
-   * 示教阶段（DRAW_PHASE_TEACH）与暂停时不会走到这里，示教点动仍可单独调末端。 */
-  (void) posSetAngle4(TOOL_ANGLE_TIGHT);
 
   switch (s_phase) {
     case DRAW_PHASE_HOME: {

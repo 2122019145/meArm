@@ -12,10 +12,11 @@
  *
  * 只有 C++11 裸机 AVR 代码；本文件不产生任何数据段，也不打印任何东西。
  *
- * 【本版本已删除】pathCorePointOk() 里的 limit 范围检查。笛卡尔坐标范围
- * 限制（rangeLimit/limit）已按需求整体移除；b/r/c 的物理行程 0~180 在
- * moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
- * （原有的 f 60~150 夹爪软限位也已删除）。
+ * 【本版本恢复】pathCorePointOk() 里的 limit 范围检查（"工作空间盒子"，
+ * 见 constant_and_positions.h 的 struct rangeLimit）：取放与绘图的轨迹校验
+ * 就是靠它把越界点整条拒掉。b/r/c 的物理行程 0~180 在 moveJointStep() 内
+ * 硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码（原有的 f 60~150
+ * 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
@@ -42,12 +43,15 @@ inline bool pathCoreSolveJoint(double x, double y, double z,
   return true;
 }
 
-/* 这个工作区点能不能用：几何可达 + 反解成功且没被吸附。
- * 【本版本已删除】原来的 limit 三轴范围检查。笛卡尔坐标范围限制已按需求
- * 整体移除；剩下的几何可达性 isReachable() 属于反解的数学前提（acos 定义域），
- * 不是"范围限制"，仍然保留。 */
+/* 这个工作区点能不能用：在 limit 盒内 + 几何可达 + 反解成功且没被吸附。
+ * limit 检查放在最前面：三次纯比较（6 个 double 比较）比 isReachable() 与
+ * 反解都便宜，越界的轨迹能在采样阶段就整条失败。 */
 inline bool pathCorePointOk(double x, double y, double z,
                             double *b, double *r, double *c) {
+  if (x < limit.minX || x > limit.maxX) return false;
+  if (y < limit.minY || y > limit.maxY) return false;
+  if (z < limit.minZ || z > limit.maxZ) return false;
+
   REC rec;
   rec.x = x;
   rec.y = y;

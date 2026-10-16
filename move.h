@@ -6,8 +6,9 @@
 //   被控量（状态量）: Pos.ser.angle1..angle3（b / r / c）与 angle4（f）
 //   派生量（显示量）: Pos.rec.x/y/z —— 由正运动学实时算出，不是目标值
 //   软件边界        : b/r/c 三轴的物理行程 0~180（硬编码），
-//                     f 的 60~150（在 posSetAngle4() 内硬编码）；
-//                     本版本已删除可配置的 servoLimit 与笛卡尔坐标的 rangeLimit。
+//                     f 的 0~180 舵机电气行程（在 posSetAngle4() 内硬编码），
+//                     末端笛卡尔坐标范围 limit（x/y ±40、z -40~40，见
+//                     constant_and_positions.h）；可配置的 servoLimit 仍未恢复。
 //
 // 设计说明:
 //   - moveJointStep 是主接口：把某个关节角加减一个步长，返回三态结果，
@@ -26,6 +27,8 @@
 //        尽头 -> MOVE_AT_LIMIT。
 //     2) 正运动学自检：由新角度算出的末端坐标必须是有限数，否则
 //        -> MOVE_UNREACHABLE（几何上不可达）。
+//     3) 位置边界：由新角度算出的末端坐标越出 limit（"工作空间盒子"）就整步
+//        回退 -> MOVE_AT_LIMIT（角度模式下坐标是派生量，算"这个方向到头了"）。
 //
 #ifndef WEARM_MOVE_H
 #define WEARM_MOVE_H
@@ -66,7 +69,7 @@ enum JointDir {
 enum MoveResult {
   MOVE_NONE        = 0,  /* 方向非法 / 步长无效，未动作 */
   MOVE_OK          = 1,  /* 正常移动了一步 */
-  MOVE_AT_LIMIT    = 2,  /* 方向被关节硬限位挡住（b/r/c 的 0~180） */
+  MOVE_AT_LIMIT    = 2,  /* 方向被挡住：关节硬限位（b/r/c 的 0~180）或末端坐标越出 limit */
   MOVE_UNREACHABLE = 3   /* 目标姿态正运动学自检失败，已整步回退 */
 };
 
@@ -80,7 +83,8 @@ enum MoveResult {
  *   2. b/r/c 三轴硬编码夹到 0~180 —— 夹完等于原值说明这个方向已到限位，
  *      返回 MOVE_AT_LIMIT；
  *   3. 用正运动学 recFromServo() 重算末端坐标，失败返回 MOVE_UNREACHABLE；
- *   4. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
+ *   4. 坐标越出 limit（工作空间盒子）返回 MOVE_AT_LIMIT（整步回退）；
+ *   5. 接受本次移动，返回 MOVE_OK。Pos.ser 与 Pos.rec 此时严格对应。
  *
  *   dir 取 JointDir 的值。stepSize 传 <= 0 时使用全局 speed.stepSize（随调速档位变化）。
  *   返回 enum MoveResult；返回 MOVE_OK 以外的值时 Pos 完全不变。 */

@@ -296,11 +296,18 @@ int main(void) {
       if (!recFromServo(&chk, &Pos.ser)) { bad++; continue; }
       if (fabs(chk.x - Pos.rec.x) > 1e-9 || fabs(chk.y - Pos.rec.y) > 1e-9 ||
           fabs(chk.z - Pos.rec.z) > 1e-9) bad++;
+      /* 关键不变量：末端坐标永远落在工作空间盒子内（越界的那一步会被
+       * move.cpp 的 posOutOfRange() 整步回退）。本版盒子（x/y ±40、z -60~60）
+       * 比真实包络宽，所以这条恒成立 —— 它验证的是回退逻辑确实挂在
+       * moveJointStep() 的提交点之前。 */
+      if (Pos.rec.x < limit.minX - 1e-9 || Pos.rec.x > limit.maxX + 1e-9) bad++;
+      if (Pos.rec.y < limit.minY - 1e-9 || Pos.rec.y > limit.maxY + 1e-9) bad++;
+      if (Pos.rec.z < limit.minZ - 1e-9 || Pos.rec.z > limit.maxZ + 1e-9) bad++;
     }
     snprintf(buf, sizeof(buf), "violations=%d 末态 b=%.1f r=%.1f c=%.1f f=%.1f (%.1f,%.1f,%.1f)",
              bad, Pos.ser.angle1, Pos.ser.angle2, Pos.ser.angle3, Pos.ser.angle4,
              Pos.rec.x, Pos.rec.y, Pos.rec.z);
-    check("4000 轮随机推杆：零越界/零 NaN/坐标与角度始终自洽", bad == 0, buf);
+    check("4000 轮随机推杆：零越界/零 NaN/坐标与角度始终自洽、且不出 limit", bad == 0, buf);
   }
 
   printf("=== 9) 摇杆中位自标定（修「无故乱动」）===\n");
