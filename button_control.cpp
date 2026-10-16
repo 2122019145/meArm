@@ -164,15 +164,17 @@ static double *btnAngle(int joint) {
  * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
-  /* 四个轴都只夹到舵机电气行程：b/r/c 0~180，f 是 TOOL_ANGLE_MIN..MAX(0~180)。
-   * 60~150 的"夹爪范围限制"已删除 —— 否则录制/回放/回中会把夹紧角顶回 60。
+  /* b/r/c 夹到各自的**机械行程窗口**（v1.6.7 起：b 0~180、r 45~160、c 30~110，
+   * 见 constant_and_positions.h 的 KIN_* 宏），f 夹到舵机电气行程
+   * TOOL_ANGLE_MIN..MAX(0~180)。60~150 的"夹爪范围限制"已删除 —— 否则
+   * 录制/回放/回中会把夹紧角顶回 60。
    * 原 clampServoAngles() 已随 servoLimit 结构体一起删除，这里只是一道保险。 */
-  if (tmp.angle1 < 0.0)   tmp.angle1 = 0.0;
-  if (tmp.angle1 > 180.0) tmp.angle1 = 180.0;
-  if (tmp.angle2 < 0.0)   tmp.angle2 = 0.0;
-  if (tmp.angle2 > 180.0) tmp.angle2 = 180.0;
-  if (tmp.angle3 < 0.0)   tmp.angle3 = 0.0;
-  if (tmp.angle3 > 180.0) tmp.angle3 = 180.0;
+  if (tmp.angle1 < KIN_BASE_MIN) tmp.angle1 = KIN_BASE_MIN;
+  if (tmp.angle1 > KIN_BASE_MAX) tmp.angle1 = KIN_BASE_MAX;
+  if (tmp.angle2 < KIN_RARM_MIN) tmp.angle2 = KIN_RARM_MIN;
+  if (tmp.angle2 > KIN_RARM_MAX) tmp.angle2 = KIN_RARM_MAX;
+  if (tmp.angle3 < KIN_FARM_MIN) tmp.angle3 = KIN_FARM_MIN;
+  if (tmp.angle3 > KIN_FARM_MAX) tmp.angle3 = KIN_FARM_MAX;
   if (tmp.angle4 < TOOL_ANGLE_MIN) tmp.angle4 = TOOL_ANGLE_MIN;
   if (tmp.angle4 > TOOL_ANGLE_MAX) tmp.angle4 = TOOL_ANGLE_MAX;
   Pos.ser = tmp;

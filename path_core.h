@@ -14,9 +14,9 @@
  *
  * 【本版本恢复】pathCorePointOk() 里的 limit 范围检查（"工作空间盒子"，
  * 见 constant_and_positions.h 的 struct rangeLimit）：取放与绘图的轨迹校验
- * 就是靠它把越界点整条拒掉。b/r/c 的物理行程 0~180 在 moveJointStep() 内
- * 硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码（原有的 f 60~150
- * 夹爪软限位也已删除）。
+ * 就是靠它把越界点整条拒掉。b/r/c 的行程窗口（KIN_*：0~180 / 45~160 / 30~110）
+ * 在 moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
+ * （原有的 f 60~150 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H

@@ -4,9 +4,10 @@
 //
 // 统一流程（每一步都保证 Pos.ser 与 Pos.rec 严格自洽）:
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
-//   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
+//   -> b/r/c 三轴夹到各自的行程窗口（KIN_*：b 0~180、r 45~160、c 30~110）：
+//      夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
-//   -> 坐标一越出 limit（"工作空间盒子"）=> 也算 MOVE_AT_LIMIT
+//   -> 坐标一越出 limit（"工作空间盒子" x/y ±160、z -100~+300）=> 也算 MOVE_AT_LIMIT
 //      （角度模式下坐标是派生量，所以这不是"不可达"，而是"这个方向到头了"，
 //        摇杆表现为推到头了）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
@@ -16,9 +17,9 @@
 //
 // 【本版本恢复】笛卡尔坐标范围检查（posOutOfRange，只读 limit 盒子）。它只管
 // 关节步进这一条路；取放/绘图的坐标采样点由 path_core.h 的 pathCorePointOk()
-// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的 0~180
-// 物理行程在 moveJointStep() 内部直接硬编码；angle4（f）由 posSetAngle4()
-// 单独处理，不走本路径。
+// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的行程窗口
+// （KIN_*：0~180 / 45~160 / 30~110）在 moveJointStep() 内部直接硬编码；
+// angle4（f）由 posSetAngle4() 单独处理，不走本路径。
 //
 #include "move.h"
 #include "constant_and_positions.h"
@@ -62,18 +63,19 @@ static bool samePose(const SER *a, const SER *b) {
   return true;
 }
 
-/* b/r/c 三轴硬编码 0~180 的物理行程夹取。
- * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
- * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
- * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 0~180 的
- * 舵机电气行程。 */
+/* b/r/c 三轴的**机械行程**夹取。
+ * 【v1.6.7 运动逻辑替换】行程不再是三轴统一的 0~180，而是参照仓库最新版的
+ * 实机标定值：b 0~180、r 45~160、c 30~110（见 constant_and_positions.h 的
+ * KIN_* 宏）。超出窗口会撞结构（上臂放平、前臂反折），所以这里按宏夹取。
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，用舵机电气行程
+ * TOOL_ANGLE_MIN..MAX(0~180)。 */
 static void clampBCR(SER *s) {
-  if (s->angle1 < 0.0)   s->angle1 = 0.0;
-  if (s->angle1 > 180.0) s->angle1 = 180.0;
-  if (s->angle2 < 0.0)   s->angle2 = 0.0;
-  if (s->angle2 > 180.0) s->angle2 = 180.0;
-  if (s->angle3 < 0.0)   s->angle3 = 0.0;
-  if (s->angle3 > 180.0) s->angle3 = 180.0;
+  if (s->angle1 < KIN_BASE_MIN) s->angle1 = KIN_BASE_MIN;
+  if (s->angle1 > KIN_BASE_MAX) s->angle1 = KIN_BASE_MAX;
+  if (s->angle2 < KIN_RARM_MIN) s->angle2 = KIN_RARM_MIN;
+  if (s->angle2 > KIN_RARM_MAX) s->angle2 = KIN_RARM_MAX;
+  if (s->angle3 < KIN_FARM_MIN) s->angle3 = KIN_FARM_MIN;
+  if (s->angle3 > KIN_FARM_MAX) s->angle3 = KIN_FARM_MAX;
 }
 
 /* 坐标是否越出 limit（"工作空间盒子"，只读判断，不改动 Pos）。
@@ -114,7 +116,7 @@ int moveJointStep(int dir, double stepSize) {
   if (code & 1) step = -step;
   *ap += step;
 
-  /* 2) 关节硬限位：b/r/c 三轴硬编码 0~180（最终防线）。
+  /* 2) 关节硬限位：b/r/c 夹到各自行程窗口（KIN_*：0~180 / 45~160 / 30~110，最终防线）。
    *    夹完三个姿态角都等于原值 => 已到机械行程尽头。
    *    注意只比较 b/r/c：angle4 由末端专用接口控制，不走这条路径。
    *    直接返回即等价于原来的整步回退（Pos 未被改动）。 */

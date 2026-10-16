@@ -215,11 +215,13 @@
  *    反向装上的：逻辑角增大时它们物理上朝反方向走。实机表现：
  *      - 左右旋转的舵机转向反了（摇杆/坐标指令给的方向与机械实际相反）；
  *      - 串口 O（张开 = 逻辑角 150）实际把爪子夹紧、S（夹紧 = 逻辑角 60）反而张开。
- *    修法不动 0~180 的整套映射，也不动任何逻辑角，只在唯一写出口
- *    writeServo() 里对这两个通道做一次"在自身行程窗口内镜像"：
+ *    修法不动整套映射，也不动任何逻辑角，只在唯一写出口
+ *    writeServo() 里对这几个通道做一次"在自身行程窗口内镜像"：
  *        physical = (min + max) - logical
  *    逻辑角（限位、反解、录制回放、绘图、示教）仍是唯一真值，变的只是最后
- *    送给舵机的那个数。基座的镜像和是 180（整行程对称）；夹爪是 210（装配角），
+ *    送给舵机的那个数。基座的镜像和是 180（整行程对称）、夹爪是 210（装配角）、
+ *    上臂是 KIN_RARM_MIN+KIN_RARM_MAX = 205、下臂是 KIN_FARM_MIN+KIN_FARM_MAX = 140
+ *    （v1.6.7 起不再写死 180：r/c 的窗口不对称，写死会把 r=45 映成 135 越界）；
  *    而夹爪的逻辑角范围已放宽到 0~180，所以镜像后的物理角可能超出 0~180，
  *    由 servo_drive 在脉宽层面夹到电气行程端点。
  *    换一套装配（舵机正着装）就把对应开关改成 0，其它文件一行都不用动。
@@ -233,19 +235,22 @@
 #ifndef WEARM_MIRROR_SHOULDER
 #  define WEARM_MIRROR_SHOULDER 0   /* 1 = 上臂舵机（通道 1 / r）反向装配。
                                      * 上臂/下臂都是按正向装配接的（只有基座与夹爪反向，
-                                     * 见 README「硬件与接线」），所以这里必须是 0 才与正解
-                                     * α = 90° − r 一致。置 1 只会把上臂的**竖直**分量取反
-                                     * （水平分量 cos(90°−r) 不变），症状恰好就是"上下搞反、
-                                     * 其余正常"—— 这正是上一版默认 1 时的问题。 */
+                                     * 见 README「硬件与接线」），所以这里必须是 0 才与
+                                     * 正解 α = 180° − r 一致。置 1 只会把上臂的**竖直**
+                                     * 分量取反（水平分量 cos(180°−r) 不变），症状恰好
+                                     * 就是"上下搞反、其余正常"—— 这正是上一版默认 1 时
+                                     * 的问题。 */
 #endif
 #ifndef WEARM_MIRROR_ELBOW
 #  define WEARM_MIRROR_ELBOW 0   /* 1 = 下臂舵机（通道 2 / c）反向装配 */
 #endif
 
-/* 运行时换向（串口 'm' 查询 / 'mS' 切换上臂 / 'mE' 切换下臂；默认取上面编译期值，
- * 掉电不保存）。只被 meArm.ino 的 writeServo() 读取：上机标定方向时用，
- * 找到正确组合后应把结果回写上面的 WEARM_MIRROR_SHOULDER / WEARM_MIRROR_ELBOW
- * 并删掉这段运行时覆盖。 */
+/* 运行时换向（串口 'm' 查询 / 'mB' 切基座 / 'mS' 切上臂 / 'mE' 切下臂；默认取上面
+ * 编译期值，掉电不保存）。只被 meArm.ino 的 writeServo() 读取：上机标定方向时用，
+ * 找到正确组合后应把结果回写上面的 WEARM_MIRROR_* 并删掉这段运行时覆盖。
+ * 【v1.6.7】基座也进了运行时开关 —— 运动模型换成参照仓库最新版后，
+ * x = -R_h·sin(b-90) 的基座正方向与旧模型相反，用 'mB' 就能免重编试出正确方向。 */
+extern bool g_mirrorBase;
 extern bool g_mirrorShoulder;
 extern bool g_mirrorElbow;
 
@@ -335,22 +340,31 @@ extern bool g_mirrorElbow;
 // 坐标轴约定（全工程统一）:
 //   x: 左右 (右为正)   y: 前后 (前为正)   z: 上下 (上为正)
 //
-// 【范围限制现状】
-//   - 笛卡尔坐标范围（"工作空间盒子"）：struct rangeLimit / limit 已恢复
-//     （定义在 constant_and_positions.cpp）：x/y/z 都是 ±40。
+// 运动学模型（v1.6.7 起 = 参照仓库 GitHub Fifiiiii-123/MeArm@a7d2ee1 最新一版）:
+//   几何：L1 = armheight = 38（底座顶面→肩轴）、L2 = armLength1 = 80（上臂）、
+//         L3 = armLength2 = 80（前臂）
+//   舵机角 -> 几何角：theta = b - 90（从 +y 量起，b=90 = 正前方）、
+//                     alpha = 180 - r（上臂仰角）、beta = c（前臂相对肘角）
+//   正解：R_h = L2·cos(alpha) - L3·cos(alpha+beta)
+//         x = -R_h·sin(theta)、y = R_h·cos(theta)（X 镜像：实物 base 增大 = 左转）
+//         z = L1 + L2·sin(alpha) - L3·sin(alpha+beta)
+//   初始位姿 (b,r,c) = (90,90,90) <=> 末端 (0, 80, 118)，即 POS_HOME
+//
+// 【范围限制现状】（v1.6.7 运动逻辑替换后）
+//   - 笛卡尔坐标范围（"工作空间盒子"）：struct rangeLimit / limit 定义在
+//     constant_and_positions.cpp，x/y 为 ±160（= ±(L2+L3)），z 为 [-122, 198]
+//     （= [L1-(L2+L3), L1+(L2+L3)]），即新几何的**外包围盒**。
 //     越界点由 path_core.h 的点校验与 move.cpp 的关节步进拒绝，详见 meArm.ino
-//     的"安全边界"一节。注意盒子比真实可达包络（x[0,40]、y[-40,40]、z[-40,40]）
-//     更宽（x<0 半边够不到），拦不住任何可达姿态 —— 它是一份声明式的配置，
-//     不是当前的有效边界；真正的可达性由反解残差与路径校验把关。
+//     的"安全边界"一节。真正的可达性判据是 isReachable()/getAngleEx()（三维
+//     距离 d ∈ (|L2-L3|, L2+L3) + 行程窗口 + 5mm 回代残差）。
+//   - 关节行程窗口：b 0~180、r 45~160、c 30~110（参照仓库最新版的实机标定值，
+//     见下面的 KIN_* 宏）。反解超出行程时夹取并回传 *clamped = true。
 //   - 可配置的关节硬限位：struct servoLimitCfg / servoLimit、servoSelfCheck()、
-//     isServoInRange()、clampServoAngles() 仍然是删除状态；b/r/c 三轴的物理
-//     行程 0~180 硬编码在 moveJointStep() 内。
+//     isServoInRange()、clampServoAngles() 仍然是删除状态。
 //   - 夹爪 f 的 60~150 硬限位：已删除（见下面的 TOOL_ANGLE_*）。f 只受舵机
 //     电气行程 TOOL_ANGLE_MIN..TOOL_ANGLE_MAX(0~180) 约束，于是"夹紧"
 //     （压到 60 以下）才可能做到。
 //   - 纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)：已删除。
-//   - isReachable() 的竖向边界 |z - armheight| <= L1+L2：已删除，
-//     可达性只看水平半径，竖向交给反解残差与路径校验把关。
 //
 #ifndef WEARM_CONSTANT_AND_POSITIONS_H
 #define WEARM_CONSTANT_AND_POSITIONS_H
@@ -370,6 +384,24 @@ extern bool g_mirrorElbow;
 #endif
 /* 关节角容差（度）：反解的回代残差判据与 r/c 行程边界判据共用这一个口径 */
 #define ANGLE_EPS 1e-6
+
+/* ---------- 关节行程窗口（v1.6.7 运动逻辑替换） ----------
+ * 直接照搬参照仓库最新版（others/f/MeArm，GitHub Fifiiiii-123/MeArm@a7d2ee1）
+ * 里每个 Task5 系列 / JoyFK 系列草图都在用的实机标定值：
+ *     BASE 0~180、RARM 45~160、FARM 30~110
+ * 它们不是"舵机电气行程"（那是 0~180，见 TOOL_ANGLE_*），而是这台实物机械臂
+ * 三个位姿关节的**机械行程** —— 参照仓库把它们作为 solveIK 的最后一道防线，
+ * 目的是别让结构自己顶死（上臂完全放平、前臂反折等姿态会撞到自身）。
+ * 反解超出行程时的策略也照搬：夹到窗口边界，并通过 *clamped 告诉调用方"这个解
+ * 被吸附过，实际到达点与目标可能有偏差"（随后还有 5mm 回代核对）。
+ * 想放宽/收紧结构行程，改这里一处即可（move.cpp / button_control.cpp /
+ * serial_protocol.cpp 的钳制都引用这几个宏）。 */
+#define KIN_BASE_MIN 0.0
+#define KIN_BASE_MAX 180.0
+#define KIN_RARM_MIN 45.0
+#define KIN_RARM_MAX 160.0
+#define KIN_FARM_MIN 30.0
+#define KIN_FARM_MAX 110.0
 
 /* 机械臂几何参数：上臂长、下臂长、臂高（单位与坐标一致） */
 struct arm {
@@ -410,7 +442,7 @@ extern struct arm arm1;
 /* ---------- 末端笛卡尔坐标范围（"工作空间盒子"）----------
  * 末端坐标 x/y/z 的上下限，每个轴都必须 min <= max（写反由 rangeLimitConfig()
  * 在开机时自动交换回来）。数值在 constant_and_positions.cpp 里，
- * 【本版】x/y/z 都是 ±40（修正小臂模型 beta=c-90 后包络变成 x[0,40] 半空间）。
+ * 【v1.6.7】x/y = ±160、z = [-122, 198]，即新几何（L1=38、L2=L3=80）的外包围盒。
  *
  * 越界怎么处理（两条"整步/整条回退"路径）:
  *   - 取放与绘图：轨迹采样点越界 -> 整条轨迹校验不过，取放启动被拒（BUSY）、
@@ -418,11 +450,12 @@ extern struct arm arm1;
  *   - 摇杆 / 按键 / 示教的关节步进：走完一步后正解出的末端越界 -> 这一步整步
  *     回退（返回 MOVE_AT_LIMIT，摇杆表现为"推到头了"，见 move.cpp）。
  *
- * 【为什么盒子拦不住任何可达姿态】关节 0~180 真正能走到的末端包围盒是
- * x[0,40] y[-40,40] z[-40,40]（probe_axes 扫 5929741 个组合实测，x<0 半边
- * 因为基座只能朝前半空间扫而够不到），盒子比它宽，所以没有任何可达姿态落在
- * 盒子外 —— 这份配置改的是"允许声明的工作空间"，不是可达性；想让末端真的到
- * x<0 或更大范围必须加长两臂（arm1）。 */
+ * 【盒子 vs 真实可达集】盒子是**外包围盒**，比真实可达集宽，所以不会有可达姿态
+ * 落在盒子外被误杀；反过来盒子内的点也可能够不到，那由 isReachable() 与
+ * getAngleEx()（三维距离 + 行程窗口 + 5mm 回代残差）拦下。
+ * 注意新模型的底座只有 b ∈ [0,180]，b = 90 指向 +y（正前方），所以**真实可达集
+ * 全在 y >= 0 的半空间**里，盒子里的负半轴只是声明、任何姿态都到不了；
+ * 这是参照仓库的实机约定（他们的 x 正 = 实物右、y 正 = 正前方），不是笔误。 */
 struct rangeLimit {
   double minX, maxX;
   double minY, maxY;
@@ -474,11 +507,12 @@ struct speedCfg {
 };
 extern struct speedCfg speed;
 
-/* 几何可达性：末端的水平半径 sqrt(x²+y²) 必须 <= L1+L2。
+/* 几何可达性：把末端点换算到肩轴为原点的平面几何里，三维距离
+ *     d = sqrt(x² + y² + (z - armheight)²)
+ * 必须落在 (|L2-L3|, L2+L3) 内（两端各留 1mm 余量避开伸直的奇异姿态）。
  * 这是反解的数学前提（尽早拒掉明显够不到的点），不属于"范围限制"，保留。
- * 【本版本】竖向边界 |z - armheight| <= L1+L2 已按需求删除：z 不再单独设卡，
- * 竖向靠 getAngleEx() 的残差判据与路径校验把关（cosC 在 acos 前已夹到 ±1，
- * 不会越域）。 */
+ * 【v1.6.7】旧版只看水平半径 sqrt(x²+y²) <= 40（竖向完全不管，那时是 40mm
+ * 两杆模型），已随运动逻辑一起换成参照仓库的三维判据。 */
 bool isReachable(const REC *rec);
 
 /* 由笛卡尔坐标 rec 反解出舵机角度 ser（逆运动学）。
@@ -489,11 +523,11 @@ bool isReachable(const REC *rec);
  * angle4(末端 f) 不参与反解，保持调用前已有的值不变。 */
 bool getAngle(pos *pos1);
 
-/* getAngle 的扩展版：*clamped 回传"解出的姿态是否被吸附到关节限位上"。
- * 【本版本】f 的 60~150 吸附已删除，b/r/c 走的是显式区间筛选（不合格就换
- * 分支/拒绝），不做吸附，所以 *clamped 目前恒为 false；参数保留给将来的
- * 姿态吸附策略，调用方（path_core.h）的判据不用改。clamped 传 NULL 时与
- * getAngle 完全一致。 */
+/* getAngle 的扩展版：*clamped 回传"解出的姿态是否被吸附到关节行程窗口上"。
+ * 【v1.6.7】反解改成参照仓库的单分支解 + 行程夹取：b 0~180、r 45~160、
+ * c 30~110（见上面的 KIN_* 宏）。只要任一轴被夹到窗口边界，*clamped 就是
+ * true（此时若实际到达点与目标相差超过 5mm，反解直接返回 false）。
+ * clamped 传 NULL 时与 getAngle 完全一致。 */
 bool getAngleEx(pos *pos1, bool *clamped);
 
 /* 正运动学：由四个舵机角度算出末端笛卡尔坐标，写入 *rec。
@@ -933,7 +967,7 @@ int protoHandleLine(const char *line);
  * pick_place.h -- 物体 A / B / C 的自动取放序列
  *
  * 上位机在串口里发单个字母 A / B / C，本模块用一条非阻塞状态机自动完成整套动作。
- * 路径按用户口径：以物体高度为基准（1 工作区单位 = 4 mm，5cm = 12.5、2cm = 5.0）
+ * 路径按用户口径：以物体高度为基准（坐标单位就是 mm，5cm = 50.0、2cm = 20.0）
  *     先上移到「物体高度 + 5cm」-> 沿水平方向移到「物体后方 2cm」
  *     -> 下降到与物体同高 -> 沿水平方向「向前 2cm」把物体送进两爪之间
  *     -> 合爪（快合到名义合拢角，再慢压到夹紧角）-> 停顿
@@ -945,7 +979,8 @@ int protoHandleLine(const char *line);
  * 「后方 / 向前」取的是基座的水平半径方向，不是固定 ±x（见 pickBehindPoint）。
  *
  * 位置表（每个物体的初始位置与放置位置）写在 pick_place.cpp 顶部，可直接改。
- * 物体与目标的放置高度允许 -10cm ~ +10cm（±25 单位）；物体越高可达的水平半径越小，
+ * 物体与目标的放置高度允许 -18 ~ +171 mm（实测可达竖直带，见 pick_place.cpp 文件头）；
+ * 物体越高可达的水平半径越小，
  * 所以「+5cm 的飞行高度」在物体很高时会整个落在可达包络之外，这时
  * planTravelZ() 会逐档降低飞行高度，最低不低于「最高物体 + 1cm」。
  * 飞行高度是否被降过可以用 pickPlacePlanZ() 查（探针用它断言取值区间）。
@@ -984,7 +1019,7 @@ int protoHandleLine(const char *line);
  *   -2  已经有一个序列在执行（本次忽略）
  *   -3  路径校验失败（当前位姿不可用 / 不在自己的反解分支上，或路径上有不可达、
  *       越界、分支跳变的点），拒绝启动，Pos 一个字节都不改
- *   -4  位置表高度超出 -10cm~+10cm，或整段区间都找不到可达的飞行高度       */
+ *   -4  位置表高度超出 PICK_HEIGHT_MIN/MAX（-18 ~ +171 mm），或整段区间都找不到可达的飞行高度 */
 int pickPlaceStart(int object);
 
 /* 每轮 loop() 调用一次，推动序列前进（非阻塞，空闲时立即返回）。 */
@@ -1252,9 +1287,9 @@ static inline const char *buttonStateName(void)     { return ""; }
  *     右手柄 前后 (A3) -> 笔尖 z   前推 = z 减小（往下压）
  *     右手柄 左右 (A2) -> 默认**不响应**（夹爪里夹着笔，示教时动它会带歪笔尖；
  *                        要恢复旧行为把 draw_control.cpp 的 DRAW_JOG_TOOL_ENABLE 改 1）
- *   每格的位移量是"工作区单位"，由 DRAW_JOG_STEP_MAX（0.25）按偏转比例缩放：
- *     轻微偏转 -> 0.02 单位/格（慢慢挪，对点用）
- *     满偏     -> 0.25 单位/格（约 6 单位/秒，比自动绘制快一倍）
+ *   每格的位移量是**毫米**，由 DRAW_JOG_STEP_MAX（1.0mm）按偏转比例缩放：
+ *     轻微偏转 -> 0.08mm/格（慢慢挪，对点用）
+ *     满偏     -> 1.0mm/格（约 24mm/秒，比自动绘制快一倍）
  *   步进间隔固定为 speed.stepDelayMs；只有步长按偏转比例缩放
  *   （与摇杆模块的调速约定），所以示教点动也吃
  *   调速 H/L 档位。
@@ -1263,11 +1298,20 @@ static inline const char *buttonStateName(void)     { return ""; }
  *   哪一路方向觉得反了，把 DRAW_JOG_INVERT_X/Y/Z 改成 1 即可（不用改逻辑）。
  *
  * 【纸面坐标与几何】
- *   纸面是水平面 z = 纸面高度（默认 DRAW_PEN_Z）。内置图形画在
- *   以 (DRAW_CENTER_X, DRAW_CENTER_Y) 为中心、半宽 DRAW_HALF 的正方形里，
+ *   纸面是水平面 z = 纸面高度（默认 DRAW_PEN_Z = -6 mm，**须上机用串口 p<z>
+ *   重标**：z = 0 是底盘顶面、肩轴在 +38，臂尖最低只能到约 -14，所以纸必须
+ *   垫高；详见 draw_control.cpp 顶部"纸面几何"的实测可达 rho 表）。内置图形
+ *   画在以 (DRAW_CENTER_X, DRAW_CENTER_Y) 为中心、半宽 DRAW_HALF 的正方形里，
  *   顶点用"归一化坐标 u,v ∈ [-1,1]"定义，这样改大小只动一个数。
- *   默认区域 x[14,26] y[-6,6]（中心 20,0，半宽 6），整块都在可达空间内部：
- *   该区域 |rho| 最大 26.7，R = sqrt(rho^2+z^2) 最大约 29.6 << L1+L2 = 40。
+ *   默认区域 x[-25,25] y[50,100]（中心 0,75，半宽 25），整块都在可达空间内部：
+ *   该区域 rho 落在 50~103，而 z = -6 平面的实测可达 rho 区间是 [40,111]。
+ *   ★ 两条硬约束：
+ *     (1) 可达半空间是 **y ≥ 0**（基座只有 ±90°），绘图区域不能跨到 y < 0；
+ *     (2) 可达性由 `pathCorePointOk()` 判定（盒子 + 几何可达 + 反解且不被吸附），
+ *         比"几何距离 d = sqrt(rho² + (z-38)²) ∈ [1,159]"严得多 —— 卡住可用
+ *         区域的是**关节行程**（r 45~160、c 30~110 ⇒ d ≤ 131.1），纸上每降低
+ *         1mm、可用 rho 上限就缩一圈。选纸面高度/半宽前先跑
+ *         `.selfcheck/drawcheck.cpp` 打表。
  */
 #ifndef DRAW_CONTROL_H
 #define DRAW_CONTROL_H
@@ -1497,7 +1541,8 @@ int drawLastResult(void);
 //                             x -> angle1 基座、y -> angle2 上臂、z -> angle3 下臂
 //                             超出舵机行程的值按行程夹取，不会因为数值大小被拒
 //
-//   每个关节都只受舵机电气行程限制（b/r/c 0~180，f 0~180 —— f 原来还有 60~150
+//   每个关节都只受各自行程窗口限制（b 0~180、r 45~160、c 30~110，见
+//   constant_and_positions.h 的 KIN_* 宏；f 0~180 —— f 原来还有 60~150
 //   的夹爪软限位，本版本已按需求删除），
 //   推到行程尽头就停住（moveJointStep 返回 MOVE_AT_LIMIT），不会顶死舵机。
 //
@@ -1509,22 +1554,19 @@ int drawLastResult(void);
 //   直接控角度后每一路轴 ↔ 一个舵机，动作可预期、行程边界清晰，
 //   末端坐标只作为显示量算出来。
 //
-// 【坐标模型（用于显示与工作空间校验）】
-//   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
-//     b (angle1) 90° -> 基座朝 +x 方向；b 行程 0~180° 使可达空间只占 x >= 0 一侧
-//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下
-//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上
-//   初始位姿 POS_HOME = (40, 0, 0) -> (b,r,c,f) = (90, 90, 90, 105)
-//   （两节水平朝前、完全伸直，落在可达外边界 rho = 40 上；这是上电姿态）。
-//   正运动学: alpha = 90 - r, beta = c - 90,
-//             x_planar = L1 cos alpha + L2 cos beta,
-//             z = L1 sin alpha + L2 sin beta + armheight,
-//             theta = 90 - b  ->  x = x_planar cos theta, y = x_planar sin theta。
-//   【修正】肩轴反转（alpha = 90 - r）、肘轴正转（beta = c - 90），依据
-//   RC-robot-hand 参考工程实测位姿：R↑=末端降、F↑=末端升。旧 beta = c - 180 把
-//   下臂多算 90°，导致取放时"该下反上"。详见 .selfcheck/README.md 的
-//   "运动学标定"一节。
+// 【坐标模型（用于显示与工作空间校验）—— v1.6.7 已整体替换】
+//   原点在**底盘顶面中心**，肩轴在 z = +38，上臂 L2 = 前臂 L3 = 80（mm）:
+//     theta = b - 90（基座转角，自 +y 量起）；b 行程 0~180° 使可达空间只占 y >= 0 一侧
+//     alpha = 180 - r（上臂仰角：r = 90° -> 上臂竖直向上，r 增大 -> 上臂下沉）
+//     beta  = c      （前臂相对肘部的折角：c 增大 -> 前臂上抬）
+//   正运动学: R_h = L2 cos alpha - L3 cos(alpha+beta),
+//             x = -R_h sin theta, y = R_h cos theta,
+//             z = 38 + L2 sin alpha - L3 sin(alpha+beta)。
+//   初始位姿 POS_HOME = (0, 80, 118) -> (b,r,c) = (90, 90, 90)
+//   （上臂竖直向上、前臂水平朝前，落在工作空间中央；这是上电姿态）。
+//   反解要求 d = sqrt(rho² + (z-38)²) ∈ [1, 159] mm，并且 b/r/c 落在各自的
+//   行程窗口内；详见 constant_and_positions.h 的文件头。
+//   完整推导与新旧模型对照见 .selfcheck/README.md 的"运动学标定"一节。
 //
 // 【调速参数】存在全局 speedCfg (speed) 中，所有移动源共用：
 //     speed.stepSize    满偏（推到底）时每格的关节角（度）；实际每格 = stepSize × 偏转比例
@@ -1616,9 +1658,9 @@ void joystickLoop(void);
  *
  * 【本版本恢复】pathCorePointOk() 里的 limit 范围检查（"工作空间盒子"，
  * 见 constant_and_positions.h 的 struct rangeLimit）：取放与绘图的轨迹校验
- * 就是靠它把越界点整条拒掉。b/r/c 的物理行程 0~180 在 moveJointStep() 内
- * 硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码（原有的 f 60~150
- * 夹爪软限位也已删除）。
+ * 就是靠它把越界点整条拒掉。b/r/c 的行程窗口（KIN_*：0~180 / 45~160 / 30~110）
+ * 在 moveJointStep() 内硬编码，f 的电气行程 0~180 在 posSetAngle4() 内硬编码
+ * （原有的 f 60~150 夹爪软限位也已删除）。
  */
 #ifndef PATH_CORE_H
 #define PATH_CORE_H
@@ -1764,34 +1806,63 @@ void servoDriveWrite(uint8_t ch, double deg) {
 #endif
 
 /* 复位目标点 = **上电初始位姿**（用户标定：初始状态下三个位姿舵机的角度必须是
- * x90, y90, z90，即 (b,r,c) = (90,90,90)；旧版 v1.6.5 的注释也是这么写的）。
- * 修正模型（alpha = 90 - r、beta = c - 90）下这个姿态对应末端 (40, 0, 0)：
- * alpha = beta = theta = 0，两节都水平朝前 —— 完全伸直的姿态，恰好落在可达
- * 外边界 rho = L1 + L2 = 40 上（probe_rt 的 anchor "(40.00, 0.00, 0.00) PASS"）。
- * 落在边界上的代价只有一条：从这一点**无法再向外伸**（rho 已经取到最大），
- * 因此"就地垂直抬升"也无解 —— rho = 40 只在 z = 0 成立。取放模块为此改成
- * 起点不可达就直接插值到"物体正上方(飞行高度)"，见 pick_place.cpp 的 s_riseAtSrc。
- * x = 40 同时在 limit 盒子的边界上，判据是闭区间，仍算"在盒内"。
- * 【历史】曾改成 (20,0,-10)（反解 b=90、r=60.55、c=7.43 的折叠位姿）以避开边界，
- * 但那会让上电姿态偏离 x90,y90,z90，已按用户要求改回。 */
-static const REC POS_HOME = { 40, 0, 0 };
+ * x90, y90, z90，即 (b,r,c) = (90,90,90)）。
+ * 【v1.6.7 运动逻辑替换】运动学已整体换成 others/f/MeArm 里对应 GitHub 最新
+ * 一版的模型（Fifiiiii-123/MeArm，commit a7d2ee1；Task5_LineN 及其后每个版本
+ * 的 solveIK/forwardKin/servoToGeo 逐字节相同）：
+ *   theta = b - 90（底座转角，从 +y 量起：b = 90 = 正前方）
+ *   alpha = 180 - r（上臂仰角）   beta = c（前臂相对肘角）
+ *   L1 = 38（底盘高）/ L2 = 80（上臂）/ L3 = 80（前臂），全部为 mm
+ * 这个模型下 (b,r,c) = (90,90,90) 的正解是：
+ *   R_h = L2·cos90 - L3·cos180 = 80
+ *   x = -R_h·sin0 = 0、y = R_h·cos0 = 80、z = 38 + 80·sin90 - 80·sin180 = 118
+ * 即 (0, 80, 118) —— 上臂竖直、前臂水平前伸，落在工作空间中央，不再像旧
+ * 40mm 模型那样贴在可达外边界 (40,0,0) 上（那时从 home 既不能向外伸也不能
+ * 就地抬升，取放模块不得不为它写特例，见 pick_place.cpp 的 s_riseAtSrc）。
+ * 反解 (0,80,118) 恰好回到 (90,90,90)。 */
+static const REC POS_HOME = { 0, 80, 118 };
 
-/* 机械臂几何参数（上臂长 / 下臂长 / 末端伸出量） */
-struct arm arm1 = { 20, 20, 0 };
+/* 机械臂几何参数（上臂长 / 下臂长 / 底盘高）—— 参照仓库最新版的实物标定值
+ * （注释里写"JoyFK_alpha2 实测"）：
+ *   armLength1 = L2 = 80mm（上臂：肩 → 肘）
+ *   armLength2 = L3 = 80mm（前臂：肘 → 腕）
+ *   armheight  = L1 = 38mm（底盘高度：底座顶面 → 肩轴）
+ * 旧版是 { 20, 20, 0 }（两杆各 20mm、无底盘高），与实物的 ~160mm 臂展差一个
+ * 数量级，也是旧模型下坐标全部挤在 ±40 里、方向又对不上的根因之一。 */
+struct arm arm1 = { 80, 80, 38 };
 
 /* 全局位姿实例（头文件里 Pos 是 extern 声明，定义必须放这里） */
 pos Pos = { { 0, 0, 0, 0 }, { POS_HOME.x, POS_HOME.y, POS_HOME.z } };
 
 /* 末端笛卡尔坐标范围（"工作空间盒子"，见头文件里的用法说明）。
- * 【本版】三轴统一 ±40。这只是给外部的**粗坐标范围**（画布/取放点的合法性判据），
- * 不是真实包络：修正小臂模型为 beta = c - 90 后 r、c 各 0~180，使
- * alpha、beta 都落在 [-90,90]，两节 cos 都 ≥ 0，所以真实可达集在平面上是
- * x ≥ 0 的一枚"透镜"（两杆夹角由余弦定理定），不是圆盘、更不是球。
- * 盒子比真实包络大一圈是有意的：真正的可达性判据是 getAngleEx() 的回代残差。 */
+ * 【v1.6.7 随运动学一起替换】x/y 取新模型两杆 L2 = L3 = 80 的**几何外包围盒**
+ * ±(L2+L3) = ±160；z 取**实测可达竖直带**（从底盘顶面量）：
+ *   z ∈ [-18, +171] mm  即 -1.8cm ~ +17.1cm
+ * 实测值是 [-18.5, +171.5]（`.selfcheck/picktable_check.cpp` 的 [1b] 段全程扫描），
+ * 盒子两端各留 0.5mm 余量。两端**都不是臂长的几何极限** [-122, +198]，而是
+ * **关节行程**决定的：r ∈ [45,160] ⇒ α ∈ [20°,135°]（上臂压不到水平线以下），
+ * c ∈ [30,110] ⇒ d ≤ 131.1mm。所以盒子外的点报"越界"、盒内但姿态不可达的点
+ * 报"够不到"，语义各自清楚。旧版盒子是 ±40，按 40mm 臂长写的，新臂长下连
+ * POS_HOME (0,80,118) 都会被判越界。
+ * 【注意这个盒子比反解严】反解的回代残差只查水平 dx/dy（照抄参照工程，见 IK 尾部），
+ * 在"前臂已顶到行程端点、水平没问题、竖直却差很远"的近满伸区它会放行：
+ * 实测 (0,122,-42) 解出 r=160/c=110，真实到达 (0,126.598,+4.078)，竖直误差 +46.1mm；
+ * (0,122,-60) 落到同一组角，竖直误差 +64.1mm（`.selfcheck/fkcheck.cpp`）。
+ * 也就是"反解接受"不等于"真能到"。盒子故意留在**物理可达**的 [-18, +171]：
+ * 路径校验（`path_core.h` 的 pathCorePointOk）与点动（`move.cpp` 的 posOutOfRange）
+ * 都按盒子判，于是这些"竖直撒谎"的解进不了取放/绘图路径，直接下发的 x/y/z
+ * 也仍按物理带报越界。
+ * 它仍然只是给外部的**粗坐标范围**：真正的可达性由 getAngleEx() 的三维距离
+ * 判据（|L2-L3| < d < L2+L3）、奇异判据（R_h >= 5mm）、行程窗口
+ * （b 0~180、r 45~160、c 30~110）与 5mm 回代残差（只查水平 x/y，见 IK 尾部）
+ * 共同把关。
+ * 注意新模型的底座 b ∈ [0,180] 意味着 **y >= 0 的半空间**（b=90 指向 +y），
+ * y < 0 的点反解会因 b 越出行程被拒 —— 盒子保留负半轴只是"声明"，
+ * 拦不住任何真实姿态。 */
 struct rangeLimit limit = {
-  .minX = -40.0, .maxX = 40.0,
-  .minY = -40.0, .maxY = 40.0,
-  .minZ = -40.0, .maxZ = 40.0
+  .minX = -160.0, .maxX = 160.0,
+  .minY = -160.0, .maxY = 160.0,
+  .minZ = -18.0, .maxZ = 171.0
 };
 
 /* 全局调速默认值：中速（1.0 度/格、固定 40ms 一格 = 25°/s） */
@@ -1818,28 +1889,23 @@ static double __attribute__((noinline)) clampDouble(double v, double lo, double 
   return v;
 }
 
-/* ---------- 可达性（圆柱工作空间模型） ----------
+/* ---------- 可达性（三维距离判据，参照仓库 solveIK 的第一步） ----------
  *
- * 【与旧版的区别】旧版是球壳：末端到肩关节的三维距离
- *     R = sqrt(x² + y² + z²)
- * 必须落在 [|L1-L2|, L1+L2] = [0, 40] 内。
- * 新版改为"以肩关节竖直轴为中心、半径 40 的圆柱"：
- *     sqrt(x² + y²)  <=  L1 + L2 = 40   （水平边界）
- * 【本版本再删一刀】竖向边界 |z - armheight| <= L1+L2 也已按需求删除：
- * z 方向不再单独设卡，能不能到由 getAngleEx() 的残差判据与路径校验决定。
+ * 【v1.6.7 随运动逻辑一起替换】旧版是"以肩关节竖直轴为中心、半径 40 的圆柱"
+ * （只查水平半径，竖向完全不设卡），那是给 40mm 两杆模型配的。
+ * 新版逐字照搬参照仓库的判据：把末端点换算到**肩轴为原点**的平面几何里，
+ *     rho = sqrt(x² + y²)            （水平投影）
+ *     zv  = z - armheight = z - L1    （相对肩轴的高度）
+ *     d   = sqrt(rho² + zv²)          （腕点到肩轴的三维距离）
+ * 要求  |L2 - L3| + 1 < d < (L2 + L3) - 1  （L2 = L3 = 80，故 1 < d < 159）。
+ *   - 上界 L2+L3 是"两杆伸直"的几何极限，贴上去（d = 160）是奇异位姿，
+ *     参照仓库用 1mm 余量拒掉；
+ *   - 下界 |L2-L3| 是"两杆对折"的极限，本机 L2 = L3 时为 0，加 1mm 余量后
+ *     要求 d > 1，即"末端不能压在肩轴正下方/正上方"。
  *
- * 【为什么是圆柱】"末端到肩关节的距离不会超过两杆之和"对任何姿位都成立，是一条
- * 与模型无关的必要条件，所以"水平半径 ≤ 40 的圆柱"是真实可达集的外包围盒。
- *   - 真实可达集内的点必然满足水平半径 ≤ R ≤ 40，**不会误杀**；
- *   - 圆柱内、真实包络外的点（例如 (35, 0, 25)：R=43 > 40），isReachable 会放行，
- *     但下游 getAngleEx() 用余弦定理反解时仍会因为 R > 40 被拒（残差检查）。
- *     所以这一改对最终行为影响很小，主要作用是"圆柱内的点不再被提前拒掉，
- *     让反解去说能不能到"。
- *
- * 【与反解的分工】本函数只做粗粒度的工作空间外边界检查，
- * 用来尽早拒掉明显不可达的点；能不能真正反解出 b/r/c 由
- * getAngleEx() 判定。圆柱内的奇异点（例如 (0,0,40) 附近）仍可能
- * 被反解拒掉，这是几何事实，不是 bug。
+ * 【与反解的分工】本函数只做粗粒度的工作空间外边界检查，用来尽早拒掉明显
+ * 不可达的点；能不能真正反解出 b/r/c 仍由 getAngleEx() 判定（它内部同样查
+ * 一遍 d，不依赖调用序）。盒子（limit 结构体）比这里更粗，只供外部使用。
  *
  * 【调用方无需改动】签名与返回值语义不变（true = 大致可达），
  * path_core.h / pick_place.cpp / draw_control.cpp 直接复用。 */
@@ -1847,46 +1913,48 @@ bool isReachable(const REC *rec) {
   if (rec == NULL) return false;
   if (!isFiniteNum(rec->x) || !isFiniteNum(rec->y) || !isFiniteNum(rec->z)) return false;
 
-  double L1 = arm1.armLength1;
-  double L2 = arm1.armLength2;
-  if (L1 <= 0 || L2 <= 0) return false;
+  double L2 = arm1.armLength1;
+  double L3 = arm1.armLength2;
+  if (L2 <= 0 || L3 <= 0) return false;
 
-  /* 水平半径 = 臂展 = L1 + L2。竖向不再设卡（见上面的说明）。 */
-  const double RHO_MAX = L1 + L2;
-  const double GEOM_EPS = 1e-9;
+  double rho = sqrt(rec->x * rec->x + rec->y * rec->y);
+  double zv  = rec->z - arm1.armheight;
+  double d   = sqrt(rho * rho + zv * zv);
 
-  /* 水平半径检查（用平方比较，省一次 sqrt） */
-  double rho2 = rec->x * rec->x + rec->y * rec->y;
-  if (rho2 > RHO_MAX * RHO_MAX + GEOM_EPS) return false;
+  const double dMin = fabs(L2 - L3) + 1.0;
+  const double dMax = (L2 + L3) - 1.0;
+  if (!(d > dMin)) return false;
+  if (!(d < dMax)) return false;
 
   return true;
 }
 
-/* 平面正解（两杆模型）：
- *   x = L1·cos(alpha) + L2·cos(beta)
- *   z = L1·sin(alpha) + L2·sin(beta)
- * 与反解残差回代共用。 */
-static void __attribute__((noinline)) fkPlanar(double alpha, double beta,
-                                               double *outX, double *outZ) {
-  const double L1 = arm1.armLength1;
-  const double L2 = arm1.armLength2;
-  *outX = L1 * cos(alpha) + L2 * cos(beta);
-  *outZ = L1 * sin(alpha) + L2 * sin(beta);
+/* 平面正解（两杆模型，参照仓库 forwardKin 的平面部分）：
+ *   R_h = L2·cos(alpha) - L3·cos(alpha + beta)
+ *   z   = L1 + L2·sin(alpha) - L3·sin(alpha + beta)
+ * 与原版的关键差别：参照模型的 beta 是**前臂相对上臂的肘关节内角**，不是
+ * 下臂的绝对角，所以两节是 (a) 与 (a+beta)，而不是 (alpha) 与 (beta)。
+ * R_h 是腕点到肩轴竖直轴的水平距离（**带符号**，负值表示腕点落在肩轴后方，
+ * 由反解的 R_h >= 5mm 奇异判据拦下）；z 是含底盘高 L1 的大地高度。
+ * 正解与反解的回代核对共用这一份算式，保证两边逐位一致。 */
+static void __attribute__((noinline)) fkPlanar(double alpha, double betaRel,
+                                               double *outR, double *outZ) {
+  const double L2 = arm1.armLength1;
+  const double L3 = arm1.armLength2;
+  *outR = L2 * cos(alpha) - L3 * cos(alpha + betaRel);
+  *outZ = arm1.armheight + L2 * sin(alpha) - L3 * sin(alpha + betaRel);
 }
 
-/* 正运动学：四个舵机角度 -> 末端笛卡尔坐标。
- *   alpha = 90 - r     （上臂：r=0 竖直朝上、r=90 水平朝前、r=180 竖直朝下）
- *   beta  = c - 90     （下臂绝对角：c=0 竖直朝下、c=90 水平朝前、c=180 竖直朝上）
- *   theta = 90 - b
- * f 只转末端夹具，不影响被控点。
- *
- * 【两轴方向相反：肩轴反转、肘轴正转】依据 RC-robot-hand 参考工程（与真机同型号）
- * 里记录的真实任务位姿：提臂只改 F(D7) 且 F↑=末端上升（COIN_A 提起 F 20→80、
- * PEN_B 提起 F 34→79），下降只改 F 且 F↓=末端下降 —— 即小臂舵机"角度↑=末端升"，
- * 故 beta = c - 90（c=90 → beta=0 水平朝前）。上臂 R(D8) 相反：descend 时 R↑
- * （COIN 93→107、OBJECT 78→95→102），lift 时 R↓（OBJECT 102→72）—— 即
- * "角度↑=末端降"，故 alpha = 90 - r。旧式子 beta = c - 180 把"下降"反解成
- * "上升"，正是取放过程中上下方向搞反的根因（详见 .selfcheck/README.md）。 */
+/* 正运动学：四个舵机角度 -> 末端笛卡尔坐标（参照仓库最新版的 servoToGeo +
+ * forwardKin，逐式照搬）。
+ *   theta = b - 90    （底座转角：从 +y 轴量起，b = 90 = 正前方）
+ *   alpha = 180 - r   （上臂仰角：r = 90 竖直朝上，r 增大 = 前倾/下垂）
+ *   beta  = c         （前臂相对上臂的肘角：c = 90 与上臂成直角，
+ *                       c 增大 = 前臂下垂、末端变低）
+ *   x = -R_h·sin(theta)、y = R_h·cos(theta)
+ * 【X 镜像】实物 base 角度增大 = 左转，而代码约定 x 正 = 实物右，所以 x 带负号，
+ * 与参照仓库一致（他们每个文件头的坐标约定就是"x = 左右（正 = 实物右）"）。
+ * f 只转末端夹具，不影响被控点。 */
 bool recFromServo(REC *rec, const SER *ser) {
   if (rec == NULL || ser == NULL) return false;
 
@@ -1895,16 +1963,16 @@ bool recFromServo(REC *rec, const SER *ser) {
   double c = ser->angle3;
   if (!isFiniteNum(b) || !isFiniteNum(r) || !isFiniteNum(c)) return false;
 
-  double alpha = (90.0 - r) / RADtoDEG;
-  double beta  = (c - 90.0) / RADtoDEG;
-  double xPlanar;
-  double z;
-  fkPlanar(alpha, beta, &xPlanar, &z);
-  z += arm1.armheight;
+  double theta = (b - 90.0) / RADtoDEG;
+  double alpha = (180.0 - r) / RADtoDEG;
+  double beta  = c / RADtoDEG;
 
-  double theta = (90.0 - b) / RADtoDEG;
-  double x = xPlanar * cos(theta);
-  double y = xPlanar * sin(theta);
+  double rh;
+  double z;
+  fkPlanar(alpha, beta, &rh, &z);
+
+  double x = -rh * sin(theta);
+  double y =  rh * cos(theta);
   if (!isFiniteNum(x) || !isFiniteNum(y) || !isFiniteNum(z)) return false;
 
   rec->x = x;
@@ -1913,42 +1981,25 @@ bool recFromServo(REC *rec, const SER *ser) {
   return true;
 }
 
-/* 反解一个平面分支并计算残差。
- * delta = alpha - beta 是两杆的**几何夹角**（±acos，弧度），不是某个舵机角；
- * 舵机角由调用方按 alpha = 90 - r、beta = c - 90 换算。 */
-static void ikBranch(double rhoP, double zv, double delta, double L1, double L2,
-                     double *beta, double *err) {
-  double phiBase = atan2(zv, rhoP);
-  /* 【勘误】这里原先是 atan2(L2*sin(d), L1 + L2*cos(d))，把两杆的角色写反了。
-   * 正解是 R = e^{i·beta}·(L1·e^{i·delta} + L2)，所以
-   *   beta = phiBase - atan2(L1·sin(delta), L2 + L1·cos(delta))
-   * 只有当 L1 == L2 时两种写法的 atan2 结果才恰好互补
-   * （atan2(sin, 1+cos) 恒等于 delta/2），所以本工程 arm1 = {20,20,0}
-   * 一直没暴露；一旦按 constant_and_positions.h 的说明把某一节做长，
-   * 四个候选的残差全都会超限、getAngleEx() 恒返回 false（手臂卡死）。
-   * 依据：L2==L1 时两式恒等，故本修正不改变当前任何一条已验行为。 */
-  double argW    = atan2(L1 * sin(delta), L2 + L1 * cos(delta));
-  *beta = phiBase - argW;
-  double alpha = *beta + delta;
-  double fx, fz;
-  fkPlanar(alpha, *beta, &fx, &fz);
-  double dx = fx - rhoP, dz = fz - zv;
-  *err = sqrt(dx * dx + dz * dz);
-}
-
-/* 回转角归一化：90 - RADtoDEG*atan2() 值域 [-90,270]，
- * 需要把贴 360 的值折回 0。 */
-static double __attribute__((noinline)) normRevAngle(double b) {
-  if (b < 0.0)    b += 360.0;
-  if (b >= 360.0) b -= 360.0;
-  if (b > 360.0 - 1e-6) b = 0.0;
-  return b;
-}
-
 bool getAngle(pos *pos1) {
   return getAngleEx(pos1, NULL);
 }
 
+/* 运动学逆解（参照仓库最新版 solveIK，逐式照搬，再加上本工程的契约）：
+ *   1) rho = sqrt(x² + y²)、zv = z - armheight、d = sqrt(rho² + zv²)；
+ *      要求 |L2-L3| + 1 < d < L2 + L3 - 1，否则不可达。
+ *   2) 余弦定理求肘角 beta（前臂相对上臂的内角，唯一解，只取 +acos：
+ *      参照仓库的机械臂前臂只能朝下方折，镜像解没有物理行程，故不做候选分支）。
+ *   3) phi   = atan2(zv, rho)
+ *      alpha = phi + atan2(L3·sin(beta), L2 - L3·cos(beta))
+ *   4) 奇异判据：R_h < 5mm（腕点越过肩轴正下方/后方）判不可达。
+ *   5) theta = -atan2(x, y)（X 镜像，与正解互逆）。
+ *   6) 几何角 -> 舵机角：b = theta + 90、r = 180 - alpha、c = beta。
+ *   7) 按各自的行程窗口夹取（b 0~180、r 45~160、c 30~110），夹到了就把
+ *      *clamped 置 true；再用正解回代核对，误差 > 5mm 判不可达。
+ * 返回 false 时**不改动 pos1->ser**（本函数的契约）。
+ * 与旧版的区别：旧版是"±acos × 正/反平面"四个候选按优先级挑选、再把 r/c 折回
+ * 基本区间；新模型只有一个解，分支跳变问题从根上消失。 */
 bool getAngleEx(pos *pos1, bool *clamped) {
   if (clamped != NULL) *clamped = false;
   if (pos1 == NULL) return false;
@@ -1958,170 +2009,95 @@ bool getAngleEx(pos *pos1, bool *clamped) {
     return false;
   }
 
-  const double L1 = arm1.armLength1;
-  const double L2 = arm1.armLength2;
+  const double L2 = arm1.armLength1;
+  const double L3 = arm1.armLength2;
 
-  double rho = sqrt(pos1->rec.x * pos1->rec.x + pos1->rec.y * pos1->rec.y);
-  double zv  = pos1->rec.z - arm1.armheight;
-  double R2  = rho * rho + zv * zv;
+  const double x   = pos1->rec.x;
+  const double y   = pos1->rec.y;
+  const double rho = sqrt(x * x + y * y);
+  const double zv  = pos1->rec.z - arm1.armheight;
+  const double d   = sqrt(rho * rho + zv * zv);
 
-  /* 两杆几何夹角 |alpha - beta| 由余弦定理唯一确定 */
-  double cosC = (R2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
-  if (cosC >  1.0) cosC =  1.0;
-  if (cosC < -1.0) cosC = -1.0;
-  double cAbs = acos(cosC);
+  if (!isFiniteNum(d)) return false;
+
+  /* 与 isReachable() 同一判据，这里再查一遍：本函数被单独调用时也必须能拒绝 */
+  if (!(d > fabs(L2 - L3) + 1.0)) {
+    WEARM_LOG("[kin] reject: target too close to the shoulder axis");
+    return false;
+  }
+  if (!(d < (L2 + L3) - 1.0)) {
+    WEARM_LOG("[kin] reject: target beyond full extension");
+    return false;
+  }
+
+  double cosB = (L2 * L2 + L3 * L3 - d * d) / (2.0 * L2 * L3);
+  if (cosB >  1.0) cosB =  1.0;
+  if (cosB < -1.0) cosB = -1.0;
+  const double beta = acos(cosB);
+
+  const double phi   = atan2(zv, rho);
+  const double alpha = phi + atan2(L3 * sin(beta), L2 - L3 * cos(beta));
+
+  /* 奇异检测：腕点水平投影越过肩轴（R_h < 5mm，含负值）时坐标失去唯一方向 */
+  double rhChk = 0.0, zChk = 0.0;
+  fkPlanar(alpha, beta, &rhChk, &zChk);
+  (void) zChk;
+  if (!(rhChk >= 5.0)) {
+    WEARM_LOG("[kin] reject: wrist behind the shoulder axis (singular)");
+    return false;
+  }
+
+  const double theta = -atan2(x, y);
+
+  const double bRaw = RADtoDEG * theta + 90.0;
+  const double rRaw = 180.0 - RADtoDEG * alpha;
+  const double cRaw = RADtoDEG * beta;
+
+  const double nb = clampDouble(bRaw, KIN_BASE_MIN, KIN_BASE_MAX);
+  const double nr = clampDouble(rRaw, KIN_RARM_MIN, KIN_RARM_MAX);
+  const double nc = clampDouble(cRaw, KIN_FARM_MIN, KIN_FARM_MAX);
+  if (nb != bRaw || nr != rRaw || nc != cRaw) {
+    if (clamped != NULL) *clamped = true;
+  }
 
 #ifdef WEARM_IK_TRACE
   Serial.print(F("[ik] tgt rho=")); Serial.print(rho, 6);
   Serial.print(F(" zv=")); Serial.print(zv, 6);
-  Serial.print(F(" R2=")); Serial.print(R2, 6);
-  Serial.print(F(" cosC=")); Serial.print(cosC, 12);
-  Serial.print(F(" cAbs=")); Serial.println(cAbs, 12);
+  Serial.print(F(" d=")); Serial.print(d, 6);
+  Serial.print(F(" beta=")); Serial.print(RADtoDEG * beta, 6);
+  Serial.print(F(" alpha=")); Serial.print(RADtoDEG * alpha, 6);
+  Serial.print(F(" b=")); Serial.print(nb, 6);
+  Serial.print(F(" r=")); Serial.print(nr, 6);
+  Serial.print(F(" c=")); Serial.println(nc, 6);
 #endif
 
-  /* 行程判据的容差：必须显著大于"弧度<->角度换算"的舍入误差
-   * （~180 * 1e-16 ≈ 2e-14），否则恰好落在行程端点（0/180）的解会被误杀。
-   * 统一用 ANGLE_EPS(1e-6)，与后面负角归零的口径一致。 */
-  const double EPS = ANGLE_EPS;
-
-  /* 【硬编码的关节行程】b/r/c 三轴物理行程都是 0~180。
-   * 原版本从 servoLimit 结构体读取；本版本已删除该结构体，改为本地常量。
-   * f 不再参与反解判定（60~150 的硬限位已删除，只有 posSetAngle4() 里的
-   * 舵机电气行程 0~180）。 */
-  const double minB = 0.0, maxB = 180.0;
-  const double minR = 0.0, maxR = 180.0;
-  const double minC = 0.0, maxC = 180.0;
-
-  /* 回转角只跟"平面朝前/反折"有关，两个平面各算一次 */
-  double bFwd = 90.0, bRev = 90.0;
-  if (rho > 1e-9) {
-    bFwd = 90.0 - RADtoDEG * atan2( pos1->rec.y,  pos1->rec.x);
-    bRev = 90.0 - RADtoDEG * atan2(-pos1->rec.y, -pos1->rec.x);
-  }
-  bFwd = normRevAngle(bFwd);
-  bRev = normRevAngle(bRev);
-
-  double bestB = 0.0, bestR = 0.0, bestC = 0.0, bestErr = 1e30;
-  int bestPrio = 99;
-  int pick = -1;
-
-  /* 四个候选分支，**按优先级**挑：δ = +cAbs 的正/反平面，然后才轮到 δ = -cAbs 的正/反平面。
-   *
-   * 【为什么不是"四个分支取残差最小"】两杆平面机构对同一个点本来就有两个镜像解
-   * （delta = +cAbs 与 -cAbs），在这个模型下两个都常常能落进 r/c 的 0~180 行程、
-   * 残差又都是 0，于是"取残差最小"会靠浮点尾数随机挑一个 —— 同一条直线上相邻
-   * 采样点来回换分支，关节角一次跳 60~80 度，取放/绘图的"段内不许换分支"校验必然
-   * 失败（修复前的固件里 c 就是 delta、且受 c ∈ [0,180] 限制，等效于只允许 +cAbs
-   * 这一族，所以历史上没有暴露过）。
-   *
-   * 【为什么还要保留 -cAbs 这一族】有些点只有镜像解落在行程里：只留 +cAbs 时
-   * probe_rt 的往返验证会多出 13% 的"反解 false"（2028 组里 273 组），绘图的
-   * 轨迹校验也会被这些点整条否掉。所以策略是"**优先级**"而不是"只留一族"：
-   * 先取 +cAbs 一族（与修复前逐位一致，保证段内不跳），只有它一个都不合格时才
-   * 退到 -cAbs（保证仍然解得出来）。同一族里正/反平面取残差小的。
-   * 注意候选必须自己满足 err <= 0.05 才算合格，否则"在行程内但解是错的"会被选中。 */
-  for (int i = 0; i < 4; i++) {
-    const bool reversePlane = (i & 1) != 0;
-    const bool plusFamily   = (i < 2);
-    const double rhoP  = reversePlane ? -rho : rho;
-    const double delta = plusFamily ? cAbs : -cAbs;
-    const int    prio  = plusFamily ? 0 : 1;
-    const double b = reversePlane ? bRev : bFwd;
-
-    /* 舵机 b 硬限位 0~180 */
-    if (b < minB - EPS || b > maxB + EPS) {
-#ifdef WEARM_IK_TRACE
-      Serial.print(F("[ik] cand ")); Serial.print(i); Serial.println(F(" reject: b out of travel"));
-#endif
-      continue;
-    }
-
-    double beta, err;
-    ikBranch(rhoP, zv, delta, L1, L2, &beta, &err);
-
-    /* 平面几何角 -> 舵机角（正解 recFromServo 的逆）：
-     *   alpha = 90 - r   =>   r = 90 - alpha   （alpha = beta + delta）
-     *   beta  = c - 90   =>   c = beta + 90                          */
-    const double alphaDeg = RADtoDEG * (beta + delta);
-    const double betaDeg  = RADtoDEG * beta;
-    double rDeg = 90.0 - alphaDeg;
-    double cDeg = betaDeg + 90.0;
-
-    /* 【为什么要把 r/c 折回基本区间】alpha - beta 是两杆的几何夹角，正解里周期是
-     * 360°，而本模型的 alpha - beta = 180 - r - c 取值跨到 [-180, 180] 这一侧。
-     * atan2/asin 分支给出的 betaDeg 可能落到 [0,360) 之外（例如 betaDeg = +180
-     * => cDeg = 270，或 betaDeg = -180 => cDeg = -90），它们与折回后的值对应同一
-     * 个位姿；不折回来就会有一个分支被 0~180 的行程判据直接否掉（r 同理，可能是
-     * 360 的整数倍偏移）。normRevAngle() 会把贴 360 的值折回 0、把负值折进
-     * [0,360)。 */
-    rDeg = normRevAngle(rDeg);
-    cDeg = normRevAngle(cDeg);
-
-#ifdef WEARM_IK_TRACE
-    Serial.print(F("[ik] cand ")); Serial.print(i);
-    Serial.print(F(" b=")); Serial.print(b, 6);
-    Serial.print(F(" rhoP=")); Serial.print(rhoP, 9);
-    Serial.print(F(" delta=")); Serial.print(delta, 12);
-    Serial.print(F(" betaDeg=")); Serial.print(betaDeg, 6);
-    Serial.print(F(" rDeg=")); Serial.print(rDeg, 6);
-    Serial.print(F(" cDeg=")); Serial.print(cDeg, 6);
-    Serial.print(F(" err=")); Serial.println(err, 12);
-#endif
-
-    /* 舵机 r、c 硬限位 0~180 */
-    if (!(rDeg >= minR - EPS && rDeg <= maxR + EPS)) {
-#ifdef WEARM_IK_TRACE
-      Serial.println(F("[ik] reject: r out of travel"));
-#endif
-      continue;
-    }
-    if (!(cDeg >= minC - EPS && cDeg <= maxC + EPS)) {
-#ifdef WEARM_IK_TRACE
-      Serial.println(F("[ik] reject: c out of travel"));
-#endif
-      continue;
-    }
-    if (!isFiniteNum(err)) {
-#ifdef WEARM_IK_TRACE
-      Serial.println(F("[ik] reject: err not finite"));
-#endif
-      continue;
-    }
-    if (!(err <= 0.05)) {
-#ifdef WEARM_IK_TRACE
-      Serial.println(F("[ik] reject: err too big"));
-#endif
-      continue;
-    }
-
-    if (pick < 0 || prio < bestPrio ||
-        (prio == bestPrio && err < bestErr)) {
-      pick = i; bestPrio = prio; bestErr = err;
-      bestB = b; bestR = rDeg; bestC = cDeg;
-    }
-  }
-
-  if (pick < 0) {
-    WEARM_LOG("[kin] reject: no planar branch fits the joint travel");
+  /* 回代核对：行程夹取可能让实际到达点偏离目标。判据照抄参照仓库
+   * （`Task5_LineN2_TeachSmooth.ino:237-239`）：**只查水平 x/y**，不看 z。
+   * 这样行为与参照逐点等价（z 会被夹取推偏而 x/y 正常的点参照也接受）；
+   * 但 z 偏差大时留一条日志，方便上机时看出"解在水平上成立、竖直上偷了懒"。 */
+  const double vTheta = (nb - 90.0) / RADtoDEG;
+  const double vAlpha = (180.0 - nr) / RADtoDEG;
+  const double vBeta  = nc / RADtoDEG;
+  double vRh = 0.0, vZ = 0.0;
+  fkPlanar(vAlpha, vBeta, &vRh, &vZ);
+  const double vx = -vRh * sin(vTheta);
+  const double vy =  vRh * cos(vTheta);
+  const double dx = vx - x;
+  const double dy = vy - y;
+  const double dz = vZ - pos1->rec.z;
+  if (sqrt(dx * dx + dy * dy) > 5.0) {
+    WEARM_LOG("[kin] reject: residual too large after clamping");
     return false;
   }
-
-  /* 正解回代自检 */
-  if (!(bestErr <= 0.05)) {
-    WEARM_LOG("[kin] reject: residual too large, no valid solution");
-    return false;
+  if (dz > 5.0 || dz < -5.0) {
+    WEARM_LOG("[kin] note: accepted with large vertical offset after clamping");
   }
 
-  /* 【本函数契约：返回 false 时不修改 pos1->ser】走到这里说明 b/r/c 已经有解，
-   * 下面一次性写回（bestB/bestR/bestC 是候选循环里挑出的那一组）。
-   * angle4(f) 不由反解决定，保持调用前已有的值不动。
-   * f 的 60~150 硬限位与"越限就吸附/拒绝"的策略已按需求删除（见
-   * constant_and_positions.h 的 TOOL_ANGLE_*），所以这里不再碰 angle4，
-   * *clamped 也保持函数开头设的 false。 */
-  pos1->ser.angle1 = bestB;
-  pos1->ser.angle2 = bestR;
-  pos1->ser.angle3 = bestC;
-
+  /* 【本函数契约：返回 false 时不修改 pos1->ser】到这里 b/r/c 已确认，
+   * 一次性写回；angle4(f) 不由反解决定，保持调用前已有的值不动。 */
+  pos1->ser.angle1 = nb;
+  pos1->ser.angle2 = nr;
+  pos1->ser.angle3 = nc;
   return true;
 }
 
@@ -2190,7 +2166,9 @@ void posInit(void) {
 
 /* 取"开机初始位姿"对应的关节角，写给按键4 回中用。
  * 【本版本已删除 clampToRange() 调用】：坐标范围限制已整体移除，
- * POS_HOME 直接反解即可（它在可达外边界上，属于闭区间内，能解出 90/90/90）。 */
+ * POS_HOME (0,80,118) 直接反解即可 —— 它的 d = √(80² + 80²) ≈ 113.1mm，
+ * 离可达外边界 159mm 还远，能精确解出 90/90/90（旧版 POS_HOME (40,0,0) 是
+ * 真的贴在 ρ = L1+L2 = 40 边界上，那一版才需要额外说明）。 */
 bool posGetHomeAngles(SER *ser) {
   if (ser == NULL) return false;
 
@@ -2301,9 +2279,10 @@ int protoAxisIndexFromChar(int c)
 //
 // 统一流程（每一步都保证 Pos.ser 与 Pos.rec 严格自洽）:
 //   在副本 next = Pos.ser 上试探性把目标关节角加减 stepSize 度
-//   -> b/r/c 三轴硬编码夹到 0~180：夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
+//   -> b/r/c 三轴夹到各自的行程窗口（KIN_*：b 0~180、r 45~160、c 30~110）：
+//      夹完与当前 Pos.ser 相同 => 已到行程尽头 => MOVE_AT_LIMIT
 //   -> recFromServo() 用新角度算出真实坐标
-//   -> 坐标一越出 limit（"工作空间盒子"）=> 也算 MOVE_AT_LIMIT
+//   -> 坐标一越出 limit（"工作空间盒子" x/y ±160、z -100~+300）=> 也算 MOVE_AT_LIMIT
 //      （角度模式下坐标是派生量，所以这不是"不可达"，而是"这个方向到头了"，
 //        摇杆表现为推到头了）
 //   -> 全部通过才一次性提交 Pos.ser / Pos.rec，返回 MOVE_OK
@@ -2313,9 +2292,9 @@ int protoAxisIndexFromChar(int c)
 //
 // 【本版本恢复】笛卡尔坐标范围检查（posOutOfRange，只读 limit 盒子）。它只管
 // 关节步进这一条路；取放/绘图的坐标采样点由 path_core.h 的 pathCorePointOk()
-// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的 0~180
-// 物理行程在 moveJointStep() 内部直接硬编码；angle4（f）由 posSetAngle4()
-// 单独处理，不走本路径。
+// 把关。可配置的关节限位（clampServoAngles）仍然是删除状态：b/r/c 的行程窗口
+// （KIN_*：0~180 / 45~160 / 30~110）在 moveJointStep() 内部直接硬编码；
+// angle4（f）由 posSetAngle4() 单独处理，不走本路径。
 //
 
 /* ---------- 内部: 方向码 -> 目标关节 / 步进符号 ---------- */
@@ -2356,18 +2335,19 @@ static bool samePose(const SER *a, const SER *b) {
   return true;
 }
 
-/* b/r/c 三轴硬编码 0~180 的物理行程夹取。
- * 【为什么不用 clampServoAngles()】该函数随 servoLimit 结构体一起被删除了；
- * 现在 b/r/c 三轴的行程全部硬编码为舵机的物理 0~180，所以这里直接写死。
- * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，硬编码 0~180 的
- * 舵机电气行程。 */
+/* b/r/c 三轴的**机械行程**夹取。
+ * 【v1.6.7 运动逻辑替换】行程不再是三轴统一的 0~180，而是参照仓库最新版的
+ * 实机标定值：b 0~180、r 45~160、c 30~110（见 constant_and_positions.h 的
+ * KIN_* 宏）。超出窗口会撞结构（上臂放平、前臂反折），所以这里按宏夹取。
+ * angle4（f）不走这条路径，它由 posSetAngle4() 单独处理，用舵机电气行程
+ * TOOL_ANGLE_MIN..MAX(0~180)。 */
 static void clampBCR(SER *s) {
-  if (s->angle1 < 0.0)   s->angle1 = 0.0;
-  if (s->angle1 > 180.0) s->angle1 = 180.0;
-  if (s->angle2 < 0.0)   s->angle2 = 0.0;
-  if (s->angle2 > 180.0) s->angle2 = 180.0;
-  if (s->angle3 < 0.0)   s->angle3 = 0.0;
-  if (s->angle3 > 180.0) s->angle3 = 180.0;
+  if (s->angle1 < KIN_BASE_MIN) s->angle1 = KIN_BASE_MIN;
+  if (s->angle1 > KIN_BASE_MAX) s->angle1 = KIN_BASE_MAX;
+  if (s->angle2 < KIN_RARM_MIN) s->angle2 = KIN_RARM_MIN;
+  if (s->angle2 > KIN_RARM_MAX) s->angle2 = KIN_RARM_MAX;
+  if (s->angle3 < KIN_FARM_MIN) s->angle3 = KIN_FARM_MIN;
+  if (s->angle3 > KIN_FARM_MAX) s->angle3 = KIN_FARM_MAX;
 }
 
 /* 坐标是否越出 limit（"工作空间盒子"，只读判断，不改动 Pos）。
@@ -2408,7 +2388,7 @@ int moveJointStep(int dir, double stepSize) {
   if (code & 1) step = -step;
   *ap += step;
 
-  /* 2) 关节硬限位：b/r/c 三轴硬编码 0~180（最终防线）。
+  /* 2) 关节硬限位：b/r/c 夹到各自行程窗口（KIN_*：0~180 / 45~160 / 30~110，最终防线）。
    *    夹完三个姿态角都等于原值 => 已到机械行程尽头。
    *    注意只比较 b/r/c：angle4 由末端专用接口控制，不走这条路径。
    *    直接返回即等价于原来的整步回退（Pos 未被改动）。 */
@@ -3055,11 +3035,13 @@ void joystickLoop(void) {
  * pick_place.cpp -- 物体 A / B / C 的自动取放序列（实现）
  *
  * 上位机发单字母 A / B / C，本模块用一条非阻塞状态机走完整套动作。
- * 【本条路径是按用户口径重写的】以物体高度为基准，1 工作区单位 = 4 mm
- * （上臂/下臂各 20 单位 = 80 mm），所以 5 cm = 12.5 单位、2 cm = 5.0 单位：
+ * 【v1.6.7 运动模型换成参照仓库最新版后，本条路径已按新尺度重新标定】
+ * 坐标与轴向约定见 constant_and_positions.h：x/y/z 的单位就是 mm，
+ * z = 0 是**底盘顶面**（肩轴在 z = +38），两节各 80 mm。
+ * 所以用户口径的 5cm / 2cm / 1cm 就是 50 / 20 / 10 mm：
  *
- *   RISE_SRC      先上移到「物体高度 + 5cm」（垂直上升，x/y 不动）
- *   TO_BEHIND     沿水平方向移到「物体后方 2cm」（与物体同半径方向后退）
+ *   RISE_SRC      先上移到「物体高度 + 50 mm」（垂直上升，x/y 不动）
+ *   TO_BEHIND     沿水平方向移到「物体后方 20 mm」（与物体同半径方向后退）
  *   DESCEND_SRC   垂直下降到与物体同高
  *   REACH_IN      沿水平半径方向「向前 2cm」，把物体送进两爪之间
  *   CLOSE_TOOL    夹爪快速合拢到名义合拢角 TOOL_ANGLE_CLOSE(60)
@@ -3083,23 +3065,34 @@ void joystickLoop(void) {
  * 【轴向】夹爪是沿基座的水平半径方向伸出去的，所以"后方 / 向前"都取半径方向
  * （见 pickBehindPoint），而不是固定 ±x：物体 y 分量较大时两者的方向差很多。
  *
- * 【物体高度范围】-10cm ~ +10cm（对称于 z = 0，即 PICK_HEIGHT_MIN/MAX = ±25 单位）。
- * 物体越高，可行的水平半径越窄（末端到肩的距离 sqrt(rho² + z²) ≤ 40，而且
- * alpha = 90-r、beta = c-90 都必须落在 [-90,90]）：z = ±25（±10cm）时 rho 只能取
- * 19.4~31.2，z = 0 时 rho 可以取 0~40。所以"物体高度 + 5cm"这个理想飞行高度，
- * 在物体又高又远时会整个落出可达包络（比如 +10cm 的物体自身要求 rho ≥ 19.4，
- * 而它上方 5cm 只允许 rho ≤ 13.9，两者没有交集）。planTravelZ() 于是按
+ * 【物体高度范围】PICK_HEIGHT_MIN/MAX = -18 / +171 mm —— 这是**固件反解接受的
+ * 竖直带**（从**底盘顶面**量，与 `constant_and_positions.cpp` 的 `limit` 一致；
+ * 注意它比"路径校验真会接受的最低平面"松：pathCorePointOk() 还要求角度不被钳制，
+ * 实测 z = -16 及更低一个点都过不了、z = -14 只有 rho 66~85，见 `.selfcheck/drawcheck.cpp` 的表）。
+ * 两端都不是臂长的几何极限，而是**关节行程**决定的，比几何距离紧得多：
+ *   · 肩 → 腕的距离由前臂角唯一决定，d² = L2²+L3²-2·L2·L3·cos(c)，
+ *     c ∈ [30,110] ⇒ **d ∈ [41.4, 131.1] mm**（几何上两节各 80 能到 159，
+ *     但 d = 159 要 c ≈ 166°，超出窗口）；
+ *   · α = 180° - r、r ∈ [45,160] ⇒ α ∈ [20°,135°]，上臂压不到水平线以下，
+ *     所以**末端最低只能到 z ≈ -15 mm**（想要 -100mm 得上臂压过水平线，做不到）；
+ *   · 基座 θ = b - 90 只有 ±90°，可达半空间是 **y ≥ 0**（x 可正可负）。
+ * 所以窗口外的 z 永远无解 —— 是关节行程限制，不是软件限制。物体越高，可用的
+ * 水平半径越窄（z = 100 时 rho ≤ 118，z = 150 时 rho ≤ 62）。"物体高度 + 5cm"
+ * 这个理想飞行高度在物体又高又远时会整个落出包络。planTravelZ() 于是按
  * PICK_TRAVEL_STEP 逐档降低飞行高度，直到整条路径都成立，最低不低于
- * "最高物体 + 1cm"。也就是说物体摆得很高时抬升量会自动变小，但序列仍然能正常
- * 取放（探针 [2] 会断言实际飞行高度落在 [最高+1cm, 最高+5cm] 内并打印出来）。
+ * "最高物体 + PICK_CLEAR_DZ(1cm)"。
+ * 也就是说物体摆得很高时抬升量会自动变小，但序列仍然能正常取放。
  *
  * 启动前把整条路径采样校验一遍（在 limit 内、isReachable()、反解没被吸附、
  * 相邻采样点的反解分支不跳变），任何一条不满足就拒绝启动、一个字节都不改。
  * 校验的采样步长是 PICK_PATH_SAMPLE_STEP，也就是"校验过的点"比实际插值点还密。
  *
  * 【位置表可以随便改】见下面的 PICK_SRC / PICK_DST：三个物体的初始位置互不相同，
- * 三个放置位置也互不相同；且每个物体放置点相对初始点在 x 与 y 上都有明显位移。
- * 改高度时只要落在 ±25 单位（±10cm）以内就不会被 -4 拒绝。
+ * 三个放置位置也互不相同；且每个物体放置点相对初始点都有明显位移。
+ * 改表时的硬约束：(i) y ≥ 0（可达半空间）；(ii) 每个采样点的 d ∈ [41.4, 131.1]；
+ * (iii) z 落在 PICK_HEIGHT_MIN/MAX（-18 ~ +171，实测可达带）里，否则被 -4 拒绝。
+ * 改完务必用 `.selfcheck\picktable_search.cpp`（判据与 pickPlaceStart 完全一致）
+ * 与 `.selfcheck\picktable_run.cpp`（真状态机跑一遍）各验一次，不要凭肉眼看"能解"。
  */
 
 
@@ -3107,14 +3100,21 @@ void joystickLoop(void) {
 #if WEARM_ENABLE_PICK_PLACE
 /* ==================== 可自定义的位置与参数 ==================== */
 
-/* 尺度换算：1 工作区单位 = 4 mm（arm1 = {20, 20, 0}，两节各 80 mm）。
- * 用户口径的 5cm / 2cm / 10cm 在这里换成工作区单位。 */
-#define PICK_LIFT_DZ      12.5   /* 5 cm：物体上方的接近/撤离高度（理想飞行高度） */
-#define PICK_CLEAR_DZ      2.5   /* 1 cm：飞行高度的下限，再低就会蹭到物体 */
-#define PICK_BACK_DZ       5.0   /* 2 cm：物体"后方"的水平退让距离 */
-#define PICK_TRAVEL_STEP   1.0   /* 0.25 cm：飞行高度逐档下降的步长 */
-#define PICK_HEIGHT_MIN  (-25.0) /* -10 cm：物体放置高度下限 */
-#define PICK_HEIGHT_MAX  ( 25.0) /* +10 cm：物体放置高度上限 */
+/* 尺度换算：本文件的坐标就是 mm（新运动模型，见 constant_and_positions.h）。
+ * 旧版本里 1 工作区单位 = 4 mm，所以下面这些量都是"旧值 × 4"，
+ * 唯独 z 不是：新模型的 z = 0 是**底盘顶面**、肩轴在 +38，换算 x' = 4x、
+ * y' = 4y、z' = 38 + 4z。 */
+#define PICK_LIFT_DZ      50.0   /* 5 cm：物体上方的接近/撤离高度（理想飞行高度） */
+#define PICK_CLEAR_DZ     10.0   /* 1 cm：飞行高度的下限，再低就会蹭到物体 */
+#define PICK_BACK_DZ      20.0   /* 2 cm：物体"后方"的水平退让距离 */
+#define PICK_TRAVEL_STEP   5.0   /* 0.5 cm：飞行高度逐档下降的步长 */
+/* 物体高度窗口（自底盘顶面量）。这两个值取的是**反解接受**的竖直带
+ * [-18, +171]（实测边界 [-18.5, +171.5] 各留 0.5mm 余量）；但路径校验
+ * pathCorePointOk() 还要求解出的角度不被行程钳制，实测 z = -16 及更低
+ * 一个点都过不了、z = -14 只有 rho 66~85，所以 -18 只是"物体高度合法"
+ * 的口径，不是"任何水平位置都能去" —— 本表的点因此都在 z ≥ +20。 */
+#define PICK_HEIGHT_MIN ( -18.0)
+#define PICK_HEIGHT_MAX ( 171.0) /* 几何极限 +198，但行程到不了，实测到 +171.5 */
 
 struct pickPoint {
   double x;
@@ -3124,43 +3124,49 @@ struct pickPoint {
 
 /* Both tables below are read-only, so they live in flash (PROGMEM) to keep
  * 72 bytes out of RAM; every read goes through pgm_read_float(). */
-/* 物体初始位置（= 夹取点）。三个位置互不相同，高度分别是 -5cm / 0 / +5cm。
+/* 物体初始位置（= 夹取点）。三个位置互不相同，高度分别是 +20 / +60 / +100 mm
+ * （台面上 2cm / 4cm 高的垫块 6cm / 8cm 高的垫块，与旧表 -20/0/+20 旧单位 = 80mm
+ * 的高度差一致）。
  *
- * 【可达性】两节各 20 单位，末端到肩的距离 ≤ 40 单位，所以在高度 z 上可用的
- * 水平半径 rho 是一条带子：
- *     x_max(z) = sqrt(1600 - z*z)              （两节一起往外伸的极限）
- *     x_min(z) = 20*sqrt(1 - (|z|/20 - 1)^2)   （上臂竖直、小臂水平折回来的极限）
- * 反解要求 alpha = 90-r、beta = c-90 都落在 [-90,90]，这正是这两条边界。
- * 举例：z=0 时 rho 可以是 0~40；z=±20（±5cm）时 rho 必须在 20~34.6；
- * z=±25（±10cm）时必须落在 19.4~31.2。改表里的 z 时先过一遍这个判据，
- * 否则会被 pickPlaceStart() 以 -4 拒绝（探针 [2] 会把它指出来）。
+ * 【真实可达集比 d ≤ 159 小得多】末端到肩轴的距离由前臂角 c 唯一决定：
+ *     d² = L2² + L3² - 2·L2·L3·cos(c),   c ∈ [KIN_FARM_MIN, KIN_FARM_MAX] = [30,110]
+ * 代入 L2 = L3 = 80 得 **d ∈ [41.4, 131.1] mm**（d = 159 要 c ≈ 166°，
+ * 早就超出行程窗口，getAngleEx() 会钳到 110° 再因回代残差过大而拒绝）。
+ * 另一个方向同样被行程卡住：r ∈ [45,160] ⇒ α = 180° - r ∈ [20°,135°]，
+ * 上臂永远不可能压到水平线以下，所以**末端的物理最低点是 z ≈ -15 mm**
+ * （α = 20°、c = 70° 时），再往下无论多近都无解 —— 台面下的物体够不到。
  *
- * 【飞行高度】理想是"物体高度 + 5cm"，但末端到肩的距离要不超 40：
- * 物体越高、半径越大，这个高度就越做不到。planTravelZ() 会逐档降低，
- * 最低不低于"最高物体 + 1cm"。表里 C 在 +5cm / rho=26，飞行高度只能到 29.5
- * （抬升 2.4cm），就是这条规则在生效。 */
+ * 因此本表的点都在 z ≥ +20，并用 `.selfcheck\picktable_search.cpp` 按
+ * pickPlaceStart() 的**全部**判据（点校验 + planTravelZ 七点阶梯 +
+ * 7 段直线采样）重新选过，`D:\dsh1\meArm\.selfcheck\picktable_run.cpp`
+ * 再用固件本体跑了一遍完整序列。
+ *
+ * 【与旧表的对应关系】旧表是 {24,16,-20} / {24,-12,0} / {26,0,20}（旧单位，
+ * 旧固件的可达半空间是 x≥0），本表把它绕基座轴**刚体旋转 90°** 后按新可达集
+ * 收紧：新 x = 4×旧 y（侧向）、新 y = 4×旧 x（前方）、新 z 另选（见上）。
+ * 注意这与 `.selfcheck\kin_audit_legacy_sites.md` 里那张"逐点 4×|y|"的换算表
+ * 不同：那张表会把 y 的符号压掉，而且 z = -42 在新模型下根本无解。
+ *
+ * 【飞行高度】理想是"物体高度 + PICK_LIFT_DZ(5cm)"，但越高可达的水平半径越小
+ * （z = 150 时 rho 只能到 6~62）。planTravelZ() 按 5mm 逐档降低，最低不低于
+ * "最高物体 + 1cm"。实测本表的三档飞行高度：A 70、B 110、C 115（C 只抬 15mm，
+ * 就是这条规则在生效）。 */
 static const struct pickPoint PICK_SRC[PICK_OBJECT_COUNT] PROGMEM = {
-  { 24.0,  16.0, -20.0 },   /* A：右侧偏前，低处（-5cm），水平半径 28.8 */
-  { 24.0, -12.0,   0.0 },   /* B：右侧偏后，肩高（0），水平半径 26.8 */
-  { 26.0,   0.0,  20.0 }    /* C：正前方，高处（+5cm），水平半径 26.0 */
+  {  69.0,  58.0,  20.0 },   /* A：侧向 +6.9cm、前方 5.8cm，低处（+20） */
+  { -69.0,  58.0,  60.0 },   /* B：侧向 -6.9cm、前方 5.8cm，中处（+60） */
+  {   0.0, 105.0, 100.0 },   /* C：正前方 10.5cm，高处（+100） */
 };
 
-/* 放置位置。逐条的位移（探针要求 x、y 都有明显位移，门限 5.0）：
- *   A: Δx = 15.0 - 24.0 =  -9.0    Δy = -18.0 - 16.0 = -34.0
- *   B: Δx = 18.0 - 24.0 =  -6.0    Δy =  16.0 - (-12.0) = +28.0
- *   C: Δx = 20.0 - 26.0 =  -6.0    Δy = -16.0 -   0.0  = -16.0
- * 三个放置点两两之间的距离：A-B 34.1、A-C 5.4、B-C 32.1。
- * 还有一条约束（探针 [1] 会断言，门限 5.0）：放置点离**别人**的初始位置不能太近，
- * 否则给某个物体放件时会蹭到还在地上的另一个物体。实测最近的几对：
- *   A 放 (15,-18) 对 C 初始 (26,0)  = √445 ≈ 21.10
- *   B 放 (18,16)  对 A 初始 (24,16) = 6.00          ← 全局最近
- *   B 放 (18,16)  对 C 初始 (26,0)  = √320 ≈ 17.89
- *   C 放 (20,-16) 对 B 初始 (24,-12) = √32 ≈ 5.66
- * 都大于门限 5.0。 */
+/* 放置位置。三个放置点都在更靠近基座的弧线上、且各自偏离 +y 轴，
+ * 免得给某个物体放件时蹭到还立在原地的另一个物体（C 立在 (0,105)）：
+ *   A: 从 ( 69, 58) 到 ( 36, 77)，水平位移 38.1，距 C 初始点 45.5
+ *   B: 从 (-69, 58) 到 (-36, 77)，水平位移 38.1，距 C 初始点 45.5
+ *   C: 从 (  0,105) 到 (  0, 75)，水平位移 30.0，距 A/B 放置点各 36.4
+ * 放置点两两之间：A-B 72.0、A-C 36.4、B-C 36.4。 */
 static const struct pickPoint PICK_DST[PICK_OBJECT_COUNT] PROGMEM = {
-  { 15.0, -18.0, -20.0 },   /* A 放这里，水平半径 23.4 */
-  { 18.0,  16.0,   0.0 },   /* B 放这里，水平半径 24.1 */
-  { 20.0, -16.0,  20.0 }    /* C 放这里，水平半径 25.6 */
+  {  36.0,  77.0,  20.0 },   /* A 放这里（侧向 +3.6cm、前方 7.7cm） */
+  { -36.0,  77.0,  60.0 },   /* B 放这里（侧向 -3.6cm、前方 7.7cm） */
+  {   0.0,  75.0, 100.0 }    /* C 放这里（正前方 7.5cm） */
 };
 
 static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
@@ -3186,10 +3192,10 @@ static const char PICK_LETTER[PICK_OBJECT_COUNT] = { 'A', 'B', 'C' };
 #define PICK_MIN_SEG_MS 180
 #define PICK_MAX_SEG_MS 4000
 
-/* 路径校验：采样步长（工作区单位）、单段最多采样点数、
+/* 路径校验：采样步长（mm）、单段最多采样点数、
  * 以及"相邻采样点关节角跳这么多就认为是反解换了分支"的门限 */
-#define PICK_PATH_SAMPLE_STEP 0.5
-#define PICK_PATH_SAMPLE_MAX  64
+#define PICK_PATH_SAMPLE_STEP 2.0
+#define PICK_PATH_SAMPLE_MAX  160
 #define PICK_BRANCH_JUMP_DEG  25.0
 
 /* 启动时允许"手里的关节角"与"当前坐标的反解角"差多少度。
@@ -3263,10 +3269,11 @@ static double s_travelZ = 0.0;
 /* 首段（PICK_ST_RISE_SRC）的终点选哪一处：
  *   0 = "起点正上方"（当前 x/y + 飞行高度），常规情况；
  *   1 = "物体正上方"（物体 x/y + 飞行高度），起点正上方在飞行高度上无解时用。
- * 后者出现在"起点完全伸直"的姿态上 —— 上电初始位姿 (b,r,c)=(90,90,90) 对应
- * (40,0,0)，rho 已取到最大值 L1+L2=40，而 rho=40 只在 z=0 成立，所以任何抬升
- * 都无解。此时直接关节插值到物体上方（实测末端全程不低于飞行高度，不会蹭到
- * 物体顶面），再接原有的"水平移到物体后方"等后续段。由 planTravelZ() 写入。 */
+ * 后者出现在"起点正上方在飞行高度上无解"的姿态上 —— 物体自己越高、半径越大，
+ * 它上方 50 mm 处就越可能捅出可达包络（d = sqrt(rho² + (z-38)²) ≤ 131.1 才可解，
+ * 见文件头）：例如物体在 z = 100 / rho = 105，上方的 150 对应 d = 152，直接无解。
+ * 此时直接关节插值到物体上方（实测末端全程不低于飞行高度，不会蹭到物体顶面），
+ * 再接原有的"水平移到物体后方"等后续段。由 planTravelZ() 写入。 */
 static bool s_riseAtSrc = false;
 
 /* ==================== 小工具 ==================== */
@@ -3347,9 +3354,11 @@ durationMs(double degrees, double rateDps) {
 
 /* 找一个能让整条路径都成立的"飞行高度"（水平平移时保持的 z）。
  *
- * 理想值 = 最高物体 + PICK_LIFT_DZ(5cm)。但两节各 20 单位，末端到肩的距离
- * sqrt(rho² + z²) ≤ 40，物体越高可达的水平半径越小：+10cm（z=+25）的物体，
- * 5cm 的飞行高度要求 rho ≤ 13.9 单位，绝大多数取放点都做不到。这时按
+ * 理想值 = 最高物体 + PICK_LIFT_DZ(5cm)。但可达包络是
+ * d = sqrt(rho² + (z-38)²) ≤ 131.1（关节行程限度，见文件头），物体越高
+ * 可达的水平半径越小：z = 100 的点，抬高 50mm 到 150 就只剩 rho ≤ 62，
+ * z = 150 以上更窄；本表里的 C（z=100 / rho=105）抬到 150 时 d = 152，
+ * 直接无解，所以只能抬到 115。这时按
  * PICK_TRAVEL_STEP 逐档降低飞行高度，直到下面七个关键点全部可解：
  *     起点正上方(不可达时改"物体正上方") / 物体后方(飞行高度) /
  *     物体正上方(飞行高度) / 目标点正上方 / 物体后方(物体同高) /
@@ -3643,11 +3652,11 @@ int pickPlaceStart(int object) {
   loadPickPoint(&PICK_DST[object], dst);
   pickBehindPoint(src, behind);
 
-  /* 0) 物体高度必须落在 -10cm ~ +10cm 里 */
+  /* 0) 物体高度必须落在 PICK_HEIGHT_MIN/MAX（实测可达带 -18 ~ +171 mm）里 */
   if (src[2] < PICK_HEIGHT_MIN || src[2] > PICK_HEIGHT_MAX ||
       dst[2] < PICK_HEIGHT_MIN || dst[2] > PICK_HEIGHT_MAX) {
 #if WEARM_DEBUG_SERIAL
-    Serial.println(F("[pick] rejected: object height outside -10cm..+10cm"));
+    Serial.println(F("[pick] rejected: object height outside PICK_HEIGHT_MIN..MAX"));
 #endif
     return -4;
   }
@@ -3880,12 +3889,16 @@ bool pickPlacePlanZ(int object, double *z) {
  *
  * 【精细化插值（本分支）】
  *   上面算出的 step 送去执行前先过一道上限：单次写入的位移不超过
- *   DRAW_STEP_MAX（0.02 工作区单位）。配合放慢后的速度（3 单位/秒、加减速 6、
+ *   DRAW_STEP_MAX（0.08 mm）。配合放慢后的速度（12 mm/秒、加减速 24、
  *   关节上限 70°/s），笔尖的轨迹由几百个密排的点组成，舵机每步只动零点几度，
  *   看上去是"缓慢匀速滑过去"，顶点附近也不会甩过冲。
- *   正常 loop 周期（1~5 ms）下算出来的 step 只有 0.003~0.015 单位，上限不生效；
+ *   正常 loop 周期（1~5 ms）下算出来的 step 只有 0.012~0.06 mm，上限不生效；
  *   只有 loop 被拖长的那一轮才限住（少走一点，剩下的下一轮补），宁慢不跳。
- *   路径校验的采样步长也同步从 0.5 收紧到 0.25。
+ *   路径校验的采样步长也同步收紧到 1.0 mm。
+ *
+ *   【v1.6.7 单位换算】运动模型换成参照仓库最新版后，x/y/z 的单位就是 mm
+ *   （旧版是"1 工作区单位 = 4mm"），所以本文件里所有位移、速度、加速度、容差
+ *   都按 ×4 换算过；角度量本来就用度，不变。
  *
  * 【示教点动】
  *   示教模式下摇杆由本模块自己读（joystickReadState），推动改变的是笔尖 x/y/z
@@ -3907,38 +3920,54 @@ bool pickPlacePlanZ(int object, double *z) {
 
 /* --- 纸面几何（上机标定用，也可以随时发串口命令 p/n/o 改） --- */
 /* 纸面高度：铅笔尖刚好落在纸上时的 Pos.rec.z。
- * 初始位姿末端是 (40,0,0)（两节水平朝前、完全伸直），纸面在肩轴**下方**
- * （z < 0）才可能被笔尖碰到。默认取 -20（肩轴下方 20 单位 ≈ 80 mm 的台面）。
- * 上机可用 p<z> 随时重标（注意新模型下 x 越小、可达的竖向深度越浅，纸面别离肩轴太近）。 */
-#define DRAW_PEN_Z_DEFAULT    -20.0
-#define DRAW_CENTER_X_DEFAULT 27.0   /* 内置图形的中心 x */
-#define DRAW_CENTER_Y_DEFAULT  0.0   /* 内置图形的中心 y */
-#define DRAW_HALF_DEFAULT      6.0   /* 内置图形的半宽（顶点落在 ±半宽 的正方形里） */
+ * 【v1.6.7 新坐标】z = 0 是**底盘顶面**，肩轴在 +38，单位是 mm。
+ * 旧版这里是 -42（按"纸面在肩轴下方 80mm"算的 38-80），但新模型换的是实物
+ * 臂长（L2 = L3 = 80），**臂尖根本到不了 -42**：`pathCorePointOk()`（盒子 +
+ * 可达 + 反解不吸附，路径校验与点动都用它）实测各平面的可达 rho 区间是
+ *   z=-14: rho 66~85      z=-10: rho 49~102     z=-6: rho 40~111
+ *   z=-16 及更低: 一个点都没有（-18 是 IK 会接受、但必须靠关节角吸附才能表示
+ *                 的"撒谎"解，见 constant_and_positions.cpp 的 limit 注释）
+ *   z=0: rho 30~121       z=+38(肩高): rho 42~131
+ * 所以纸必须垫高到 z ≈ -6 ~ 0（垫块/书，用 `p<z>` 标定），默认取**能放进一个
+ * 50×50mm 图形的最低平面** -6：中心 (0,75)、半宽 25 时整块方形的 rho 落在
+ * 50~103，对可达区间 [40,111] 两侧还各留 10/8mm 余量。
+ * 纸垫得越高，能画的区域越大（z=+10 时同样中心能开到半宽 35）；半径越大，
+ * 可达的竖向深度越浅，所以 `n<半宽>` 不能一味加大。
+ * 上机标定：`p<z>`（例如 p0、p-6），带 `-DWEARM_DEBUG_SERIAL=1` 编译能看到
+ * "[draw] 笔尖停在 …" 的实测落点。★ 安全方向：先把值取得**偏高**（笔悬空）
+ * 再一点点往下试，值偏低是直接压进纸/台面。
+ * 整张"z → 可达 rho"表和候选配置矩阵由 `.selfcheck/drawcheck.cpp` 打印。 */
+#define DRAW_PEN_Z_DEFAULT    -6.0
+#define DRAW_CENTER_X_DEFAULT  0.0   /* 内置图形的中心 x（侧向） */
+#define DRAW_CENTER_Y_DEFAULT 75.0   /* 内置图形的中心 y（前方） */
+#define DRAW_HALF_DEFAULT     25.0   /* 内置图形的半宽 mm（顶点落在 ±半宽 的正方形里） */
 /* 【本版本删除】原来这里还有纸面高度的标定范围 DRAW_PEN_Z_MIN/MAX(-5~30)。
  * 纸面高度只影响落笔深度，标定成什么值都允许（不在工作空间内的点在启动时
  * 会被 pathCore 系列的路径校验拒掉），所以不再在这里硬卡范围。 */
-#define DRAW_HALF_MIN          2.0
-#define DRAW_HALF_MAX         12.0
-#define DRAW_CENTER_LIMIT     35.0   /* 中心允许的 |x|、|y| 上限（工作区单位） */
+#define DRAW_HALF_MIN          8.0
+#define DRAW_HALF_MAX         48.0
+#define DRAW_CENTER_LIMIT    140.0   /* 中心允许的 |x|、|y| 上限（mm） */
 
 /* 抬笔高度：不画图的移动都在 纸面 + 这个高度 上做。
  * 若该高度在工作空间外会自动降低（见 liftZFor），所以取得高一点没关系。 */
-#define DRAW_LIFT_DZ           4.0
+#define DRAW_LIFT_DZ          16.0
 
 /* --- 速度（本分支：整体放慢，见下） --- */
 /* 【本分支改了什么】把绘制运动调慢调细：
  *   线速度 8 -> 3 单位/秒、加速度 12 -> 6、关节角硬上限 110 -> 70°/s，
  *   并且每一轮最多只走 DRAW_STEP_MAX（见 pathTick）。
- *   于是每条轨迹都变成"很多个很小的位移点"，舵机是一小格一小格叠上去的。 */
-#define DRAW_V_MAX             3.0   /* 笔尖最大线速度（工作区单位/秒） */
-#define DRAW_ACCEL             6.0   /* 加减速度（单位/秒^2） */
+ *   于是每条轨迹都变成"很多个很小的位移点"，舵机是一小格一小格叠上去的。
+ * 【v1.6.7】位移量的单位由"工作区单位"（1 = 4mm）换成 mm，所以下面这些
+ * 位移/速度/加速度/容差都 ×4（角度量不变）。 */
+#define DRAW_V_MAX            12.0   /* 笔尖最大线速度（mm/秒） */
+#define DRAW_ACCEL            24.0   /* 加减速度（mm/秒^2） */
 #define DRAW_MAX_DPS          70.0   /* 关节角速度硬上限（度/秒） */
 #define DRAW_HOME_DPS         50.0   /* 回待机位的关节角速度（度/秒） */
 #define DRAW_JOG_MAX_DPS     200.0   /* 示教点动的关节角速度上限（度/秒，比自动绘制宽松：手动操作宁快勿卡） */
-/* 单次写入的最大位移（工作区单位）：一轮里要走的距离超过它就只走这么多，
+/* 单次写入的最大位移（mm）：一轮里要走的距离超过它就只走这么多，
  * 剩下的留给下一轮（正常 loop 周期下用不到它）。
- * 0.02 相当于"一条 12 单位的直线至少分 600 步"，关节角每步只动零点几度。 */
-#define DRAW_STEP_MAX          0.02
+ * 0.08 相当于"一条 48mm 的直线至少分 600 步"，关节角每步只动零点几度。 */
+#define DRAW_STEP_MAX          0.08
 
 /* --- 时间 --- */
 #define DRAW_TICK_MAX_MS      50UL   /* 单次推进最多认 50ms（串口打印卡顿保护） */
@@ -3946,22 +3975,22 @@ bool pickPlacePlanZ(int object, double *z) {
 #define DRAW_HOME_TOL_DEG      0.4   /* 回待机位的到位容差（度） */
 
 /* --- 轨迹校验（与 pick_place 同一套门限思想） --- */
-#define DRAW_PATH_SAMPLE_STEP  0.25  /* 轨迹校验的采样步长（本分支 0.5 -> 0.25，校验更细） */
-#define DRAW_PATH_SAMPLE_MAX  96
+#define DRAW_PATH_SAMPLE_STEP   1.0  /* 轨迹校验的采样步长 mm（v1.6.7：0.25 单位 × 4） */
+#define DRAW_PATH_SAMPLE_MAX  256
 #define DRAW_BRANCH_JUMP_DEG  25.0
 
 /* --- 示教 --- */
-#define DRAW_POINT_TOL         0.8   /* 过点判定容差（工作区单位） */
+#define DRAW_POINT_TOL         1.0   /* 过点判定容差（mm，原 0.8 单位 ≈ 3.2mm，收紧到 1mm） */
 #define DRAW_JOG_SCALE         0.5   /* 末端 f 的点动步长 = speed.stepSize × 这个系数（度） */
 #define DRAW_JOG_CENTER      512     /* 摇杆中位 ADC 值 */
 /* 【示教点动的坐标步长（本次修复）】
- * x/y/z 是"工作区单位"（0~40 左右），而 speed.stepSize 在手动模式里的含义是
+ * x/y/z 现在是 mm（工作空间 ±160 左右），而 speed.stepSize 在手动模式里的含义是
  * "每个控制周期转过的角度（度）" —— 直接拿它当位移用会让笔尖一格跳出半个工作区。
- * 所以这里单独给一套坐标步长：满偏时每格最多 DRAW_JOG_STEP_MAX 工作区单位，
- * 并按偏转比例缩小；配上 10~40ms 的步进间隔，满偏速度约 6 单位/秒
- * （比自动绘制的 DRAW_V_MAX 3 快一倍，手动点动够灵敏，但不会"一推就飞"）。 */
-#define DRAW_JOG_STEP_MAX      0.25  /* 满偏时每格位移（工作区单位） */
-#define DRAW_JOG_STEP_MIN      0.02  /* 轻微偏转时的每格位移下限（再小就点不动了） */
+ * 所以这里单独给一套坐标步长：满偏时每格最多 DRAW_JOG_STEP_MAX mm，
+ * 并按偏转比例缩小；配上 10~40ms 的步进间隔，满偏速度约 24 mm/秒
+ * （比自动绘制的 DRAW_V_MAX 12 快一倍，手动点动够灵敏，但不会"一推就飞"）。 */
+#define DRAW_JOG_STEP_MAX      1.0   /* 满偏时每格位移（mm） */
+#define DRAW_JOG_STEP_MIN      0.08  /* 轻微偏转时的每格位移下限（再小就点不动了） */
 /* 示教期间是否允许摇杆动末端夹爪：默认 0 = 不响应 A2。
  * 夹爪里夹着笔（或笔夹），示教时顺手推右摇杆很容易带开夹爪把笔顶歪/掉笔，
  * 而"点动"本身根本不需要它。要恢复旧行为把这里改成 1。 */
@@ -4297,7 +4326,7 @@ static double liftZFor(const double *pt)
   double z = pt[2] + DRAW_LIFT_DZ;
   while (z > pt[2]) {
     if (pointOk(pt[0], pt[1], z, NULL, NULL, NULL)) return z;
-    z -= 0.5;
+    z -= 2.0;                 /* v1.6.7：单位换成 mm，递减量 0.5 单位 -> 2mm */
   }
   return pt[2];
 }
@@ -4680,15 +4709,15 @@ static void pathTick(void)
   double step = v * s_dtSec;
   if (step > remain) step = remain;
 
-  /* 【精细化插值】这一轮最多只送出去 DRAW_STEP_MAX（0.02 工作区单位）的位移。
-   *   - 正常情况（loop 周期 1~5 ms、巡航 3 单位/秒）算出来的 step 只有
-   *     0.003~0.015 单位，**这个上限根本不会生效**，速度完全按梯形规划走。
+  /* 【精细化插值】这一轮最多只送出去 DRAW_STEP_MAX（0.08 mm）的位移。
+   *   - 正常情况（loop 周期 1~5 ms、巡航 12 mm/秒）算出来的 step 只有
+   *     0.012~0.06 mm，**这个上限根本不会生效**，速度完全按梯形规划走。
    *   - 只有当某一轮 loop 被拖长（串口打印、别的模块占时间）时才会限住，
    *     那一轮就少走一点、剩下的留给下一轮 —— 宁可慢，也不让舵机一次跳一大步。
    *   - 为什么不做"一轮里拆成多小步循环送出"：本工程用 LTO + -Os，
    *     把 pathAdvance() 放进循环里会让它无法被内联，实测同样功能要多花
    *     662 B flash（Uno 只剩 512 B 余量，装不下）。限一步的写法只多 32 B，
-   *     效果一样：**任何一次写入的位移都不会超过 0.02 单位**。 */
+   *     效果一样：**任何一次写入的位移都不会超过 0.08 mm**。 */
   if (step > DRAW_STEP_MAX) step = DRAW_STEP_MAX;
   (void) pathAdvance(step);
 
@@ -5476,15 +5505,17 @@ static double *btnAngle(int joint) {
  * against a stale out-of-range angle sticking in Pos. */
 static void btnCommitAngles(void) {
   SER tmp = Pos.ser;
-  /* 四个轴都只夹到舵机电气行程：b/r/c 0~180，f 是 TOOL_ANGLE_MIN..MAX(0~180)。
-   * 60~150 的"夹爪范围限制"已删除 —— 否则录制/回放/回中会把夹紧角顶回 60。
+  /* b/r/c 夹到各自的**机械行程窗口**（v1.6.7 起：b 0~180、r 45~160、c 30~110，
+   * 见 constant_and_positions.h 的 KIN_* 宏），f 夹到舵机电气行程
+   * TOOL_ANGLE_MIN..MAX(0~180)。60~150 的"夹爪范围限制"已删除 —— 否则
+   * 录制/回放/回中会把夹紧角顶回 60。
    * 原 clampServoAngles() 已随 servoLimit 结构体一起删除，这里只是一道保险。 */
-  if (tmp.angle1 < 0.0)   tmp.angle1 = 0.0;
-  if (tmp.angle1 > 180.0) tmp.angle1 = 180.0;
-  if (tmp.angle2 < 0.0)   tmp.angle2 = 0.0;
-  if (tmp.angle2 > 180.0) tmp.angle2 = 180.0;
-  if (tmp.angle3 < 0.0)   tmp.angle3 = 0.0;
-  if (tmp.angle3 > 180.0) tmp.angle3 = 180.0;
+  if (tmp.angle1 < KIN_BASE_MIN) tmp.angle1 = KIN_BASE_MIN;
+  if (tmp.angle1 > KIN_BASE_MAX) tmp.angle1 = KIN_BASE_MAX;
+  if (tmp.angle2 < KIN_RARM_MIN) tmp.angle2 = KIN_RARM_MIN;
+  if (tmp.angle2 > KIN_RARM_MAX) tmp.angle2 = KIN_RARM_MAX;
+  if (tmp.angle3 < KIN_FARM_MIN) tmp.angle3 = KIN_FARM_MIN;
+  if (tmp.angle3 > KIN_FARM_MAX) tmp.angle3 = KIN_FARM_MAX;
   if (tmp.angle4 < TOOL_ANGLE_MIN) tmp.angle4 = TOOL_ANGLE_MIN;
   if (tmp.angle4 > TOOL_ANGLE_MAX) tmp.angle4 = TOOL_ANGLE_MAX;
   Pos.ser = tmp;
@@ -6115,9 +6146,10 @@ const char *buttonStateName(void) {
 */
 
 
-/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mS/mE 查询切换）。
+/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mB/mS/mE 查询切换）。
  * 定义在本 TU（而不是 meArm.ino）：自检探针都链接本 TU、但不 #include meArm.ino，
  * 放在 .ino 里会导致探针链接失败（undefined reference）。 */
+bool g_mirrorBase     = (WEARM_MIRROR_BASE     != 0);
 bool g_mirrorShoulder = (WEARM_MIRROR_SHOULDER != 0);
 bool g_mirrorElbow    = (WEARM_MIRROR_ELBOW    != 0);
 
@@ -6319,7 +6351,7 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mS mE";
+static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -6339,9 +6371,14 @@ static void protoReplyTaskTag(const char *tag)
   protoPut('\n');
 }
 
-/* 'm'（查询/切换上臂与下臂换向）的回复："S=0 E=1" 形式，与 protoReplyFeature 同一风格。 */
+/* 'm'（查询/切换基座、上臂与下臂换向）的回复："B=1 S=0 E=1" 形式，
+ * 与 protoReplyFeature 同一风格。 */
 static void protoReplyMirror(void)
 {
+  protoPut('B');
+  protoPut('=');
+  protoPut(g_mirrorBase ? '1' : '0');
+  protoPut(' ');
   protoPut('S');
   protoPut('=');
   protoPut(g_mirrorShoulder ? '1' : '0');
@@ -6618,7 +6655,7 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
-  /* m / mS / mE：查询/切换上臂(r)与下臂(c)的物理换向（运行时方向标定）。
+  /* m / mB / mS / mE：查询/切换基座(b)、上臂(r)、下臂(c)的物理换向（运行时方向标定）。
    * 只改 writeServo() 送给舵机的数，逻辑角与反解一律不变；掉电不保存。
    * 放在功能门控与忙判定之前：换向不移动机械臂，任何时刻都允许。 */
   if (cmd == 'm') {
@@ -6627,11 +6664,13 @@ int protoHandleLine(const char *line)
       return PROTO_RES_MIRROR;
     }
     const char *q = tail;
-    if (q[1] != '\0' || (q[0] != 'S' && q[0] != 'E')) {
+    if (q[1] != '\0' || (q[0] != 'B' && q[0] != 'S' && q[0] != 'E')) {
       R_REJ();
       return PROTO_RES_UNKNOWN;
     }
-    if (q[0] == 'S') {
+    if (q[0] == 'B') {
+      g_mirrorBase = !g_mirrorBase;
+    } else if (q[0] == 'S') {
       g_mirrorShoulder = !g_mirrorShoulder;
     } else {
       g_mirrorElbow = !g_mirrorElbow;
@@ -6792,8 +6831,9 @@ int protoHandleLine(const char *line)
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    /* 超出机械行程是夹取而不是拒绝：b/r/c 三轴的上下限已硬编码为 0..180，
-     * 所以 "x200" 会落到该关节行程的上限，
+    /* 超出行程是夹取而不是拒绝：三条轴各自的上限已按 KIN_* 宏硬编码为
+     * b 0..180、r 45..160、c 30..110，所以 "x200" 会落到基座行程的上限 180、
+     * "y0" 会落到上臂下限 45、而 "z0" 会落到下臂下限 30，
      * 而不是把整条命令变成什么都不做的空操作。
      * 一个轴都没提到的行根本走不到这里 —— protoParseAxisLine 会拒掉它。 */
     protoApplyAngles(angles, seen);
@@ -6923,16 +6963,20 @@ static bool protoParseNumber(const char **pp, double *out)
  * angle3 = c（下臂）—— 正是考题要求的 x/y/z 映射，
  * 也是为什么三个关节能用一次指针遍历写完，而不必 switch 展开。
  *
- * 角度在这里硬夹到 0..180（取代了原来的 clampServoAngles() 调用）。
- * 同样的上限在舵机驱动层也会执行，但在这里夹一次能让 Pos.ser 自身
+ * 角度在这里按各轴的**机械行程窗口**夹取（取代了原来的 clampServoAngles()
+ * 调用）：b 0~180、r 45~160、c 30~110（v1.6.7 起，见
+ * constant_and_positions.h 的 KIN_* 宏；旧版三轴统一 0~180）。
+ * 同样的窗口在舵机驱动层也会执行，但在这里夹一次能让 Pos.ser 自身
  * 保持在合法范围内。 */
 static void protoApplyAngles(const double angles[3], uint8_t seen)
 {
+  static const double axisMin[PROTO_AXIS_COUNT] = {KIN_BASE_MIN, KIN_RARM_MIN, KIN_FARM_MIN};
+  static const double axisMax[PROTO_AXIS_COUNT] = {KIN_BASE_MAX, KIN_RARM_MAX, KIN_FARM_MAX};
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     if ((seen & (uint8_t)(1u << a)) == 0u) continue;
     double v = angles[a];
-    if (v < 0.0)   v = 0.0;
-    if (v > 180.0) v = 180.0;
+    if (v < axisMin[a]) v = axisMin[a];
+    if (v > axisMax[a]) v = axisMax[a];
     (&Pos.ser.angle1)[a] = v;
   }
 
@@ -7060,9 +7104,9 @@ void serialProtocolBegin(void)
 //     没人要的姿态上。旧坐标控制的代码已备份到工作区外。）
 //
 // 手柄操作（详见 joystick_control.h）:
-//   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 +y 侧转
-//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 90°−r 变小）
-//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c−90° 变大）
+//   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 −x 侧转
+//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 180°−r 变小）
+//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c 变大）
 //   右手柄 左右推 (A2) -> f = angle4 末端夹具   角度增大 = 张开
 //   ★ 摇杆中位在 setup() 里自标定（各轴取平均、扣掉静态偏差，见 joystick_control.cpp
 //     的 JOY_CAL_*）：真实手柄的中位很少正好是 ADC 512，偏差超过死区就会让机械臂
@@ -7140,40 +7184,48 @@ void serialProtocolBegin(void)
 //   换一套装配就把 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL 改成 0。
 //
 // 安全边界:
-//   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
+//   1. 关节行程硬限位 —— b[KIN_BASE_MIN,KIN_BASE_MAX]=[0,180]、r[KIN_RARM_MIN,KIN_RARM_MAX]=[45,160]、
+//                              c[KIN_FARM_MIN,KIN_FARM_MAX]=[30,110]、
+//                              f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
 //                              （原来的 f 60~150 夹爪软限位已按需求删除）。
+//                              r/c 的窗口来自参照仓库那台实机的行程标定（KIN_* 宏）。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
 //                              点，绘图/示教一律拒绝，串口 x/y/z（NOW 策略）允许吸附后到位。
 //   2. rangeLimit 位置边界   —— "工作空间盒子"（constant_and_positions.cpp 的 limit）：
-//                              x/y ±40、z -40~40。摇杆/按键/示教的关节步进由
-//                              move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
+//                              x/y ±160、z -100~+300（z 从底盘顶面量）。摇杆/按键/示教的
+//                              关节步进由 move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
 //                              取放与绘图的轨迹采样点由 path_core.h 的
 //                              pathCorePointOk() 整条拒绝（取放启动报 BUSY、
-//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽，
-//                              见下面的"可达包络"一节 —— 它不改变可达性。
+//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽
+//                              （盒子的 z 上界 300 > 几何上界 198），拦不住真实姿态 ——
+//                              真正把关的是反解的 d ∈ [1,159] 判据。
 //   3. 正运动学自洽          —— 每步都用 recFromServo() 重算坐标，
 //                              Pos.ser 与 Pos.rec 永远严格对应（坐标入口也一样，
 //                              见 move.cpp 的 moveToPoint()）。
 //
 // 坐标模型（用于显示与工作空间校验，与 constant_and_positions.cpp 一致）:
-//   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
-//     b (angle1) 90° -> 基座朝 +x，b 偏离 90° 就转向 ±y；
-//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下；
-//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上。
-//   alpha = 90 - r、beta = c - 90（肩轴反转、肘轴正转，见 RC-robot-hand 标定）。
-//   初始位姿 POS_HOME = (40, 0, 0)，即 (b,r,c,f) = (90, 90, 90, f 中位)：
-//   上臂、下臂都水平朝前，完全伸直的姿态，落在可达外边界 rho = L1+L2 = 40 上
-//   （不能也不需要在开机时避开边界：这是用户标定的上电姿态）。
-//   关节限位内的实测可达包络（probe_axes 扫组合，余量由探针打印）:
-//     x[0.00, 40.00] y[-40.00, 40.00] z[-40.00, 40.00]
-//   limit 本版取 x/y ±40、z -40~40（与可达包络一致，两杆各 20、关节 0~180°）。
-//   ★ 末端能到哪仍由几何决定（L1 = L2 = 20）：水平半径越大竖向行程越小，
-//     最大竖向行程在 ρ≈0 处（z ∈ [-40, 40]）。
-//   ★ 上机提示: 基座可摆到 x<0 的后方、末端最低到 z≈-40.0，请先在慢速档、
-//     空载、抬离台面的情况下单步试。
+//   ★ v1.6.7 起整体换成参照仓库（Fifiiiii-123/MeArm @ a7d2ee1）最新一版的模型：
+//   坐标原点在**底盘顶面中心**，肩轴在 z = +38；上臂 L2 = 前臂 L3 = 80（mm）。
+//   舵机角 -> 几何角:
+//     theta = b − 90°（基座转角，自 +y 量起，所以 b = 90° = 正前方 +y；
+//                      b 只有 0~180 ⇒ 可达半空间是 y ≥ 0）
+//     alpha = 180° − r（上臂仰角，r = 90° ⇒ 上臂竖直向上）
+//     beta  = c      （前臂相对肘部的折角）
+//   正解:
+//     R_h = L2·cos(alpha) − L3·cos(alpha+beta)
+//     x = −R_h·sin(theta)、y = R_h·cos(theta)
+//     z = 38 + L2·sin(alpha) − L3·sin(alpha+beta)
+//   初始位姿 POS_HOME = (0, 80, 118)，即 (b,r,c) = (90,90,90)：上臂竖直向上、
+//   前臂水平朝前，正解/反解严格互逆，落在工作空间中央（旧 40mm 模型的 home 是
+//   贴在可达外边界上的 (40,0,0)，那一版已废弃）。
+//   关节限位内的可达包络: 末端到肩轴的距离 d = sqrt(x²+y²+(z−38)²) ∈ [1, 159] mm，
+//     且 y ≥ 0；本机 z 的物理极限是 38 ± 160 = [−122, +198]，所以盒子里的
+//     z > 198 永远无解（臂长不够，不是软件限制）。
+//   ★ 末端能到哪仍由几何决定（两节各 80）：水平半径越大竖向行程越小。
+//   ★ 上机提示: 基座可摆到 x 两侧（|theta| ≤ 90°）、末端最低到 z ≈ −122，
+//     请先在慢速档、空载、抬离台面的情况下单步试。
 //
 // 调速:
 //   调用 adjustSpeed(level) 切换速度档位:
@@ -7195,21 +7247,25 @@ void serialProtocolBegin(void)
  * 【方向镜像】基座回转（b）与末端夹爪（f）在这台机器上是反向装配的，所以这两个
  * 通道在各自的行程窗口内做一次镜像：physical = (min + max) - logical。
  * 逻辑角仍是唯一真值（限位/反解/录制/绘图/示教全用逻辑角），只有送到舵机的
- * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）。
+ * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）；
+ * 上臂/下臂若开启镜像（g_mirrorShoulder / g_mirrorElbow），和分别是
+ * KIN_RARM_MIN+KIN_RARM_MAX = 205 与 KIN_FARM_MIN+KIN_FARM_MAX = 140。
  * 【本版本提示】夹爪的逻辑角范围已放宽到 0~180，所以镜像后可能超过 180（例如
  * 逻辑角 0 -> 物理 210）；servo_drive 会把脉宽夹在电气行程内，舵机只是顶到
  * 自己的极限，不会再由本函数保证"落在 [min,max] 内"。
- * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
+ * 【v1.6.7】基座这一路也改成运行时可翻转（g_mirrorBase，串口 'mB' 切换），
+ * 因为运动模型换成参照仓库最新版后基座的正方向跟着变了 —— 可以在不重编译的
+ * 情况下试出正确方向。换装配就改 weArm_config.h 里的
+ * WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
-#if WEARM_MIRROR_BASE
-    // 基座：硬编码 0~180 的镜像
-    servoDriveWrite(0, 180.0 - Pos.ser.angle1);
-#else
-    servoDriveWrite(0, Pos.ser.angle1);
-#endif
+    servoDriveWrite(0, g_mirrorBase ? (180.0 - Pos.ser.angle1) : Pos.ser.angle1);
 
-    servoDriveWrite(1, g_mirrorShoulder ? (180.0 - Pos.ser.angle2) : Pos.ser.angle2);
-    servoDriveWrite(2, g_mirrorElbow    ? (180.0 - Pos.ser.angle3) : Pos.ser.angle3);
+    /* 【v1.6.7 修正】上臂/下臂的镜像和不再写死 180：它们的行程窗口是
+     * r[45,160]、c[30,110]（KIN_* 宏），窗口内镜像必须用 (min+max)-angle
+     * 才能把窗口映回自己：r 用 205、c 用 140。写死 180 会把 r=45 映成 135、
+     * r=160 映成 20（直接越出上限），只有窗口恰好关于 90 对称时才不出错。 */
+    servoDriveWrite(1, g_mirrorShoulder ? ((KIN_RARM_MIN + KIN_RARM_MAX) - Pos.ser.angle2) : Pos.ser.angle2);
+    servoDriveWrite(2, g_mirrorElbow    ? ((KIN_FARM_MIN + KIN_FARM_MAX) - Pos.ser.angle3) : Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
     // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）

@@ -51,3 +51,14 @@ Thumbs.db
 /*.zip
 /p1.txt
 /HANDOVER*.md
+
+# ---- 第三方只读参照（v1.6.7 运动逻辑替换的来源）----
+# others/ 下面是从 GitHub 克隆下来的对照工程（自带 .git 与 5.6MB pack），
+# 只在本机当参照读、不随本仓库分发；直接 git add -A 会把它当嵌套仓库写进索引。
+/others/
+
+# avr_build.ps1 给单文件 sketch 另建的构建缓存（avrbuild/ 的同类）
+.selfcheck/avrbuild*/
+
+# 编译/运行日志的 stderr 片段（*.log 已在上面排除）
+*.err

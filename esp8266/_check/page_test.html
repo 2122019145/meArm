@@ -1,0 +1,103 @@
+<!doctype html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>meArm WiFi 遥控</title><style>
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,"Microsoft YaHei",sans-serif;background:#12151a;color:#e8eaf0}
+header{padding:10px 14px;background:#1b2027;display:flex;flex-wrap:wrap;gap:10px;align-items:center;position:sticky;top:0;z-index:9}
+h1{font-size:17px;margin:0}.pill{font:12px/1 monospace;background:#232a33;padding:5px 8px;border-radius:99px}
+main{padding:12px;max-width:960px;margin:0 auto}h2{font-size:14px;color:#8fa4c0;margin:16px 0 6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+button{font:14px system-ui;padding:11px 6px;border:0;border-radius:9px;background:#2a3340;color:#e8eaf0;cursor:pointer}
+button:active{transform:scale(.97)}button.safe:hover{background:#33415a}button.danger{background:#5a2a2f}
+button.danger:hover{background:#7a3239}button.stop{background:#8c2020;font-weight:700}
+#status{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px;font:13px/1.4 monospace}
+#status div{background:#1b2027;padding:7px 9px;border-radius:8px;overflow:hidden}
+.j{margin:9px 0;background:#1b2027;padding:9px 11px;border-radius:9px}
+.j b{display:inline-block;width:1.4em}.j input[type=range]{width:min(70%,520px);vertical-align:middle}
+.j span{font:13px monospace;display:inline-block;min-width:3.4em;text-align:right;color:#7fd1a0}
+#log{background:#0c0e12;border:1px solid #232a33;border-radius:9px;padding:8px;height:230px;overflow:auto;
+     font:12px/1.5 monospace;white-space:pre-wrap;word-break:break-all}
+.row{display:flex;gap:8px;margin:8px 0;flex-wrap:wrap}.row input[type=text]{flex:1;min-width:180px;padding:10px;
+     border-radius:9px;border:1px solid #2a3340;background:#0c0e12;color:#e8eaf0;font:14px monospace}
+label{font-size:13px;color:#9fb0c8}a{color:#7fb0ff}
+</style></head><body>
+<script>
+const _d={buttons:[{g:"状态/安全",l:"查询状态",c:"?",f:0,d:0},{g:"状态/安全",l:"急停·保持",c:"X",f:2,d:0},
+ {g:"使能与位姿",l:"使能+回初始位姿",c:"E",f:3,d:1},{g:"摇杆/调速",l:"摇杆开",c:"JOY",f:0,d:0}],
+ joints:{one:1,list:[{n:"B",lo:0,hi:180,v:90},{n:"R",lo:10,hi:170,v:90},{n:"F",lo:20,hi:150,v:90},{n:"C",lo:50,hi:130,v:120}]},
+ state:{state:"IDLE",pose:"B=90.00 R=90.00 F=90.00 C=120.00",joy:"JOY:0 CLAW_LOCK:1",ram:"RAM:1 samples=300 ms=30000",
+  q:0,heap:34108,up:42,net:"STA mywifi -55dBm 192.168.1.23",new:["E: moving to B90 R90 F90 C120","DONE:E_HOME; joystick ON"]}};
+window.fetch=(u)=>{u=String(u);let r=_d.buttons;if(u.indexOf('/joints')>=0)r=_d.joints;if(u.indexOf('/state')>=0)r=_d.state;
+ return Promise.resolve({json:()=>Promise.resolve(r),text:()=>Promise.resolve(JSON.stringify(r))});};
+</script>
+<header><h1>meArm WiFi 遥控</h1><span class="pill" id="pState">STATE —</span>
+<span class="pill" id="pPose">B — R — F — C —</span><span class="pill" id="pNet">…</span>
+<span class="pill" id="pQ">队列 0</span></header>
+<main>
+<div id="status"></div>
+<div id="btns"></div>
+<div id="jsec"><h2 id="jtitle">四关节（拖动后点“发送”或“依次发送”）</h2>
+<div id="joints"></div></div>
+<div class="row"><button class="safe" id="bAll" onclick="sendAll()">依次发送全部关节</button>
+<button class="safe" onclick="fetch('/queue?clear=1')">清空队列</button>
+<label><input type="checkbox" id="auto" checked onchange="setAuto()"> 自动查状态（每 3 秒）</label></div>
+<h2>手动命令 / 串口控制台</h2>
+<div class="row"><input type="text" id="cmd" placeholder="例如 B90 或 REC 或 DUMP" onkeydown="if(event.key==='Enter')sendBox()">
+<button class="safe" onclick="sendBox()">发送</button><button class="safe" onclick="document.getElementById('log').textContent=''">清屏</button>
+<a href="/log.txt" download="mearm_log.txt"><button class="safe">下载日志</button></a>
+<a href="/wifi"><button class="safe">WiFi 设置</button></a></div>
+<div id="log"></div>
+</main><script>
+const $=id=>document.getElementById(id);
+let joints=[],cur=[],one=1;
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function line(s){const l=$('log');const at=l.scrollTop+l.clientHeight>=l.scrollHeight-24;
+  l.textContent+=s+'\n';if(l.textContent.length>20000)l.textContent=l.textContent.slice(-16000);if(at)l.scrollTop=l.scrollHeight;}
+async function send(c,danger,quiet){
+  if(danger&&!confirm('确认发送「'+c+'」？机械臂会动作！'))return false;
+  line('> '+c);await fetch('/cmd?c='+encodeURIComponent(c));return true;}
+function sendBox(){const v=$('cmd').value.trim();if(v){send(v,false);$('cmd').value='';}}
+async function loadButtons(){const a=await(await fetch('/buttons')).json();const box=$('btns');box.innerHTML='';
+  const g={};for(const b of a)(g[b.g]=g[b.g]||[]).push(b);
+  for(const k in g){const h=document.createElement('h2');h.textContent=k;box.appendChild(h);
+    const d=document.createElement('div');d.className='grid';
+    for(const b of g[k]){const el=document.createElement('button');
+      el.textContent=b.l;el.className=(b.f&2)?'stop':(b.d?'danger':'safe');
+      el.onclick=()=>send(b.c,!!b.d);d.appendChild(el);}
+    box.appendChild(d);}}
+async function loadJoints(){const d=await(await fetch('/joints')).json();one=d.one;joints=d.list;
+  const box=$('joints');box.innerHTML='';cur=joints.map(j=>j.v);
+  if(!joints.length){$('jsec').style.display='none';$('bAll').style.display='none';return;}
+  $('jtitle').textContent=one?'四关节（拖动后点“发送”，或“依次发送”排队）':'关节（拖动后点“发送”，一次发全部）';
+  joints.forEach((j,i)=>{const e=document.createElement('div');e.className='j';
+    e.innerHTML='<b>'+j.n+'</b><input type="range" min="'+j.lo+'" max="'+j.hi+'" value="'+j.v+'" id="r'+i+'">'+
+      '<span id="v'+i+'">'+j.v+'°</span> <button class="safe" onclick="sendOne('+i+')">发送</button>';
+    box.appendChild(e);
+    e.querySelector('input').addEventListener('input',ev=>{$('v'+i).textContent=ev.target.value+'°';cur[i]=+ev.target.value;});});}
+function vals(){return joints.map((j,i)=>+$('r'+i).value);}
+async function sendOne(i){const v=+$('r'+i).value;line('> '+joints[i].n+v);
+  if(one)await fetch('/joint?i='+i+'&v='+v);
+  else await fetch('/joint?i='+i+'&v='+v+'&all='+vals().join(','));}
+async function sendAll(){
+  const v=vals();
+  if(one){
+    if(!confirm('依次发送全部关节角？机械臂会动作！'))return;
+    for(let i=0;i<joints.length;i++)await fetch('/joint?i='+i+'&v='+v[i]+'&q=1');
+    line('> 已排入队列：'+joints.map((j,i)=>j.n+v[i]).join(' '));
+  }else{
+    if(!confirm('发送全部关节角？机械臂会动作！'))return;
+    await fetch('/joint?i=0&v='+v[0]+'&all='+v.join(','));
+    line('> '+joints.map((j,i)=>j.n+v[i]).join(','));}}
+function setAuto(){fetch('/auto?on='+($('auto').checked?1:0));}
+async function poll(){
+  try{const s=await(await fetch('/state')).json();
+    const short=t=>t&&t.length>30?t.slice(0,30)+'…':t;
+    $('pState').textContent=s.state;$('pPose').textContent=short(s.pose);
+    $('pNet').textContent=s.net;$('pQ').textContent='队列 '+s.q;
+    const c=s.cards||[['状态',s.state],['关节角',s.pose],['摇杆/爪',s.joy],['记录',s.ram],
+      ['WiFi',s.net],['堆内存',s.heap+' B'],['运行',s.up+' s'],['队列',s.q+' 条']];
+    $('status').innerHTML=c.map(x=>'<div>'+esc(x[0])+'<br><b>'+esc(x[1])+'</b></div>').join('');
+    if(s.new&&s.new.length)s.new.forEach(l=>line(l));
+  }catch(e){$('pNet').textContent='连接断开…';}}
+loadButtons();loadJoints();poll();
+setInterval(poll,1200);setAuto();
+</script></body></html>

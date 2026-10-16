@@ -17,9 +17,10 @@
 #include "draw_control.h"
 #include "weArm_config.h"
 
-/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mS/mE 查询切换）。
+/* 运行时换向开关（默认取 weArm_config.h 编译期值；串口 m/mB/mS/mE 查询切换）。
  * 定义在本 TU（而不是 meArm.ino）：自检探针都链接本 TU、但不 #include meArm.ino，
  * 放在 .ino 里会导致探针链接失败（undefined reference）。 */
+bool g_mirrorBase     = (WEARM_MIRROR_BASE     != 0);
 bool g_mirrorShoulder = (WEARM_MIRROR_SHOULDER != 0);
 bool g_mirrorElbow    = (WEARM_MIRROR_ELBOW    != 0);
 
@@ -221,7 +222,7 @@ static const char s_rBusy[] PROGMEM = "BUSY";
 static const char s_rDiscard[] PROGMEM = "DISCARD";
 static const char s_rEmpty[] PROGMEM = "EMPTY";
 static const char s_rOff[] PROGMEM = "OFF";
-static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mS mE";
+static const char s_rBoot[] PROGMEM = "CMD OSHL ABC NRPM0 FDGEQUW pno ANG ! !P !B !D m mB mS mE";
 
 /* 'F'（切换绘图任务）回复 "OK F=<tag>"：tag 是简短的 ASCII 名称
  * （"LINE" / "N" / "TRI" / "Z" / "V" / "POLY" / "CURVE"），
@@ -241,9 +242,14 @@ static void protoReplyTaskTag(const char *tag)
   protoPut('\n');
 }
 
-/* 'm'（查询/切换上臂与下臂换向）的回复："S=0 E=1" 形式，与 protoReplyFeature 同一风格。 */
+/* 'm'（查询/切换基座、上臂与下臂换向）的回复："B=1 S=0 E=1" 形式，
+ * 与 protoReplyFeature 同一风格。 */
 static void protoReplyMirror(void)
 {
+  protoPut('B');
+  protoPut('=');
+  protoPut(g_mirrorBase ? '1' : '0');
+  protoPut(' ');
   protoPut('S');
   protoPut('=');
   protoPut(g_mirrorShoulder ? '1' : '0');
@@ -520,7 +526,7 @@ int protoHandleLine(const char *line)
     return PROTO_RES_NONE;
   }
 
-  /* m / mS / mE：查询/切换上臂(r)与下臂(c)的物理换向（运行时方向标定）。
+  /* m / mB / mS / mE：查询/切换基座(b)、上臂(r)、下臂(c)的物理换向（运行时方向标定）。
    * 只改 writeServo() 送给舵机的数，逻辑角与反解一律不变；掉电不保存。
    * 放在功能门控与忙判定之前：换向不移动机械臂，任何时刻都允许。 */
   if (cmd == 'm') {
@@ -529,11 +535,13 @@ int protoHandleLine(const char *line)
       return PROTO_RES_MIRROR;
     }
     const char *q = tail;
-    if (q[1] != '\0' || (q[0] != 'S' && q[0] != 'E')) {
+    if (q[1] != '\0' || (q[0] != 'B' && q[0] != 'S' && q[0] != 'E')) {
       R_REJ();
       return PROTO_RES_UNKNOWN;
     }
-    if (q[0] == 'S') {
+    if (q[0] == 'B') {
+      g_mirrorBase = !g_mirrorBase;
+    } else if (q[0] == 'S') {
       g_mirrorShoulder = !g_mirrorShoulder;
     } else {
       g_mirrorElbow = !g_mirrorElbow;
@@ -694,8 +702,9 @@ int protoHandleLine(const char *line)
       return PROTO_RES_BAD_SYNTAX;
     }
 
-    /* 超出机械行程是夹取而不是拒绝：b/r/c 三轴的上下限已硬编码为 0..180，
-     * 所以 "x200" 会落到该关节行程的上限，
+    /* 超出行程是夹取而不是拒绝：三条轴各自的上限已按 KIN_* 宏硬编码为
+     * b 0..180、r 45..160、c 30..110，所以 "x200" 会落到基座行程的上限 180、
+     * "y0" 会落到上臂下限 45、而 "z0" 会落到下臂下限 30，
      * 而不是把整条命令变成什么都不做的空操作。
      * 一个轴都没提到的行根本走不到这里 —— protoParseAxisLine 会拒掉它。 */
     protoApplyAngles(angles, seen);
@@ -825,16 +834,20 @@ static bool protoParseNumber(const char **pp, double *out)
  * angle3 = c（下臂）—— 正是考题要求的 x/y/z 映射，
  * 也是为什么三个关节能用一次指针遍历写完，而不必 switch 展开。
  *
- * 角度在这里硬夹到 0..180（取代了原来的 clampServoAngles() 调用）。
- * 同样的上限在舵机驱动层也会执行，但在这里夹一次能让 Pos.ser 自身
+ * 角度在这里按各轴的**机械行程窗口**夹取（取代了原来的 clampServoAngles()
+ * 调用）：b 0~180、r 45~160、c 30~110（v1.6.7 起，见
+ * constant_and_positions.h 的 KIN_* 宏；旧版三轴统一 0~180）。
+ * 同样的窗口在舵机驱动层也会执行，但在这里夹一次能让 Pos.ser 自身
  * 保持在合法范围内。 */
 static void protoApplyAngles(const double angles[3], uint8_t seen)
 {
+  static const double axisMin[PROTO_AXIS_COUNT] = {KIN_BASE_MIN, KIN_RARM_MIN, KIN_FARM_MIN};
+  static const double axisMax[PROTO_AXIS_COUNT] = {KIN_BASE_MAX, KIN_RARM_MAX, KIN_FARM_MAX};
   for (int a = 0; a < PROTO_AXIS_COUNT; a++) {
     if ((seen & (uint8_t)(1u << a)) == 0u) continue;
     double v = angles[a];
-    if (v < 0.0)   v = 0.0;
-    if (v > 180.0) v = 180.0;
+    if (v < axisMin[a]) v = axisMin[a];
+    if (v > axisMax[a]) v = axisMax[a];
     (&Pos.ser.angle1)[a] = v;
   }
 

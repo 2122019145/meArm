@@ -33,9 +33,9 @@
 //     没人要的姿态上。旧坐标控制的代码已备份到工作区外。）
 //
 // 手柄操作（详见 joystick_control.h）:
-//   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 +y 侧转
-//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 90°−r 变小）
-//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c−90° 变大）
+//   左手柄 左右推 (A0) -> b = angle1 基座回转   角度增大 = 末端往 −x 侧转
+//   左手柄 前后推 (A1) -> r = angle2 上臂俯仰   角度增大 = 上臂下沉（α = 180°−r 变小）
+//   右手柄 前后推 (A3) -> c = angle3 下臂俯仰   角度增大 = 下臂上抬（β = c 变大）
 //   右手柄 左右推 (A2) -> f = angle4 末端夹具   角度增大 = 张开
 //   ★ 摇杆中位在 setup() 里自标定（各轴取平均、扣掉静态偏差，见 joystick_control.cpp
 //     的 JOY_CAL_*）：真实手柄的中位很少正好是 ADC 512，偏差超过死区就会让机械臂
@@ -113,40 +113,48 @@
 //   换一套装配就把 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL 改成 0。
 //
 // 安全边界:
-//   1. 关节行程硬限位 —— b[0,180] r[0,180] c[0,180]，f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
+//   1. 关节行程硬限位 —— b[KIN_BASE_MIN,KIN_BASE_MAX]=[0,180]、r[KIN_RARM_MIN,KIN_RARM_MAX]=[45,160]、
+//                              c[KIN_FARM_MIN,KIN_FARM_MAX]=[30,110]、
+//                              f[TOOL_ANGLE_MIN,TOOL_ANGLE_MAX]=[0,180]
 //                              （原来的 f 60~150 夹爪软限位已按需求删除）。
+//                              r/c 的窗口来自参照仓库那台实机的行程标定（KIN_* 宏）。
 //                              摇杆/按键走 moveJointStep()：角度夹到限位内，夹不动了
 //                              就停住（MOVE_AT_LIMIT），不会顶死舵机。
 //                              坐标入口走 moveToPoint()：反解结果要靠限位吸附才成立的
 //                              点，绘图/示教一律拒绝，串口 x/y/z（NOW 策略）允许吸附后到位。
 //   2. rangeLimit 位置边界   —— "工作空间盒子"（constant_and_positions.cpp 的 limit）：
-//                              x/y ±40、z -40~40。摇杆/按键/示教的关节步进由
-//                              move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
+//                              x/y ±160、z -100~+300（z 从底盘顶面量）。摇杆/按键/示教的
+//                              关节步进由 move.cpp 的 posOutOfRange() 整步回退（MOVE_AT_LIMIT）；
 //                              取放与绘图的轨迹采样点由 path_core.h 的
 //                              pathCorePointOk() 整条拒绝（取放启动报 BUSY、
-//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽，
-//                              见下面的"可达包络"一节 —— 它不改变可达性。
+//                              绘图启动/绘制中被拒）。注意本版盒子比真实包络宽
+//                              （盒子的 z 上界 300 > 几何上界 198），拦不住真实姿态 ——
+//                              真正把关的是反解的 d ∈ [1,159] 判据。
 //   3. 正运动学自洽          —— 每步都用 recFromServo() 重算坐标，
 //                              Pos.ser 与 Pos.rec 永远严格对应（坐标入口也一样，
 //                              见 move.cpp 的 moveToPoint()）。
 //
 // 坐标模型（用于显示与工作空间校验，与 constant_and_positions.cpp 一致）:
-//   肩关节在坐标原点，上臂 L1 = 下臂 L2 = 20，armheight = 0。
-//   舵机角 -> 两杆绝对角（地面参考，与官方 MeArm 库 ik.cpp 的 a1/a2 同构）:
-//     b (angle1) 90° -> 基座朝 +x，b 偏离 90° 就转向 ±y；
-//     r (angle2) 0° -> 上臂竖直朝上，90° -> 水平朝前，180° -> 竖直朝下；
-//     c (angle3) 0° -> 下臂竖直朝下，90° -> 水平朝前，180° -> 竖直朝上。
-//   alpha = 90 - r、beta = c - 90（肩轴反转、肘轴正转，见 RC-robot-hand 标定）。
-//   初始位姿 POS_HOME = (40, 0, 0)，即 (b,r,c,f) = (90, 90, 90, f 中位)：
-//   上臂、下臂都水平朝前，完全伸直的姿态，落在可达外边界 rho = L1+L2 = 40 上
-//   （不能也不需要在开机时避开边界：这是用户标定的上电姿态）。
-//   关节限位内的实测可达包络（probe_axes 扫组合，余量由探针打印）:
-//     x[0.00, 40.00] y[-40.00, 40.00] z[-40.00, 40.00]
-//   limit 本版取 x/y ±40、z -40~40（与可达包络一致，两杆各 20、关节 0~180°）。
-//   ★ 末端能到哪仍由几何决定（L1 = L2 = 20）：水平半径越大竖向行程越小，
-//     最大竖向行程在 ρ≈0 处（z ∈ [-40, 40]）。
-//   ★ 上机提示: 基座可摆到 x<0 的后方、末端最低到 z≈-40.0，请先在慢速档、
-//     空载、抬离台面的情况下单步试。
+//   ★ v1.6.7 起整体换成参照仓库（Fifiiiii-123/MeArm @ a7d2ee1）最新一版的模型：
+//   坐标原点在**底盘顶面中心**，肩轴在 z = +38；上臂 L2 = 前臂 L3 = 80（mm）。
+//   舵机角 -> 几何角:
+//     theta = b − 90°（基座转角，自 +y 量起，所以 b = 90° = 正前方 +y；
+//                      b 只有 0~180 ⇒ 可达半空间是 y ≥ 0）
+//     alpha = 180° − r（上臂仰角，r = 90° ⇒ 上臂竖直向上）
+//     beta  = c      （前臂相对肘部的折角）
+//   正解:
+//     R_h = L2·cos(alpha) − L3·cos(alpha+beta)
+//     x = −R_h·sin(theta)、y = R_h·cos(theta)
+//     z = 38 + L2·sin(alpha) − L3·sin(alpha+beta)
+//   初始位姿 POS_HOME = (0, 80, 118)，即 (b,r,c) = (90,90,90)：上臂竖直向上、
+//   前臂水平朝前，正解/反解严格互逆，落在工作空间中央（旧 40mm 模型的 home 是
+//   贴在可达外边界上的 (40,0,0)，那一版已废弃）。
+//   关节限位内的可达包络: 末端到肩轴的距离 d = sqrt(x²+y²+(z−38)²) ∈ [1, 159] mm，
+//     且 y ≥ 0；本机 z 的物理极限是 38 ± 160 = [−122, +198]，所以盒子里的
+//     z > 198 永远无解（臂长不够，不是软件限制）。
+//   ★ 末端能到哪仍由几何决定（两节各 80）：水平半径越大竖向行程越小。
+//   ★ 上机提示: 基座可摆到 x 两侧（|theta| ≤ 90°）、末端最低到 z ≈ −122，
+//     请先在慢速档、空载、抬离台面的情况下单步试。
 //
 // 调速:
 //   调用 adjustSpeed(level) 切换速度档位:
@@ -175,21 +183,25 @@
  * 【方向镜像】基座回转（b）与末端夹爪（f）在这台机器上是反向装配的，所以这两个
  * 通道在各自的行程窗口内做一次镜像：physical = (min + max) - logical。
  * 逻辑角仍是唯一真值（限位/反解/录制/绘图/示教全用逻辑角），只有送到舵机的
- * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）。
+ * 那一个数被换向。基座的镜像和是 180（整行程），夹爪是 210（这台机器的装配角）；
+ * 上臂/下臂若开启镜像（g_mirrorShoulder / g_mirrorElbow），和分别是
+ * KIN_RARM_MIN+KIN_RARM_MAX = 205 与 KIN_FARM_MIN+KIN_FARM_MAX = 140。
  * 【本版本提示】夹爪的逻辑角范围已放宽到 0~180，所以镜像后可能超过 180（例如
  * 逻辑角 0 -> 物理 210）；servo_drive 会把脉宽夹在电气行程内，舵机只是顶到
  * 自己的极限，不会再由本函数保证"落在 [min,max] 内"。
- * 换装配就改 weArm_config.h 里的 WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
+ * 【v1.6.7】基座这一路也改成运行时可翻转（g_mirrorBase，串口 'mB' 切换），
+ * 因为运动模型换成参照仓库最新版后基座的正方向跟着变了 —— 可以在不重编译的
+ * 情况下试出正确方向。换装配就改 weArm_config.h 里的
+ * WEARM_MIRROR_BASE / WEARM_MIRROR_TOOL。 */
 void writeServo(void){
-#if WEARM_MIRROR_BASE
-    // 基座：硬编码 0~180 的镜像
-    servoDriveWrite(0, 180.0 - Pos.ser.angle1);
-#else
-    servoDriveWrite(0, Pos.ser.angle1);
-#endif
+    servoDriveWrite(0, g_mirrorBase ? (180.0 - Pos.ser.angle1) : Pos.ser.angle1);
 
-    servoDriveWrite(1, g_mirrorShoulder ? (180.0 - Pos.ser.angle2) : Pos.ser.angle2);
-    servoDriveWrite(2, g_mirrorElbow    ? (180.0 - Pos.ser.angle3) : Pos.ser.angle3);
+    /* 【v1.6.7 修正】上臂/下臂的镜像和不再写死 180：它们的行程窗口是
+     * r[45,160]、c[30,110]（KIN_* 宏），窗口内镜像必须用 (min+max)-angle
+     * 才能把窗口映回自己：r 用 205、c 用 140。写死 180 会把 r=45 映成 135、
+     * r=160 映成 20（直接越出上限），只有窗口恰好关于 90 对称时才不出错。 */
+    servoDriveWrite(1, g_mirrorShoulder ? ((KIN_RARM_MIN + KIN_RARM_MAX) - Pos.ser.angle2) : Pos.ser.angle2);
+    servoDriveWrite(2, g_mirrorElbow    ? ((KIN_FARM_MIN + KIN_FARM_MAX) - Pos.ser.angle3) : Pos.ser.angle3);
 
 #if WEARM_MIRROR_TOOL
     // 夹爪：装配镜像和 TOOL_MIRROR_SUM = 210（原来写死 (60.0 + 150.0)）
